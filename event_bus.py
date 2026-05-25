@@ -24,6 +24,11 @@ class EventType(StrEnum):
     STATE_CHANGE = "STATE_CHANGE"
     TOKEN_STREAM = "TOKEN_STREAM"
     KWIN_ACTION = "KWIN_ACTION"
+    # Aegis / Wraith / Navigator additions.
+    AUDIO_FFT = "AUDIO_FFT"        # spectral bands while Piper speaks
+    RECON_ALERT = "RECON_ALERT"    # Wraith findings (Wi-Fi vuln, intrusion, …)
+    NMAP_SCAN = "NMAP_SCAN"        # nmap progress lines (host/port/state)
+    HUD_OVERLAY = "HUD_OVERLAY"    # ad-hoc HUD payloads (graph nodes, projections)
 
 
 @dataclass(frozen=True)

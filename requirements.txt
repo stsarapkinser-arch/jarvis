@@ -6,3 +6,5 @@ PyQt6>=6.6
 qasync>=0.27
 psutil>=5.9
 dbus-next>=0.2.3
+# Aegis HUD: FFT analysis of the Piper PCM stream → core sphere pulse.
+numpy>=1.26
