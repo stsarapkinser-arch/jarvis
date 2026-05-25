@@ -15,6 +15,7 @@ from jarvis_hud import JarvisHUD
 from kwin import KWinOrchestrator
 from main import JarvisMain
 from pixel import PixelBridge
+from recon_daemon import ReconDaemon
 from sentinel import Sentinel
 
 log = logging.getLogger("jarvis.boot")
@@ -48,7 +49,7 @@ async def amain() -> None:
     bus.bind_loop(asyncio.get_running_loop())
 
     hud = JarvisHUD()
-    hud.show()
+    hud.show_fullscreen()
 
     jarvis = Jarvis()
     kwin = KWinOrchestrator()
@@ -58,10 +59,12 @@ async def amain() -> None:
     bus.subscribe(EventType.DAEMON_ALERT, jarvis.on_daemon_alert)
     bus.subscribe(EventType.OS_EVENT, jarvis.on_os_event)
     bus.subscribe(EventType.PIXEL_EVENT, jarvis.on_pixel_event)
+    bus.subscribe(EventType.RECON_ALERT, jarvis.on_recon_alert)
 
     asyncio.create_task(bus.run(), name="event-bus")
     await DaemonSwarm().start_all()
     await Sentinel().start_all()
+    await ReconDaemon().start_all()
     await PixelBridge().start()
     asyncio.create_task(hud_layout_watcher(bus, kwin), name="hud-layout")
 

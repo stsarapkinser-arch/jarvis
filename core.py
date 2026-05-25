@@ -13,10 +13,12 @@ from typing import Optional
 
 import ollama
 
+from audio_fft import PiperFFTPump
 from commands import CommandBook
 from event_bus import Event, EventBus, EventType
 from kwin import KWinOrchestrator
 from memory_engine import ChronoMemory
+from nmap_stream import is_nmap_command, stream_nmap
 from parser import (
     ParsedResponse, clean_bash, inject_sudo, parse_response, run_bash, wrap_sandbox,
 )
@@ -86,6 +88,7 @@ class Jarvis(metaclass=Singleton):
         self.book = CommandBook()
         self.kwin = KWinOrchestrator()
         self.patcher = QuickPatcher()
+        self._fft_pump = PiperFFTPump(self.bus)
         self.model = MODEL
         self.system_prompt = Path(SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
         self._ollama = ollama.AsyncClient()
@@ -116,7 +119,13 @@ class Jarvis(metaclass=Singleton):
 
     def say(self, text: str, tone: str | None = None) -> None:
         """Speak via Piper in a daemon thread. Tone adjusts length-scale (speed)
-        and sentence-silence (pauses) per current Jarvis state."""
+        and sentence-silence (pauses) per current Jarvis state.
+
+        The Piper PCM stream is tee'd into :class:`PiperFFTPump` so the HUD
+        core sphere pulses in sync with the voice. If aplay is unavailable
+        the audio is dropped silently but the FFT events still flow — useful
+        on headless dev boxes where the HUD is the only consumer.
+        """
         text = (text or "").strip()
         if not text:
             return
@@ -135,16 +144,25 @@ class Jarvis(metaclass=Singleton):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-                aplay = subprocess.Popen(
-                    ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-q"],
-                    stdin=piper.stdout,
-                    stderr=subprocess.DEVNULL,
-                )
-                piper.stdout.close()
-                assert piper.stdin is not None
+                try:
+                    aplay = subprocess.Popen(
+                        ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-q"],
+                        stdin=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    aplay_stdin = aplay.stdin
+                except FileNotFoundError:
+                    aplay = None
+                    aplay_stdin = None
+                assert piper.stdin is not None and piper.stdout is not None
                 piper.stdin.write(text.encode("utf-8"))
                 piper.stdin.close()
-                aplay.wait()
+                # Tee PCM into FFT analyzer and into aplay. The pump closes
+                # aplay's stdin when piper EOFs, which signals aplay to drain.
+                self._fft_pump.start_pump(piper.stdout, aplay_stdin, label="piper")
+                if aplay is not None:
+                    aplay.wait()
+                piper.wait()
             except Exception:
                 log.exception("say() pipeline failed")
 
@@ -235,7 +253,11 @@ class Jarvis(metaclass=Singleton):
         return "".join(chunks)
 
     async def _run(self, cmd: str) -> tuple[Optional[int], str, str]:
-        return await asyncio.to_thread(run_bash, inject_sudo(cmd))
+        injected = inject_sudo(cmd)
+        if is_nmap_command(injected):
+            # nmap streams through the HUD port matrix in real time.
+            return await stream_nmap(injected, bus=self.bus)
+        return await asyncio.to_thread(run_bash, injected)
 
     def _is_destructive(self, cmd: str) -> bool:
         return bool(DESTRUCTIVE_RE.search(cmd))
@@ -372,6 +394,21 @@ class Jarvis(metaclass=Singleton):
             await self.kwin.highlight_window(hint)
         except Exception:
             log.exception("KWin highlight failed")
+        # Also paint a neon AR bracket on the HUD around the matching window
+        # so the user sees the diagnosis even without focus stealing.
+        try:
+            matches = await self.kwin.find_window_rects(hint)
+        except Exception:
+            log.exception("KWin geometry probe failed")
+            matches = []
+        if matches:
+            await self.bus.publish(Event(
+                EventType.HUD_OVERLAY,
+                {"kind": "app_glow", "windows": [
+                    {**m, "color": "amber", "caption": hint} for m in matches
+                ]},
+                urgency="normal",
+            ))
 
     async def process_intent(self, text: str) -> str:
         text = (text or "").strip()
@@ -437,6 +474,38 @@ class Jarvis(metaclass=Singleton):
         line = str(event.data)
         await self._state("ALERT", line[:80])
         await self.process_intent(f"[DAEMON_ALERT] {line.strip()}")
+
+    async def on_recon_alert(self, event: Event) -> None:
+        """Wraith finding handler.
+
+        Yellow (Wi-Fi vuln) — verbal heads-up only, the HUD already blinks.
+        Red (intrusion)     — verbal warning + queue UFW BLOCK as a
+                              destructive command so the standard confirmation
+                              gate kicks in before any rule is applied.
+        """
+        data = event.data if isinstance(event.data, dict) else {}
+        color = data.get("color", "yellow")
+        summary = str(data.get("summary", "recon hit"))
+        ufw = data.get("ufw_suggest")
+
+        if color == "red":
+            await self._state("ALERT", summary[:80])
+            phrase = (
+                f"Сэр, подозрительный трафик. {summary}. "
+                + (f"Готовлю блокировку: {ufw}." if ufw else "Прикажете заблокировать?")
+            )
+            self.say(phrase, tone="alert")
+            if ufw:
+                # Reuse the destructive-command confirmation gate.
+                await self._gate_destructive(ufw, summary, None)
+            return
+
+        # Yellow — Wi-Fi reconnaissance opportunity, no automatic action.
+        await self._state("ALERT", summary[:80])
+        self.say(
+            f"Сэр, в зоне доступа обнаружена уязвимость. {summary}. Вывожу данные на визор.",
+            tone="alert",
+        )
 
     async def on_os_event(self, event: Event) -> None:
         data = event.data if isinstance(event.data, dict) else {}

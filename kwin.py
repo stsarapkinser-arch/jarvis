@@ -311,3 +311,32 @@ class KWinOrchestrator(metaclass=Singleton):
             return None
         quad = layout.freest_quadrant()
         return QUADRANT_TO_RATIO[quad]
+
+    async def find_window_rects(self, pattern: str) -> list[dict]:
+        """Return geometry dicts (x, y, w, h, caption) for every visible window
+        whose caption (or resource name) contains ``pattern`` (case-insensitive).
+
+        Used by the HUD app-glow layer: we paint Iron-Man-style neon brackets
+        around the matched windows. Empty list when nothing matches or on
+        Wayland sessions where neither kdotool nor wmctrl can enumerate the
+        layout."""
+        pat = (pattern or "").strip().lower()
+        if not pat:
+            return []
+        layout = await self.query_windows()
+        if layout is None:
+            return []
+        hits: list[dict] = []
+        for w in layout.windows:
+            caption_l = (w.caption or "").lower()
+            res_l = (w.res or "").lower()
+            if pat not in caption_l and pat not in res_l:
+                continue
+            hits.append({
+                "x": int(w.x),
+                "y": int(w.y),
+                "w": int(w.width),
+                "h": int(w.height),
+                "caption": w.caption,
+            })
+        return hits

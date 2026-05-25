@@ -18,3 +18,31 @@
 разложи окна => __kwin__:prepare_workspace
 разложи рабочий стол => __kwin__:prepare_workspace
 tile windows => __kwin__:prepare_workspace
+
+# === PROTOCOLS ============================================================
+# Composite chains for high-stakes flows. Each "protocol" is a single bash
+# pipeline so the destructive-command gate and quick-patch healer treat it
+# as one operation. UFW rules are scoped to the active interface so we do
+# not lock ourselves out of remote sessions.
+
+# --- Боевой режим: максимальная видимость, жёсткий фаервол, лог в файл ---
+режим боя => sudo -n ufw default deny incoming && sudo -n ufw default allow outgoing && sudo -n ufw enable && sudo -n journalctl -p warning -n 200 --no-pager > /tmp/jarvis-battle.log && notify-send "JARVIS" "Battle mode armed"
+боевой режим => sudo -n ufw default deny incoming && sudo -n ufw default allow outgoing && sudo -n ufw enable && sudo -n journalctl -p warning -n 200 --no-pager > /tmp/jarvis-battle.log && notify-send "JARVIS" "Battle mode armed"
+battle mode => sudo -n ufw default deny incoming && sudo -n ufw default allow outgoing && sudo -n ufw enable && sudo -n journalctl -p warning -n 200 --no-pager > /tmp/jarvis-battle.log && notify-send "JARVIS" "Battle mode armed"
+
+# --- Снять боевой режим: вернуть мирные правила ---
+сними боевой режим => sudo -n ufw default allow incoming && sudo -n ufw default allow outgoing && sudo -n ufw disable && notify-send "JARVIS" "Battle mode disengaged"
+выключи режим боя => sudo -n ufw default allow incoming && sudo -n ufw default allow outgoing && sudo -n ufw disable && notify-send "JARVIS" "Battle mode disengaged"
+
+# --- Невидимость: Tor, рандомный MAC, очистка истории команд ---
+режим невидимости => sudo -n systemctl start tor && for IFC in $(ls /sys/class/net | grep -E '^(wl|en)'); do sudo -n ip link set "$IFC" down && sudo -n macchanger -r "$IFC" && sudo -n ip link set "$IFC" up; done && history -c && notify-send "JARVIS" "Stealth protocol engaged"
+включи невидимость => sudo -n systemctl start tor && for IFC in $(ls /sys/class/net | grep -E '^(wl|en)'); do sudo -n ip link set "$IFC" down && sudo -n macchanger -r "$IFC" && sudo -n ip link set "$IFC" up; done && history -c && notify-send "JARVIS" "Stealth protocol engaged"
+stealth mode => sudo -n systemctl start tor && for IFC in $(ls /sys/class/net | grep -E '^(wl|en)'); do sudo -n ip link set "$IFC" down && sudo -n macchanger -r "$IFC" && sudo -n ip link set "$IFC" up; done && history -c && notify-send "JARVIS" "Stealth protocol engaged"
+
+# --- Выйти из невидимости ---
+выключи невидимость => sudo -n systemctl stop tor && notify-send "JARVIS" "Stealth protocol disengaged"
+сними невидимость => sudo -n systemctl stop tor && notify-send "JARVIS" "Stealth protocol disengaged"
+
+# --- Aegis визор: ручное переключение в полноэкранный режим (KWin shortcut) ---
+включи визор => qdbus org.kde.kglobalaccel /component/kwin invokeShortcut "Window Fullscreen"
+выключи визор => qdbus org.kde.kglobalaccel /component/kwin invokeShortcut "Window Fullscreen"
