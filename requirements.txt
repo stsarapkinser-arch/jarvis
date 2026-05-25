@@ -1,0 +1,8 @@
+ollama>=0.3
+chromadb>=0.5
+vosk>=0.3.45
+sounddevice>=0.4
+PyQt6>=6.6
+qasync>=0.27
+psutil>=5.9
+dbus-next>=0.2.3

@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS Protocol — AI Orchestrator for Kali Linux
+After=graphical-session.target sound.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/jarvis
+ExecStart=%h/jarvis/.venv/bin/python %h/jarvis/start_jarvis.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

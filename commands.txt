@@ -1,0 +1,20 @@
+открой браузер => firefox &
+открой терминал => konsole &
+открой файлы => dolphin &
+открой настройки => systemsettings &
+покажи диск => df -h
+покажи память => free -h
+покажи процессы => ps aux --sort=-%cpu | head -20
+покажи сеть => ip -brief addr
+покажи интерфейсы => nmcli device status
+очисти кэш => sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
+температура => sensors | grep -E "Package|Core"
+батарея => upower -i $(upower -e | grep BAT) | grep -E "state|percentage|time"
+блокировать экран => loginctl lock-session
+выключить => systemctl poweroff
+перезагрузить => systemctl reboot
+скриншот => spectacle -bcn
+подготовь рабочее пространство => __kwin__:prepare_workspace
+разложи окна => __kwin__:prepare_workspace
+разложи рабочий стол => __kwin__:prepare_workspace
+tile windows => __kwin__:prepare_workspace
