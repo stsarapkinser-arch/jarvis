@@ -37,6 +37,7 @@ from typing import Any, Final
 import chromadb
 import ollama
 from chromadb import Documents, EmbeddingFunction, Embeddings
+from chromadb.errors import InternalError as ChromaDBInternalError
 
 from src.common.singleton import Singleton
 
@@ -321,6 +322,11 @@ class ChronoMemory(metaclass=Singleton):
             if where:
                 kwargs["where"] = dict(where)
             res = col.query(**kwargs)
+        except ChromaDBInternalError:
+            # ChromaDB can throw "Error finding id" on empty/filtered subsets.
+            # Return empty results instead of crashing the voice pipeline.
+            log.warning("ChromaDB internal error on %s (likely empty collection)", getattr(col, "name", "?"))
+            return []
         except Exception:
             log.exception("query failed on %s", getattr(col, "name", "?"))
             return []
