@@ -88,15 +88,18 @@ _SPEAK_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
     "function": {
         "name": ToolName.SPEAK_RESPONSE.value,
         "description": (
-            "ЕДИНСТВЕННЫЙ способ заговорить с оператором вслух. Живая речь без "
-            "markdown, без списков, без тегов. Короткие фразы. Обращение «сэр»."
+            "ЕДИНСТВЕННЫЙ способ заговорить с оператором вслух. Живая речь, без "
+            "markdown и списков. Ты УПРАВЛЯЕШЬ своим голосом пунктуацией: "
+            "многоточие … — глубокая пауза (анализ, раздумье); короткие "
+            "предложения — динамика; критические данные разделяй точками "
+            "(«Цель. Один. Девять. Два.»). Обращение «сэр»."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Что произнести голосом. Только живая речь.",
+                    "description": "Что произнести голосом. Только живая речь, с осмысленной пунктуацией.",
                 },
                 "mood": {
                     "type": "string",
@@ -105,6 +108,20 @@ _SPEAK_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
                         "professional — спокойный баритон по умолчанию; "
                         "alert — срочно/сухо (тревога, перегрев); "
                         "ironic — точная ирония equals-to-equals."
+                    ),
+                },
+                "speed": {
+                    "type": "number",
+                    "description": (
+                        "Темп: 1.0 — норма, <1 медленнее/размереннее (аристократично), "
+                        ">1 быстрее (срочность). Опционально; по умолчанию — по состоянию."
+                    ),
+                },
+                "pause": {
+                    "type": "number",
+                    "description": (
+                        "Пауза между предложениями, сек: ~0.1 резко/по-военному, "
+                        "~0.4 размеренно. Опционально."
                     ),
                 },
             },
@@ -263,6 +280,16 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _coerce_opt_float(value: Any) -> float | None:
+    """Опциональное число (speed/pause). Невалидное/пустое → None (дефолт состояния)."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_arguments(raw: Any) -> dict[str, Any]:
     """function.arguments может прийти строкой-JSON, dict'ом или мусором.
 
@@ -294,6 +321,8 @@ class MonologueArgs:
 class SpeakArgs:
     text: str
     mood: SpeakMood = SpeakMood.PROFESSIONAL
+    speed: float | None = None      # когнитивная просодия: темп (1.0 норма)
+    pause: float | None = None      # пауза между предложениями, сек
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SpeakArgs:
@@ -302,7 +331,12 @@ class SpeakArgs:
             mood = SpeakMood(raw_mood)
         except ValueError:
             mood = SpeakMood.PROFESSIONAL
-        return cls(text=_coerce_str(d.get("text")), mood=mood)
+        return cls(
+            text=_coerce_str(d.get("text")),
+            mood=mood,
+            speed=_coerce_opt_float(d.get("speed")),
+            pause=_coerce_opt_float(d.get("pause")),
+        )
 
 
 @dataclass(frozen=True, slots=True)

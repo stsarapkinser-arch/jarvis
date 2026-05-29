@@ -5,13 +5,11 @@ import logging
 import random
 import re
 import shutil
-import subprocess
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 try:
     import psutil  # type: ignore
@@ -20,7 +18,7 @@ except ImportError:
     psutil = None  # type: ignore
     _HAS_PSUTIL = False
 
-from src.audio.fft_analyzer import PiperFFTPump
+from src.audio.audio_engine import AcousticEngine
 from src.memory.ephemeral import EphemeralRunner
 from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
 from src.ui.window_manager import KWinOrchestrator
@@ -112,115 +110,12 @@ WEAVER_FACT_MAX_CHARS = 120
 WEAVER_INTENT_MAX_CHARS = 300
 WEAVER_BATTERY_FRESH_SEC = 900  # 15 min
 
-TONE_PRESETS: dict[str, tuple[float, float]] = {
-    "alert":  (0.85, 0.10),
-    "normal": (1.00, 0.20),
-    "idle":   (1.12, 0.40),
-}
-
-# ───────────── Acoustic Code «Bettany-Signature» (SOX DSP) ─────────────
-# Голос Piper (ru_RU-dmitry-medium) сам по себе — нейтральный мужской TTS.
-# Задача цепочки — приблизить его к КИНО-Джарвису (Пол Беттани): тёплый,
-# гладкий, выдержанный британский баритон с лёгкой «хай-фай»-отполированностью
-# и едва ощутимым пространством комнаты. Кино-Джарвис подчёркнуто ЧЕЛОВЕЧЕСКИЙ
-# и спокойный — поэтому здесь НЕТ фейзера/«нейронного кольца» и НЕТ резкого
-# «шиммера» на верхах (они тянут тембр в робота/сай-фай, прочь от оригинала).
-#
-# Философия фильтров:
-#   - pitch вниз → вес баритона (sox pitch не сохраняет форманты, поэтому
-#     сдвиг заодно опускает форманты — это даёт «грудь». Честный формант-shift
-#     потребовал бы rubberband-cli, тяжелее для N100; компромисс осознанный).
-#   - bass-shelf + срез «бубнежа» на 300 Гц → тёплая, но не мутная грудь.
-#   - лёгкий минус на 1.8 кГц (де-назализация/убираем жёсткость).
-#   - аккуратный presence-пик ~3.2 кГц → разборчивость дикции без сибилянтов.
-#   - treble-shelf вниз → сглаженный верх (никакого «звенящего» TTS).
-#     ВАЖНО: при 22050 Гц всё, что ≥11 кГц (Найквист), бессмысленно — поэтому
-#     «воздух» не задираем, теплота строится на низах и гладкости.
-#   - compand → ровная, плотная, «уверенная» подача (даже динамика).
-#   - reverb с низким wet → ощущение «в комнате через хорошие колонки»,
-#     а не зал; в alert reverb выключен (сухо и немедленно).
-#   - gain -n → нормализация пика, защита от клиппинга.
-#
-# ПОТОЛОК МЕТОДА (честно): DSP формирует ТЕМБР/СТИЛЬ/ПРОСТРАНСТВО, но не
-# переносит саму ИДЕНТИЧНОСТЬ голоса актёра — под капотом остаётся русский
-# мужской спикер Piper. Точное клонирование тембра Беттани требует voice
-# conversion (RVC / so-vits-svc), обученного на сэмплах. См. README раздел TTS.
-# Все профили — sox-аргументы без бинарника и формата (это в DSP_IO_ARGS).
-SOX_BIN = shutil.which("sox")
-# Однократный флаг: предупреждаем про отсутствие sox только один раз за процесс
-# (иначе лог засорится на каждой фразе). Читается/пишется в _play_tts.
-_SOX_MISSING_WARNED = False
-DSP_IO_ARGS: tuple[str, ...] = (
-    "-q", "-V0",
-    "-t", "raw", "-r", "22050", "-e", "signed", "-b", "16", "-c", "1", "-",
-    "-t", "raw", "-r", "22050", "-e", "signed", "-b", "16", "-c", "1", "-",
-)
-SOX_PROFILES: dict[str, tuple[str, ...]] = {
-    # Канонический кино-Джарвис: тёплый гладкий баритон, ровная подача,
-    # тонкий лоск комнаты. Это голос «по умолчанию».
-    "normal": (
-        "highpass", "70",                                # срез сабсоник-рокота/DC
-        "pitch", "-90",                                  # вес баритона (~0.9 полутона)
-        "bass", "+3.5", "110",                           # тёплая грудь (low-shelf)
-        "equalizer", "300",  "1.2q", "-2",               # убрать «бубнёж»/коробку
-        "equalizer", "1800", "1.4q", "-2",               # де-назализация/мягкость
-        "equalizer", "3200", "1.6q", "+2.5",             # дикция/presence
-        "treble", "-2", "8000",                          # сглаженный верх, без звона
-        "compand", "0.02,0.20", "6:-48,-30,-12", "-4", "-90", "0.10",  # ровная подача
-        "reverb", "16", "55", "26", "100", "8", "-3",    # тонкая «комната»
-        "gain", "-n", "-3.5",
-    ),
-    # Alert: собранный, сухой, более «впереди» — для ALERT state и destructive
-    # gate. По-прежнему человеческий (не металлический), но срочный и чёткий.
-    "alert": (
-        "highpass", "110",
-        "pitch", "-55",                                  # меньше веса — собраннее
-        "equalizer", "250",  "1.2q", "+2",               # немного груди — это всё ещё Джарвис
-        "equalizer", "1800", "1.4q", "-1.5",
-        "equalizer", "3500", "1.4q", "+3",               # presence для срочности
-        "treble", "-1", "9000",
-        "compand", "0.005,0.06", "6:-45,-26,-9", "-3", "-90", "0.05",  # быстро/плотно
-        "gain", "-n", "-1.5",                            # без reverb — сухо и сразу
-    ),
-    # Idle: глубже, медленнее, спокойнее и чуть просторнее — для IDLE state.
-    "idle": (
-        "highpass", "65",
-        "pitch", "-120",                                 # ещё ниже — расслабленный бас
-        "bass", "+4", "105",
-        "equalizer", "300",  "1.2q", "-2.5",
-        "equalizer", "1800", "1.4q", "-2",
-        "equalizer", "3000", "1.6q", "+1.5",             # presence мягче — отстранённее
-        "treble", "-3", "7500",
-        "compand", "0.03,0.28", "6:-48,-30,-12", "-5", "-90", "0.15",
-        "reverb", "24", "60", "32", "100", "12", "-3",   # чуть больше пространства
-        "gain", "-n", "-4.5",
-    ),
-    # Night Stealth: тёплый, тёмный, интимный и тихий — если темно
-    # (сенсор Pixel) или поздний час (≥23 или ≤6). Без «воздуха».
-    "night_stealth": (
-        "highpass", "70",
-        "pitch", "-100",
-        "bass", "+3", "110",
-        "lowpass", "3600",                               # никаких высоких на ушах
-        "equalizer", "300",  "1.2q", "-2",
-        "equalizer", "1800", "1.2q", "-1.5",
-        "compand", "0.03,0.3", "6:-48,-30,-14", "-6", "-90", "0.2",
-        "reverb", "12", "70", "22", "100", "6", "-4",    # крошечная тёплая комната
-        "gain", "-n", "-10",                             # заметно тише
-    ),
-}
-
-# Источник данных о свете/proximity — пока KDE Connect не экспортирует
-# sensor data штатно. Договорённость: внешний продьюсер (Termux/MQTT-bridge
-# /кастомный плагин) пишет JSON в /tmp/jarvis_ambient.json вида:
-#   {"light_lux": 12.0, "proximity_near": false, "ts": 1700000000.0}
-# Если файл существует и свеж (≤ 60 сек), значения используем — иначе
-# мягкий fallback на час дня.
-AMBIENT_FILE = Path("/tmp/jarvis_ambient.json")
-AMBIENT_FRESH_SEC = 60.0
-NIGHT_LUX_THRESHOLD = 30.0   # < 30 lux ≈ темно
-NIGHT_HOUR_START = 23
-NIGHT_HOUR_END = 6
+# ───────────── Acoustic tract → src/audio/audio_engine.py ─────────────
+# Кинематографический голосовой тракт (когнитивная просодия + SoX «Bettany
+# Signature» + FFT-перекачка для сферы HUD) вынесен в AcousticEngine. Ядро
+# больше не держит SOX-профили/очередь/воркер — оно лишь зовёт
+# ``self._acoustic.speak(text, state, speed=, pause=)``. Ambient/night-логика,
+# прерывание ALERT'ом и модуляция нагрузкой системы — внутри движка.
 
 ACK_VARIANTS: dict[str, tuple[str, ...]] = {
     "ok": ("Готово.", "Сделано.", "Принято.", "Выполнено.", "Есть."),
@@ -341,7 +236,6 @@ class Jarvis(metaclass=Singleton):
         self.memory = ChronoMemory()
         self.kwin = KWinOrchestrator()
         self.patcher = QuickPatcher()
-        self._fft_pump = PiperFFTPump(self.bus)
         self.model = LLAMA_MODEL_NAME
         try:
             self.system_prompt = Path(SYSTEM_PROMPT_FILE).read_text(encoding="utf-8")
@@ -378,22 +272,15 @@ class Jarvis(metaclass=Singleton):
         self._shadow = ShadowExec()
         self._ephemeral = EphemeralRunner(shadow=self._shadow)
 
-        # ── TTS sequential queue ────────────────────────────────────────────
-        # Единственный воркер читает из очереди строки и озвучивает одну
-        # за другой — никакого наслоения двух Piper-процессов.
-        import queue as _q
-        self._tts_queue: "_q.Queue[tuple[str,str]|None]" = _q.Queue()
-        # Текущий активный piper-процесс — хранится чтобы можно было убить
-        # его при поступлении alert-приоритетного сообщения.
-        self._current_piper: Optional[Any] = None
-        self._current_piper_lock = threading.Lock()
-        # Флаг реального воспроизведения — HUD читает через шину AUDIO_FFT;
-        # этот флаг нужен чтобы _tts_worker_loop мог сигнализировать начало/конец.
-        self._tts_playing: bool = False
-        self._tts_worker_thread = threading.Thread(
-            target=self._tts_worker_loop, daemon=True, name="jarvis-tts"
+        # ── Кинематографический голос (AcousticEngine) ──────────────────────
+        # Движок владеет очередью речи, рабочим потоком, SoX-трактом «Bettany
+        # Signature» и FFT-перекачкой для сферы HUD. Ядро лишь зовёт .speak().
+        self._acoustic = AcousticEngine(
+            self.bus,
+            piper_path=PIPER_PATH,
+            voice_model=VOICE_MODEL,
+            voice_config=VOICE_CONFIG,
         )
-        self._tts_worker_thread.start()
 
         # ── OS alert dedup ──────────────────────────────────────────────────
         # Для каждого sensor-ключа храним время последнего say(), чтобы
@@ -411,246 +298,29 @@ class Jarvis(metaclass=Singleton):
             return "idle"
         return "normal"
 
-    # ───── Ambient awareness & SOX profile selector ─────
-    @staticmethod
-    def _read_ambient() -> dict[str, Any] | None:
-        """Возвращает свежий ambient-снимок (light_lux, proximity_near) если есть.
-
-        Источник — внешний продьюсер пишет JSON в /tmp/jarvis_ambient.json.
-        KDE Connect штатно sensor data не отдаёт; договорённость
-        document'ирована в SOX_PROFILES — там же fallback на час суток."""
-        try:
-            if not AMBIENT_FILE.is_file():
-                return None
-            import json
-            data = json.loads(AMBIENT_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        try:
-            ts = float(data.get("ts", 0.0))
-        except (TypeError, ValueError):
-            ts = 0.0
-        if time.time() - ts > AMBIENT_FRESH_SEC:
-            return None
-        return data
-
-    def _sox_profile_name(self, tone: str) -> str:
-        """Решает каким DSP-профилем озвучивать ответ.
-
-        Приоритет (от высшего к низшему):
-          1. tone == 'alert' — всегда alert-профиль (никакая темнота
-             не приглушит звуковую тревогу).
-          2. ambient.light_lux < 30 → night_stealth.
-          3. proximity_near=true (телефон в кармане) → night_stealth
-             (лаконичнее и тише — оператор не у экрана).
-          4. Час ≥ 23 или ≤ 6 → night_stealth (fallback без сенсора).
-          5. Иначе tone (normal/idle)."""
-        if tone == "alert":
-            return "alert"
-        amb = self._read_ambient()
-        if amb is not None:
-            try:
-                lux = float(amb.get("light_lux", 1e6))
-            except (TypeError, ValueError):
-                lux = 1e6
-            if lux < NIGHT_LUX_THRESHOLD:
-                return "night_stealth"
-            if bool(amb.get("proximity_near", False)):
-                return "night_stealth"
-        hour = time.localtime().tm_hour
-        if hour >= NIGHT_HOUR_START or hour < NIGHT_HOUR_END:
-            return "night_stealth"
-        return tone if tone in SOX_PROFILES else "normal"
-
     def ack(self, category: str) -> str:
         return random.choice(ACK_VARIANTS.get(category, ("ok",)))
 
-    def say(self, text: str, tone: str | None = None) -> None:
-        """Enqueue text for sequential TTS. All speech goes through _tts_worker_loop
-        so piper processes never overlap. Alert tone interrupts current speech."""
+    def say(
+        self,
+        text: str,
+        tone: str | None = None,
+        *,
+        speed: float | None = None,
+        pause: float | None = None,
+    ) -> None:
+        """Озвучить текст через AcousticEngine (последовательная очередь, кино-DSP).
+
+        ``tone`` (normal/alert/idle) маппится на состояние голоса; ALERT прерывает
+        текущую речь. Опциональные ``speed``/``pause`` — когнитивная просодия от
+        LLM (speak_response). Инлайн-тег ``<say speed pause>`` в тексте тоже
+        учитывается движком. Метод неблокирующий — лишь кладёт фразу в очередь."""
         text = (text or "").strip()
         if not text:
             return
         self._last_say_ts = time.time()
         chosen = tone or self._tone_for_state()
-
-        # Alert tone: прерываем текущую речь, ставим вперёд очереди
-        if chosen == "alert":
-            self._interrupt_current_speech()
-
-        self._tts_queue.put((text, chosen))
-
-    def _interrupt_current_speech(self) -> None:
-        """Kill the running piper/sox/aplay pipeline immediately."""
-        with self._current_piper_lock:
-            procs = self._current_piper
-            self._current_piper = None
-        if procs is None:
-            return
-        for p in procs:
-            if p is not None and p.poll() is None:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-
-    def _tts_worker_loop(self) -> None:
-        """Single-worker TTS loop. Consumes (text, tone) pairs from _tts_queue
-        and speaks them one at a time — no overlapping piper processes.
-
-        Критически важно: этот воркер сам управляет видимостью сферы HUD.
-        Перед _play_tts публикует STATE_CHANGE→SPEAKING, после — IDLE.
-        Только так сфера появляется и гаснет синхронно с реальным звуком,
-        а не с логикой LLM (которая переходит в IDLE раньше конца речи)."""
-        while True:
-            try:
-                item = self._tts_queue.get()
-                if item is None:
-                    break
-                text, tone = item
-                # Сигналим шине: начинаем говорить — сфера появляется
-                self._tts_playing = True
-                self.bus.publish_threadsafe(
-                    Event(EventType.STATE_CHANGE, ("SPEAKING", text[:60]))
-                )
-                try:
-                    self._play_tts(text, tone)
-                finally:
-                    self._tts_playing = False
-                    # Если очередь пуста — возвращаемся в IDLE и гасим сферу
-                    if self._tts_queue.empty():
-                        self.bus.publish_threadsafe(
-                            Event(EventType.STATE_CHANGE, ("IDLE", ""))
-                        )
-                        # Явный нулевой FFT-кадр — HUD сразу гасит сферу
-                        self.bus.publish_threadsafe(
-                            Event(EventType.AUDIO_FFT, {"bands": [0.0] * 24, "level": 0.0, "ts": time.time()})
-                        )
-            except Exception:
-                log.exception("tts worker loop error")
-
-    def _play_tts(self, text: str, chosen: str) -> None:
-        length_scale, sentence_silence = TONE_PRESETS.get(chosen, TONE_PRESETS["normal"])
-
-        # Symbiote modulation: when the box is under load, talk faster
-        # with shorter pauses — the user is busy with a compile or a
-        # heavy GUI app and we shouldn't hog the air. CRITICAL goes
-        # even faster. Floor at 0.55 so we don't chipmunk.
-        load = SystemState().load
-        if load == SystemLoad.HIGH:
-            length_scale *= 0.88
-            sentence_silence *= 0.6
-        elif load == SystemLoad.CRITICAL:
-            length_scale *= 0.78
-            sentence_silence *= 0.4
-        length_scale = max(0.55, length_scale)
-
-        # Зафиксируем DSP-профиль СЕЙЧАС — состояние системы могло смениться
-        sox_profile_name = self._sox_profile_name(chosen)
-        sox_args = SOX_PROFILES.get(sox_profile_name, SOX_PROFILES["normal"])
-
-        if not Path(PIPER_PATH).is_file():
-            log.error(
-                "Piper binary not found at %s — TTS disabled. "
-                "Положите бинарник в %s/piper/piper",
-                PIPER_PATH, _PROJECT_ROOT,
-            )
-            return
-        if not Path(VOICE_MODEL).is_file():
-            log.error(
-                "Voice model not found at %s — TTS disabled.",
-                VOICE_MODEL,
-            )
-            return
-        if not Path(VOICE_CONFIG).is_file():
-            log.error(
-                "Voice config not found at %s — TTS disabled.",
-                VOICE_CONFIG,
-            )
-            return
-
-        piper = sox = aplay = None
-        try:
-            # ─── 1) piper: text → raw PCM ───
-            piper = subprocess.Popen(
-                [
-                    PIPER_PATH,
-                    "--model", VOICE_MODEL,
-                    "--config", VOICE_CONFIG,
-                    "--output_raw",
-                    "--length-scale", f"{length_scale:.2f}",
-                    "--sentence-silence", f"{sentence_silence:.2f}",
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-
-            # ─── 2) aplay: PCM → soundcard ───
-            try:
-                aplay = subprocess.Popen(
-                    ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-q"],
-                    stdin=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                aplay = None
-
-            # ─── 3) sox DSP между piper и aplay ───
-            if SOX_BIN and aplay is not None:
-                try:
-                    sox = subprocess.Popen(
-                        [SOX_BIN, *DSP_IO_ARGS, *sox_args],
-                        stdin=subprocess.PIPE,
-                        stdout=aplay.stdin,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    log.exception("sox DSP startup failed; fallback to direct piper→aplay")
-                    sox = None
-            elif aplay is not None and not SOX_BIN:
-                # Без sox голос идёт «сырым» из piper — тембр/кино-постобработка
-                # НЕ применяются. Это самая частая причина «голос не изменился».
-                # Предупреждаем ОДИН раз, громко, с инструкцией.
-                global _SOX_MISSING_WARNED
-                if not _SOX_MISSING_WARNED:
-                    _SOX_MISSING_WARNED = True
-                    log.warning(
-                        "sox не найден в PATH — голос идёт БЕЗ кино-постобработки "
-                        "(тембр/эквализация/реверб профиля '%s' пропущены). "
-                        "Установите: sudo apt install sox",
-                        sox_profile_name,
-                    )
-
-            sink_stdin = (sox.stdin if sox is not None
-                          else (aplay.stdin if aplay is not None else None))
-
-            assert piper.stdin is not None and piper.stdout is not None
-            piper.stdin.write(text.encode("utf-8"))
-            piper.stdin.close()
-
-            # Регистрируем процессы для возможного прерывания
-            with self._current_piper_lock:
-                self._current_piper = [p for p in (piper, sox, aplay) if p is not None]
-
-            self._fft_pump.start_pump(piper.stdout, sink_stdin, label=f"piper[{sox_profile_name}]")
-
-            if sox is not None:
-                sox.wait()
-            if aplay is not None:
-                aplay.wait()
-            piper.wait()
-        except Exception:
-            log.exception("_play_tts() pipeline failed")
-        finally:
-            with self._current_piper_lock:
-                self._current_piper = None
-            for p in (sox, aplay, piper):
-                if p is not None and p.poll() is None:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
+        self._acoustic.speak(text, chosen, speed=speed, pause=pause)
 
     # ───────────── Context Weaver (Pillar 4) ─────────────
     # Builds the structured short prompt the spec asks for:
@@ -797,7 +467,7 @@ class Jarvis(metaclass=Singleton):
     # ───────────── Tool dispatch (Native Function Calling) ─────────────
     @staticmethod
     def _tone_for_mood(mood: tooldefs.SpeakMood) -> str:
-        """speak_response.mood → SOX-профиль голоса (_play_tts)."""
+        """speak_response.mood → tone-строка для AcousticEngine (state/DSP-профиль)."""
         return {
             tooldefs.SpeakMood.ALERT: "alert",
             tooldefs.SpeakMood.PROFESSIONAL: "normal",
@@ -921,7 +591,13 @@ class Jarvis(metaclass=Singleton):
         if name == tooldefs.ToolName.SPEAK_RESPONSE:
             sp = tooldefs.SpeakArgs.from_dict(call.arguments)
             if sp.text.strip():
-                self.say(sp.text.strip(), tone=self._tone_for_mood(sp.mood))
+                # Когнитивная просодия: mood → тон, speed/pause → ритм Piper.
+                self.say(
+                    sp.text.strip(),
+                    tone=self._tone_for_mood(sp.mood),
+                    speed=sp.speed,
+                    pause=sp.pause,
+                )
                 st.spoke = True
                 # HUD ticker continuity (раньше его кормил token-stream).
                 await self.bus.publish(Event(EventType.TOKEN_STREAM, sp.text.strip()))
