@@ -1,0 +1,29 @@
+[Unit]
+Description=JARVIS Protocol — AI Orchestrator for Kali Linux
+After=graphical-session.target sound.target plasma-kwin_wayland.service
+PartOf=graphical-session.target
+# Ollama (LLM brain) и KDE Connect (Pixel bridge) — soft-dep,
+# не падаем если их нет, но дожидаемся графической сессии.
+Wants=ollama.service
+
+[Service]
+Type=simple
+WorkingDirectory=__JARVIS_HOME__
+ExecStart=__JARVIS_PYTHON__ __JARVIS_HOME__/start_jarvis.py
+Restart=always
+RestartSec=3
+# Системд watchdog: если event-loop завис (дедлок, OOM) — рестарт через 30с.
+WatchdogSec=30
+NotifyAccess=main
+# Достаточно лога, чтобы поймать SIGABRT/IOT при старте.
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=QT_QPA_PLATFORM=wayland
+# OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
+# падал на llvmpipe. Если у пользователя другой драйвер — пусть
+# переопределит в drop-in.
+Environment=MESA_LOADER_DRIVER_OVERRIDE=iris
+
+[Install]
+WantedBy=graphical-session.target

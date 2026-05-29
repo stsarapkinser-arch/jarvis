@@ -1,0 +1,30 @@
+# Jarvis project configuration — линтер и тестраннер.
+# Сборка/публикация пакета не выполняется (это автономное приложение, не библиотека).
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["piper", "scripts", "__pycache__", ".venv", "venv", "jarvis_memory"]
+
+[tool.ruff.lint]
+# Подмножество стандартного набора: ошибки pyflakes (F), стилевые (E/W),
+# модернизация (UP), bugbear (B), импорты (I). Длинные строки (E501) не
+# проверяем — много русскоязычных system_prompt-блоков и URL.
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = [
+    "E501",  # длинные строки (часто русскоязычные литералы и URL)
+    "B008",  # function calls in default args (FastAPI/Qt patterns)
+    "UP007", # Union/Optional синтаксис — оставляем PEP 604 на усмотрение
+]
+
+[tool.ruff.lint.per-file-ignores]
+# В тестах допустимы fixture-импорты без явного использования.
+"tests/*" = ["F401"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:chromadb.*",
+]

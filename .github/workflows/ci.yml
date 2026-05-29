@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: Install runtime + test dependencies
+        # llama-cpp-python и PyQt6 не нужны для unit-тестов и тянут тяжёлые
+        # системные зависимости — ставим только то, на чём держатся тесты.
+        run: |
+          pip install pytest pytest-asyncio numpy chromadb ollama
+
+      - name: pytest
+        run: pytest tests/ -q

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Runtime state
+jarvis_memory/
+
+# Large model/binary assets — stored outside the repo
+models/
+model/
+piper/*.onnx
+
+# Generated/ephemeral
+scripts/_inline/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
