@@ -141,11 +141,9 @@ class JarvisHUD(QMainWindow):
         self.thinking_text: str = ""
         self.ticker_buffer: deque[str] = deque(maxlen=220)
 
-        # Sphere position (нормированные ratio, lerp к таргету от KWin watcher'а)
-        self._target_xr: float = 0.88
-        self._target_yr: float = 0.86
-        self._current_xr: float = 0.88
-        self._current_yr: float = 0.86
+        # Sphere position (strictly locked to native position, no drift)
+        self._locked_xr: float = 0.88
+        self._locked_yr: float = 0.86
 
         # Pulse phase (для idle/thinking мягкого мерцания сферы)
         self._pulse_phase: float = 0.0
@@ -216,7 +214,8 @@ class JarvisHUD(QMainWindow):
 
     def _set_state_color(self) -> None:
         """Анимация рамки в цвет текущего ``self.state``. Если IDLE —
-        после transition перезапускаем бесконечную idle-пульсацию."""
+        после transition перезапускаем бесконечную idle-пульсацию.
+        При SPEAKING — frame пульсирует в такт голосу через FFT level."""
         target = STATE_FRAME_COLORS.get(self.state, FRAME_NEUTRAL)
         self._animate_frame_to(target, FRAME_TRANSITION_MS)
         if self.state == "IDLE":
@@ -233,6 +232,19 @@ class JarvisHUD(QMainWindow):
         self._idle_pulse_anim.setKeyValueAt(0.5, FRAME_IDLE_DIM)
         self._idle_pulse_anim.setEndValue(QColor(self._frame_color))
         self._idle_pulse_anim.start()
+
+    def _update_speaking_frame(self) -> None:
+        """Modulate frame brightness by FFT level when speaking — zero-delay sync with voice."""
+        if self.state != "SPEAKING":
+            return
+        # Pulse the alpha/brightness based on FFT level (0.0-1.0)
+        base = STATE_FRAME_COLORS.get("SPEAKING", FRAME_SPEAKING)
+        # Modulate alpha: min 120, max 220 based on FFT
+        min_alpha = 120
+        max_alpha = 220
+        fft_alpha = int(min_alpha + self._fft_level * (max_alpha - min_alpha))
+        modulated = QColor(base.red(), base.green(), base.blue(), fft_alpha)
+        self._set_frame_color(modulated)
 
     # ──────── Qt slots (main thread) ────────
     @pyqtSlot(str, str)
@@ -252,8 +264,9 @@ class JarvisHUD(QMainWindow):
 
     @pyqtSlot(float, float)
     def set_core_position(self, xr: float, yr: float) -> None:
-        self._target_xr = max(0.08, min(0.92, float(xr)))
-        self._target_yr = max(0.10, min(0.90, float(yr)))
+        # Strictly lock position — no lerping, no drift
+        self._locked_xr = max(0.08, min(0.92, float(xr)))
+        self._locked_yr = max(0.10, min(0.90, float(yr)))
 
     @pyqtSlot(list, float)
     def _on_fft(self, bands: list, level: float) -> None:
@@ -327,12 +340,11 @@ class JarvisHUD(QMainWindow):
     # ──────── Tick (30 fps) ────────
     def _tick(self) -> None:
         self._pulse_phase = (self._pulse_phase + 0.06) % math.tau
-        # Smooth lerp к таргету позиции сферы (от KWin watcher'а)
-        self._current_xr += (self._target_xr - self._current_xr) * 0.08
-        self._current_yr += (self._target_yr - self._current_yr) * 0.08
         # Decay FFT
         if time.time() - self._fft_decay_ts > 0.1:
             self._fft_level *= 0.88
+        # Update frame pulsation when speaking (zero-delay sync with audio FFT)
+        self._update_speaking_frame()
         # Cull stale app glows
         now = time.time()
         before = len(self._app_glows)
@@ -405,15 +417,15 @@ class JarvisHUD(QMainWindow):
             painter.setFont(QFont("Monospace", 9))
             painter.drawText(x + 4, max(0, y - 6), g.get("caption", "")[:40])
 
-    # --- 2D Сфера в углу ---
+    # --- 2D Сфера в углу (индикатор речи) ---
     def _draw_sphere(self, painter: QPainter, w: int, h: int) -> None:
-        # Сфера появляется ТОЛЬКО когда Jarvis говорит — в остальных состояниях
-        # она не видна, чтобы не отвлекать.
-        if self.state != "SPEAKING":
+        # Сфера появляется ТОЛЬКО когда Jarvis активно говорит (FFT level > threshold).
+        # При отсутствии аудио — полностью невидима.
+        if self.state != "SPEAKING" or self._fft_level < 0.05:
             return
 
-        cx = int(self._current_xr * w)
-        cy = int(self._current_yr * h)
+        cx = int(self._locked_xr * w)
+        cy = int(self._locked_yr * h)
 
         # Радиус пульсирует исключительно по FFT уровню голоса.
         # Мягкое фоновое дыхание (soft) только как минимальная анимация.
@@ -421,9 +433,9 @@ class JarvisHUD(QMainWindow):
         r = int(SPHERE_BASE_R + 2 * soft + 22 * self._fft_level)
 
         c = self._frame_color
-        # Видимость сферы пропорциональна уровню FFT — когда тихо, сфера
-        # полупрозрачная, при пиках — яркая.
-        visibility = max(0.3, self._fft_level)
+        # Видимость сферы пропорциональна уровню FFT — полностью зависит от звука.
+        # Появляется ТОЛЬКО когда есть активная речь.
+        visibility = self._fft_level
 
         # Outer halo
         outer = QRadialGradient(cx, cy, r * 2.2)

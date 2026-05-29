@@ -26,6 +26,7 @@ from src.core.orchestrator import (
     LLAMA_MODEL_PATH,
     Jarvis,
 )
+from src.core.immortal import ImmortalWatchdog, FileChangeWatcher
 from src.inference.server import LlamaServer
 from src.services.daemon_swarm import DaemonSwarm
 from src.services.watch_service import DeepWatch
@@ -188,36 +189,17 @@ async def _boot_greeting(jarvis: Jarvis) -> None:
 
 
 async def hud_layout_watcher(bus: EventBus, kwin: KWinOrchestrator) -> None:
-    """Periodically inspect the window layout and ask the HUD to re-anchor
-    to the least-occupied screen quadrant. Best-effort: silent on Wayland
-    without kdotool/wmctrl.
+    """Periodically pin the HUD window (keepAbove/skipTaskbar/skipPager/skipSwitcher).
+    KWin под Wayland сбрасывает эти флаги при смене workspace / выходе из fullscreen
+    приложений, поэтому heartbeat обязателен.
 
-    Также периодически перепинивает HUD-окно (keepAbove/skipTaskbar/
-    skipPager/skipSwitcher) — KWin под Wayland сбрасывает эти флаги при
-    смене workspace / выходе из fullscreen приложений, поэтому heartbeat
-    обязателен. Цикл одного watcher'а дешевле двух отдельных task'ов."""
+    NOTE: HUD position is strictly locked to native position (0.88, 0.86) — no repositioning."""
     log.info("HUD layout watcher started")
-    last: tuple[float, float] | None = None
-    repin_every_n_cycles = 5  # ≈ 30 секунд при 6 sec/cycle
-    cycle = 0
     while True:
         try:
-            corner = await kwin.suggest_hud_corner()
+            await kwin.pin_jarvis_hud()
         except Exception:
-            log.exception("suggest_hud_corner failed")
-            corner = None
-        if corner and corner != last:
-            await bus.publish(Event(
-                EventType.KWIN_ACTION,
-                {"kind": "hud_reposition", "x_ratio": corner[0], "y_ratio": corner[1]},
-            ))
-            last = corner
-        cycle = (cycle + 1) % repin_every_n_cycles
-        if cycle == 0:
-            try:
-                await kwin.pin_jarvis_hud()
-            except Exception:
-                log.exception("periodic HUD pin failed")
+            log.exception("HUD pin failed")
         await asyncio.sleep(HUD_REPOSITION_PERIOD_SEC)
 
 
@@ -346,7 +328,15 @@ def main() -> int:
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     with loop:
-        loop.create_task(amain())
+        # Jarvis immortality: wrap amain() in a crash-resistant watchdog
+        watchdog = ImmortalWatchdog(amain)
+        file_watcher = FileChangeWatcher()
+
+        # Start file watcher for hot reload
+        loop.create_task(file_watcher.start(), name="file-watcher")
+
+        # Start watchdog (will handle crashes and auto-restart)
+        loop.create_task(watchdog.run(), name="immortal-watchdog")
         loop.run_forever()
     return 0
 
