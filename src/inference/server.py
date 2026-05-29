@@ -24,6 +24,25 @@ from .protocol import GenerateRequest, GenerateChunk, HealthReply, ServerError
 
 log = logging.getLogger("jarvis.llm_server")
 
+# Inline script для subprocess-пробы GPU. Запускается в изолированном процессе,
+# чтобы перехватить C-level падение (SIGABRT/SIGSEGV от Vulkan/GGML_ASSERT)
+# до того как оно убьёт основной сервер.
+# Аргументы: model_path n_gpu_layers n_ctx n_batch n_ubatch
+_GPU_PROBE_SCRIPT = """\
+import sys
+from llama_cpp import Llama
+Llama(
+    model_path=sys.argv[1],
+    n_gpu_layers=int(sys.argv[2]),
+    n_ctx=int(sys.argv[3]),
+    n_batch=int(sys.argv[4]),
+    n_ubatch=int(sys.argv[5]),
+    n_threads=1,
+    flash_attn=False,
+    verbose=False,
+)
+"""
+
 
 def _env_int(name: str, default: int) -> int:
     """Read an int from the environment."""
@@ -160,8 +179,53 @@ class LlamaServer:
             writer.write(json.dumps(err._asdict()).encode() + b"\n")
             await writer.drain()
 
+    async def _probe_gpu(
+        self, n_gpu: int, n_ctx: int, n_batch: int, n_ubatch: int
+    ) -> bool:
+        """Load the model in an isolated subprocess to detect C-level GPU crashes.
+
+        SIGABRT/SIGSEGV from Vulkan или GGML_ASSERT нельзя поймать через
+        try/except в Python — они убивают процесс. Проба запускает загрузку в
+        дочернем процессе: если тот крашится (returncode != 0), основной сервер
+        выживает и может откатиться на CPU.
+
+        Установите JARVIS_LLAMA_GPU_PROBE=0, чтобы пропустить пробу."""
+        if os.getenv("JARVIS_LLAMA_GPU_PROBE", "1") == "0":
+            return True
+        log.info(
+            "GPU probe: loading model with n_gpu_layers=%d n_ctx=%d (subprocess test)...",
+            n_gpu, n_ctx,
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", _GPU_PROBE_SCRIPT,
+                self.model_path, str(n_gpu), str(n_ctx), str(n_batch), str(n_ubatch),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=120.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                log.warning("GPU probe timed out after 120 s — assuming GPU unavailable")
+                return False
+            if proc.returncode != 0:
+                log.warning(
+                    "GPU probe exited %d — GPU model load failed (SIGABRT=%s SIGSEGV=%s)",
+                    proc.returncode,
+                    proc.returncode == -6,   # SIGABRT
+                    proc.returncode == -11,  # SIGSEGV
+                )
+                return False
+            log.info("GPU probe succeeded — proceeding with iGPU")
+            return True
+        except Exception as e:
+            log.warning("GPU probe error: %s", e)
+            return False
+
     async def _ensure_llama(self) -> bool:
-        """Load the model if not already loaded."""
+        """Load the model if not already loaded. Probes GPU before real load."""
         if self._llama is not None:
             return True
 
@@ -173,28 +237,37 @@ class LlamaServer:
             log.error("Model not found: %s", self.model_path)
             return False
 
+        n_gpu = _env_int("JARVIS_LLAMA_GPU_LAYERS", -1)
+        n_ctx = _env_int("JARVIS_LLAMA_CTX", 4096)
+        n_batch = _env_int("JARVIS_LLAMA_BATCH", 256)
+        n_ubatch = _env_int("JARVIS_LLAMA_UBATCH", 128)
+        n_threads = _env_int("JARVIS_LLAMA_THREADS", 4)
+
+        if n_gpu != 0:
+            if not await self._probe_gpu(n_gpu, n_ctx, n_batch, n_ubatch):
+                log.warning(
+                    "GPU probe failed — falling back to CPU-only (n_gpu_layers=0). "
+                    "Set JARVIS_LLAMA_GPU_LAYERS=0 to suppress this probe."
+                )
+                n_gpu = 0
+
         try:
             log.info(
-                "Loading %s (gpu_layers=%d threads=%d ctx=%d batch=%d ubatch=%d)",
-                Path(self.model_path).name,
-                _env_int("JARVIS_LLAMA_GPU_LAYERS", -1),
-                _env_int("JARVIS_LLAMA_THREADS", 4),
-                _env_int("JARVIS_LLAMA_CTX", 8192),
-                _env_int("JARVIS_LLAMA_BATCH", 256),
-                _env_int("JARVIS_LLAMA_UBATCH", 128),
+                "Loading %s (gpu_layers=%d ctx=%d threads=%d batch=%d ubatch=%d)",
+                Path(self.model_path).name, n_gpu, n_ctx, n_threads, n_batch, n_ubatch,
             )
             self._llama = Llama(
                 model_path=self.model_path,
-                n_gpu_layers=_env_int("JARVIS_LLAMA_GPU_LAYERS", -1),
-                n_threads=_env_int("JARVIS_LLAMA_THREADS", 4),
-                n_ctx=_env_int("JARVIS_LLAMA_CTX", 8192),
-                n_batch=_env_int("JARVIS_LLAMA_BATCH", 256),
-                n_ubatch=_env_int("JARVIS_LLAMA_UBATCH", 128),
+                n_gpu_layers=n_gpu,
+                n_threads=n_threads,
+                n_ctx=n_ctx,
+                n_batch=n_batch,
+                n_ubatch=n_ubatch,
                 flash_attn=False,
                 chat_format="chatml",
                 verbose=False,
             )
-            log.info("Model loaded successfully")
+            log.info("Model loaded successfully (gpu_layers=%d)", n_gpu)
             return True
         except Exception:
             log.exception("Model load failed")

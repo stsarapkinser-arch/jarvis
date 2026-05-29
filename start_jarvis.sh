@@ -5,6 +5,10 @@
 #   ./start_jarvis.sh install      - установить как systemd служба
 #   ./start_jarvis.sh status       - проверить статус
 #   ./start_jarvis.sh stop         - остановить
+#
+# Обновление из репозитория:
+#   git pull --rebase              - всегда используйте --rebase,
+#                                    чтобы избежать "divergent branches"
 
 set -e
 

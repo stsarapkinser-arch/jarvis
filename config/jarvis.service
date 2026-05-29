@@ -26,9 +26,14 @@ StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=__JARVIS_HOME__
-# llama-cpp: CPU-only по умолчанию — стабильно на N100 без Vulkan-краша.
-# Для GPU-offload добавьте drop-in: JARVIS_LLAMA_GPU_LAYERS=-1 (все слои).
-Environment=JARVIS_LLAMA_GPU_LAYERS=0
+# llama-cpp: iGPU по умолчанию. Если GPU-probe (subprocess-тест загрузки модели)
+# упадёт с SIGABRT/SIGSEGV, сервер автоматически откатится на CPU.
+# Чтобы принудительно отключить probe: JARVIS_LLAMA_GPU_PROBE=0
+# Чтобы использовать CPU-only: JARVIS_LLAMA_GPU_LAYERS=0
+Environment=JARVIS_LLAMA_GPU_LAYERS=-1
+# n_ctx=4096 — вдвое меньше n_ctx=8192; KV-кэш занимает ~0.5 ГБ вместо ~1 ГБ.
+# N100 iGPU делит RAM с системой; 8192 был причиной vk::DeviceLostError.
+Environment=JARVIS_LLAMA_CTX=4096
 Environment=QT_QPA_PLATFORM=wayland
 # OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
 # падал на llvmpipe. Если у пользователя другой драйвер — пусть
