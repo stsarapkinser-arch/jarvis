@@ -1,158 +1,149 @@
-"""Jarvis immortality watchdog: auto-restart on crash, hot reload on code changes.
+"""Бессмертие Jarvis, слой 1 из 2 — горячая перезагрузка кода в самом процессе.
 
-This module wraps the main bootstrap in a watchdog loop. If the event loop crashes
-or any subsystem fails catastrophically, the watchdog:
+Архитектура бессмертия двухслойная:
 
-1. Detects the crash (exception or event loop exit)
-2. Waits for a backoff period (exponential: 2s, 4s, 8s, 16s, then 30s)
-3. Attempts to git pull (reload code from repo)
-4. Restarts the entire Jarvis event loop
+  • Слой 1 (этот файл, ``FileChangeWatcher``) — живёт ВНУТРИ процесса
+    bootstrap. Следит за ``src/`` и ``config/``; как только вы отредактировали
+    файл или сделали ``git pull``, процесс делает ``os.execv`` — перезапускает
+    сам себя с тем же PID и свежим кодом. Все изменения подхватываются
+    автоматически, вручную перезапускать ничего не нужно.
 
-Additionally, a file watcher detects changes in src/ and config/ and triggers
-hot reloads of modified modules (importlib.reload).
+  • Слой 2 (``src/core/supervisor.py``) — ВНЕШНИЙ супервизор-демон. Он
+    переживает падение/убийство/Ctrl+C процесса bootstrap и поднимает его
+    заново. Именно он делает так, что «остановка python -m src.core.bootstrap
+    не убивает Джарвиса».
+
+Почему ``os.execv``, а не ``importlib.reload``? Потому что Jarvis — это живое
+приложение Qt + asyncio + потоки. ``importlib.reload`` оставляет половину
+объектов привязанной к старым классам (Qt-слоты, замыкания, синглтоны) —
+получается полусломанное состояние. ``os.execv`` же даёт честный чистый
+старт нового кода, ничего не теряя: тот же PID, те же дескрипторы, мгновенно.
+Сервер инференса llama-cpp живёт в ОТДЕЛЬНОМ процессе, поэтому при re-exec
+он не перезагружается — модель остаётся «тёплой» в RAM.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import subprocess
 import sys
 import time
-import importlib
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable
 
 log = logging.getLogger("jarvis.immortal")
 
-RESTART_BACKOFF_SEQUENCE = [2, 4, 8, 16, 30]  # exponential backoff in seconds
-FILE_WATCH_DEBOUNCE_SEC = 1.0
+# Код выхода, по которому супервизор понимает «это плановая перезагрузка кода,
+# поднимай немедленно без backoff». Любой другой код — это краш.
+RELOAD_EXIT_CODE = 42
+
+# Сколько ждать после первого замеченного изменения, прежде чем перезапуститься
+# (редактор/`git pull` могут писать несколько файлов подряд — собираем пачку).
+FILE_WATCH_DEBOUNCE_SEC = 1.2
+# Период опроса mtime файлов.
+FILE_WATCH_POLL_SEC = 0.5
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class ImmortalWatchdog:
-    """Wraps amain() in a crash-resistant watchdog loop."""
+def reexec(reason: str = "code change") -> None:
+    """Перезапустить текущий процесс на месте свежим кодом.
 
-    def __init__(self, amain_coro: Callable[[], Any]) -> None:
-        self.amain_coro = amain_coro
-        self.restart_count = 0
-        self.last_crash_time = 0.0
-        self._file_watcher_task: asyncio.Task | None = None
+    Под супервизором/systemd выходим с ``RELOAD_EXIT_CODE`` — там поднимут
+    мгновенно. Без супервизора делаем ``os.execv`` — сами заменяем образ
+    процесса (тот же PID), что тоже подхватывает новый код без участия
+    оператора."""
+    log.warning("Перезапуск Jarvis (%s) — подхватываю новый код", reason)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
-    async def run(self) -> None:
-        """Run the main event loop with auto-restart on crash."""
-        backoff_idx = 0
-        while True:
-            try:
-                log.info(f"Jarvis startup (restart #{self.restart_count})")
-                await self.amain_coro()
-                # If amain() returns normally, that's unexpected
-                log.warning("amain() returned normally — restarting")
-            except KeyboardInterrupt:
-                log.info("Keyboard interrupt — shutting down")
-                break
-            except Exception:
-                log.exception("Jarvis crashed")
-                self.restart_count += 1
+    if os.environ.get("JARVIS_SUPERVISED") == "1":
+        # Супервизор ждёт нас и поднимет немедленно с новым кодом.
+        os._exit(RELOAD_EXIT_CODE)
 
-            # Exponential backoff before restart
-            backoff = RESTART_BACKOFF_SEQUENCE[min(backoff_idx, len(RESTART_BACKOFF_SEQUENCE) - 1)]
-            log.warning(f"Restarting in {backoff}s (backoff level {backoff_idx})")
-            await asyncio.sleep(backoff)
-            backoff_idx = min(backoff_idx + 1, len(RESTART_BACKOFF_SEQUENCE) - 1)
-
-            # Attempt git pull before restart
-            try:
-                await self._attempt_git_pull()
-            except Exception:
-                log.exception("git pull failed — continuing with current code")
-
-            self.last_crash_time = time.time()
-
-    async def _attempt_git_pull(self) -> None:
-        """Try to pull latest code from git. Silent failure — don't block restart."""
-        repo_root = Path(__file__).resolve().parents[2]  # /home/user/jarvis
-        if not (repo_root / ".git").is_dir():
-            log.debug("Not a git repo — skipping pull")
-            return
-
-        try:
-            # Run git pull in subprocess
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["git", "pull", "--rebase"],
-                cwd=str(repo_root),
-                capture_output=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                log.info(f"git pull successful: {result.stdout.decode().strip()}")
-            else:
-                log.warning(f"git pull failed: {result.stderr.decode().strip()}")
-        except subprocess.TimeoutExpired:
-            log.warning("git pull timed out")
-        except Exception as e:
-            log.debug(f"git pull exception: {e}")
+    # Автономный режим: заменяем образ процесса на свежий интерпретатор.
+    # cwd уже корень репозитория, ``-m src.core.bootstrap`` запустит заново.
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "src.core.bootstrap"])
+    except Exception:
+        log.exception("os.execv не удался — выходим с RELOAD_EXIT_CODE")
+        os._exit(RELOAD_EXIT_CODE)
 
 
 class FileChangeWatcher:
-    """Watches src/ and config/ for file changes, triggers hot reload."""
+    """Следит за ``src/`` и ``config/``; на изменение .py/конфигов перезапускает
+    процесс свежим кодом (см. :func:`reexec`).
 
-    def __init__(self) -> None:
-        self.watch_dirs = [
-            Path(__file__).resolve().parents[2] / "src",
-            Path(__file__).resolve().parents[2] / "config",
-        ]
-        self.last_seen_mtime: dict[Path, float] = {}
-        self._debounce_handle: asyncio.TimerHandle | None = None
+    Опрос по mtime — без внешних зависимостей (watchdog/inotify не нужны),
+    надёжно работает и под Wayland, и в headless-CI."""
+
+    WATCH_SUFFIXES = (".py", ".toml", ".service", "system_prompt")
+
+    def __init__(self, on_reload: Callable[[str], None] | None = None) -> None:
+        self.watch_dirs = [_REPO_ROOT / "src", _REPO_ROOT / "config"]
+        self._on_reload = on_reload or reexec
+        self._mtimes: dict[Path, float] = {}
+        self._pending_since: float | None = None
+        self._armed = False  # первый проход только снимает baseline, не триггерит
+
+    def _iter_files(self):
+        for d in self.watch_dirs:
+            if not d.is_dir():
+                continue
+            for p in d.rglob("*"):
+                if not p.is_file():
+                    continue
+                if p.name == "system_prompt" or p.suffix in self.WATCH_SUFFIXES:
+                    yield p
+
+    def _scan(self) -> set[Path]:
+        """Вернуть множество изменившихся с прошлого скана файлов."""
+        changed: set[Path] = set()
+        seen: set[Path] = set()
+        for p in self._iter_files():
+            seen.add(p)
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            prev = self._mtimes.get(p)
+            if prev is None:
+                self._mtimes[p] = mtime
+                if self._armed:
+                    changed.add(p)  # новый файл появился
+            elif mtime > prev:
+                self._mtimes[p] = mtime
+                changed.add(p)
+        # Удалённые файлы тоже считаем изменением.
+        removed = set(self._mtimes) - seen
+        for p in removed:
+            self._mtimes.pop(p, None)
+            if self._armed:
+                changed.add(p)
+        return changed
 
     async def start(self) -> None:
-        """Start the file watcher task."""
+        """Запустить цикл наблюдения (как asyncio-таск)."""
+        log.info("FileChangeWatcher: слежу за %s",
+                 ", ".join(str(d) for d in self.watch_dirs))
+        # Первый проход — снимаем baseline mtime, не реагируем.
+        self._scan()
+        self._armed = True
         while True:
             try:
-                await self._check_for_changes()
+                changed = self._scan()
+                if changed:
+                    if self._pending_since is None:
+                        self._pending_since = time.monotonic()
+                        log.info("Замечены изменения: %s",
+                                 ", ".join(sorted(p.name for p in changed)))
+                    else:
+                        # пришли ещё файлы — продлеваем debounce
+                        self._pending_since = time.monotonic()
+                elif self._pending_since is not None:
+                    if time.monotonic() - self._pending_since >= FILE_WATCH_DEBOUNCE_SEC:
+                        self._pending_since = None
+                        self._on_reload("изменены файлы проекта")
             except Exception:
-                log.exception("File watcher check failed")
-            await asyncio.sleep(0.5)
-
-    async def _check_for_changes(self) -> None:
-        """Scan watched directories for modified files."""
-        changed_files: set[Path] = set()
-
-        for watch_dir in self.watch_dirs:
-            if not watch_dir.is_dir():
-                continue
-            for py_file in watch_dir.rglob("*.py"):
-                if py_file.is_file():
-                    try:
-                        mtime = py_file.stat().st_mtime
-                        last = self.last_seen_mtime.get(py_file, 0.0)
-                        if mtime > last:
-                            changed_files.add(py_file)
-                            self.last_seen_mtime[py_file] = mtime
-                    except OSError:
-                        pass
-
-        if changed_files:
-            log.info(f"Detected {len(changed_files)} changed files: {[f.name for f in changed_files]}")
-            # Debounce: wait a bit for the editor to finish writing
-            if self._debounce_handle:
-                self._debounce_handle.cancel()
-            self._debounce_handle = asyncio.get_event_loop().call_later(
-                FILE_WATCH_DEBOUNCE_SEC,
-                lambda: asyncio.create_task(self._hot_reload(changed_files))
-            )
-
-    async def _hot_reload(self, changed_files: set[Path]) -> None:
-        """Attempt to reload changed modules."""
-        for py_file in changed_files:
-            try:
-                rel_path = py_file.relative_to(Path(__file__).resolve().parents[2])
-                # Convert path to module name: src/ui/hud.py -> src.ui.hud
-                module_name = str(rel_path).replace("/", ".").replace(".py", "")
-                if module_name in sys.modules:
-                    log.info(f"Hot reloading {module_name}")
-                    importlib.reload(sys.modules[module_name])
-                else:
-                    log.debug(f"Module {module_name} not loaded yet — skipping")
-            except Exception:
-                log.exception(f"Failed to hot reload {py_file}")
+                log.exception("FileChangeWatcher: ошибка скана")
+            await asyncio.sleep(FILE_WATCH_POLL_SEC)

@@ -59,6 +59,10 @@ FRAME_SPEAKING      = QColor(160, 210, 255, 220)   # Мягкий голубой
 FRAME_ALERT         = QColor(220, 160,  40, 220)   # Тёплый янтарь
 FRAME_NEUTRAL       = QColor( 40, 120, 200, 130)   # Нейтральный синий
 
+# Голосовая пульсация рамки: лерп dim→peak по уровню голоса (FFT).
+FRAME_SPEAK_DIM     = QColor( 90, 150, 210, 110)   # пауза между словами
+FRAME_SPEAK_PEAK    = QColor(190, 225, 255, 235)   # пик голоса
+
 STATE_FRAME_COLORS: dict[str, QColor] = {
     "IDLE":     FRAME_IDLE_BRIGHT,
     "THINKING": FRAME_THINKING,
@@ -215,7 +219,15 @@ class JarvisHUD(QMainWindow):
     def _set_state_color(self) -> None:
         """Анимация рамки в цвет текущего ``self.state``. Если IDLE —
         после transition перезапускаем бесконечную idle-пульсацию.
-        При SPEAKING — frame пульсирует в такт голосу через FFT level."""
+        При SPEAKING — frame пульсирует в такт голосу через FFT level,
+        поэтому QPropertyAnimation глушим: им управляет только _tick→FFT."""
+        if self.state == "SPEAKING":
+            # Голос полностью владеет цветом рамки — никаких конкурирующих
+            # анимаций, иначе они дёргают frameColor мимо FFT и появляется
+            # рассинхрон/мерцание. _update_speaking_frame в _tick рулит сам.
+            self._idle_pulse_anim.stop()
+            self._transition_anim.stop()
+            return
         target = STATE_FRAME_COLORS.get(self.state, FRAME_NEUTRAL)
         self._animate_frame_to(target, FRAME_TRANSITION_MS)
         if self.state == "IDLE":
@@ -234,17 +246,25 @@ class JarvisHUD(QMainWindow):
         self._idle_pulse_anim.start()
 
     def _update_speaking_frame(self) -> None:
-        """Modulate frame brightness by FFT level when speaking — zero-delay sync with voice."""
+        """Рамка дышит в такт голосу. Вызывается каждый _tick (30 fps),
+        читает свежий self._fft_level (издаётся PiperFFTPump ~100 Hz прямо
+        из PCM-потока перед aplay) — задержка между звуком и пульсом ≈ 0.
+
+        Лерп между приглушённым и ярким голубым по уровню голоса: и цвет,
+        и альфа едут вместе, поэтому рамка ощутимо «вспыхивает» на пиках
+        речи и притухает в паузах между словами."""
         if self.state != "SPEAKING":
             return
-        # Pulse the alpha/brightness based on FFT level (0.0-1.0)
-        base = STATE_FRAME_COLORS.get("SPEAKING", FRAME_SPEAKING)
-        # Modulate alpha: min 120, max 220 based on FFT
-        min_alpha = 120
-        max_alpha = 220
-        fft_alpha = int(min_alpha + self._fft_level * (max_alpha - min_alpha))
-        modulated = QColor(base.red(), base.green(), base.blue(), fft_alpha)
-        self._set_frame_color(modulated)
+        lvl = self._fft_level
+        # Лёгкое фоновое «дыхание», чтобы рамка жила даже на тихих участках.
+        breath = 0.10 * (0.5 + 0.5 * math.sin(self._pulse_phase))
+        e = max(0.0, min(1.0, lvl + breath))
+        # Лерп dim → peak.
+        r = int(FRAME_SPEAK_DIM.red()   + e * (FRAME_SPEAK_PEAK.red()   - FRAME_SPEAK_DIM.red()))
+        g = int(FRAME_SPEAK_DIM.green() + e * (FRAME_SPEAK_PEAK.green() - FRAME_SPEAK_DIM.green()))
+        b = int(FRAME_SPEAK_DIM.blue()  + e * (FRAME_SPEAK_PEAK.blue()  - FRAME_SPEAK_DIM.blue()))
+        a = int(FRAME_SPEAK_DIM.alpha() + e * (FRAME_SPEAK_PEAK.alpha() - FRAME_SPEAK_DIM.alpha()))
+        self._set_frame_color(QColor(r, g, b, a))
 
     # ──────── Qt slots (main thread) ────────
     @pyqtSlot(str, str)
@@ -264,9 +284,10 @@ class JarvisHUD(QMainWindow):
 
     @pyqtSlot(float, float)
     def set_core_position(self, xr: float, yr: float) -> None:
-        # Strictly lock position — no lerping, no drift
-        self._locked_xr = max(0.08, min(0.92, float(xr)))
-        self._locked_yr = max(0.10, min(0.90, float(yr)))
+        # HUD строго зафиксирован на родном месте (правый нижний угол).
+        # Любые запросы на репозицию игнорируем — пятно/рамка НИКОГДА не
+        # съезжают. Аргументы намеренно не используются.
+        del xr, yr
 
     @pyqtSlot(list, float)
     def _on_fft(self, bands: list, level: float) -> None:

@@ -26,7 +26,7 @@ from src.core.orchestrator import (
     LLAMA_MODEL_PATH,
     Jarvis,
 )
-from src.core.immortal import ImmortalWatchdog, FileChangeWatcher
+from src.core.immortal import FileChangeWatcher
 from src.inference.server import LlamaServer
 from src.services.daemon_swarm import DaemonSwarm
 from src.services.watch_service import DeepWatch
@@ -328,15 +328,15 @@ def main() -> int:
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
     with loop:
-        # Jarvis immortality: wrap amain() in a crash-resistant watchdog
-        watchdog = ImmortalWatchdog(amain)
+        # Бессмертие, слой 1: горячая перезагрузка кода. Watcher следит за
+        # src/ и config/ — при правке файлов или git pull процесс делает
+        # os.execv и поднимается со свежим кодом (тот же PID), без ручного
+        # перезапуска. Слой 2 (переживание крашей/убийства) — внешний
+        # супервизор: python -m src.core.supervisor.
         file_watcher = FileChangeWatcher()
-
-        # Start file watcher for hot reload
         loop.create_task(file_watcher.start(), name="file-watcher")
 
-        # Start watchdog (will handle crashes and auto-restart)
-        loop.create_task(watchdog.run(), name="immortal-watchdog")
+        loop.create_task(amain(), name="amain")
         loop.run_forever()
     return 0
 

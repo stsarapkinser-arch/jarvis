@@ -11,8 +11,10 @@
 # Идемпотентен: повторный запуск переустанавливает unit и перечитывает daemon.
 set -euo pipefail
 
-JARVIS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEMPLATE="${JARVIS_HOME}/jarvis.service"
+# Корень репозитория = родитель scripts/. Так пути для `python -m src.core.*`
+# и WorkingDirectory указывают на репозиторий, а не на scripts/.
+JARVIS_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE="${JARVIS_HOME}/config/jarvis.service"
 USER_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 TARGET="${USER_UNIT_DIR}/jarvis.service"
 

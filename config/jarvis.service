@@ -7,18 +7,25 @@ PartOf=graphical-session.target
 Wants=ollama.service
 
 [Service]
-Type=simple
+# Бессмертие: ExecStart запускает внешний супервизор (слой 2), который
+# стережёт python -m src.core.bootstrap и поднимает его при любом падении/
+# убийстве. foreground — супервизор не демонизируется, его держит сам systemd.
+Type=notify
+# sd_notify (READY=1/WATCHDOG=1) шлёт дочерний bootstrap, не супервизор,
+# поэтому нужен all, а не main.
+NotifyAccess=all
 WorkingDirectory=__JARVIS_HOME__
-ExecStart=__JARVIS_PYTHON__ __JARVIS_HOME__/start_jarvis.py
+ExecStart=__JARVIS_PYTHON__ -m src.core.supervisor foreground
+ExecStop=__JARVIS_PYTHON__ -m src.core.supervisor stop
 Restart=always
-RestartSec=3
-# Системд watchdog: если event-loop завис (дедлок, OOM) — рестарт через 30с.
+RestartSec=2
+# Системд watchdog: если event-loop bootstrap завис (дедлок, OOM) и перестал
+# слать WATCHDOG=1 — systemd убивает cgroup юнита и перезапускает через 2с.
 WatchdogSec=30
-NotifyAccess=main
-# Достаточно лога, чтобы поймать SIGABRT/IOT при старте.
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=__JARVIS_HOME__
 Environment=QT_QPA_PLATFORM=wayland
 # OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
 # падал на llvmpipe. Если у пользователя другой драйвер — пусть
