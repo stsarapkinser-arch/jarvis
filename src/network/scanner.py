@@ -23,7 +23,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from event_bus import Event, EventBus, EventType
+from src.common.event_bus import Event, EventBus, EventType
 
 log = logging.getLogger("jarvis.nmap")
 

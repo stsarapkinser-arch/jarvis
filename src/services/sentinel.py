@@ -9,8 +9,8 @@ import time
 from pathlib import Path
 from typing import Final
 
-from event_bus import Event, EventBus, EventType, SystemLoad, SystemState
-from singleton import Singleton
+from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.sentinel")
 

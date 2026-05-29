@@ -27,8 +27,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication
 
-import jarvis_hud
-
+import src.ui.hud
 
 @pytest.fixture(scope="module")
 def app():

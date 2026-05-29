@@ -27,7 +27,7 @@ import secrets
 import tempfile
 from pathlib import Path
 
-from shadow_exec import ShadowExec, ShadowResult
+from src.security.execution import ShadowExec, ShadowResult
 
 log = logging.getLogger("jarvis.ephemeral")
 

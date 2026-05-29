@@ -27,13 +27,13 @@ except ImportError:
     psutil = None  # type: ignore
     _HAS_PSUTIL = False
 
-from audio_fft import PiperFFTPump
-from ephemeral import EphemeralRunner, extract_python
-from event_bus import Event, EventBus, EventType, SystemLoad, SystemState
-from kwin import KWinOrchestrator
-from memory_engine import SIG_WARM, ChronoMemory
-from nmap_stream import is_nmap_command, stream_nmap
-from parser import (
+from src.audio.fft_analyzer import PiperFFTPump
+from src.memory.ephemeral import EphemeralRunner, extract_python
+from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
+from src.ui.window_manager import KWinOrchestrator
+from src.memory.engine import SIG_WARM, ChronoMemory
+from src.network.scanner import is_nmap_command, stream_nmap
+from src.common.parser import (
     ParsedResponse,
     clean_bash,
     inject_sudo,
@@ -41,23 +41,23 @@ from parser import (
     run_bash,
     wrap_sandbox,
 )
-from repair import QuickPatcher
-from shadow_exec import ShadowExec, needs_shadow
-from singleton import Singleton
-from state_snapshot import StateSnapshot, snapshot
+from src.common.repair import QuickPatcher
+from src.security.execution import ShadowExec, needs_shadow
+from src.common.singleton import Singleton
+from src.memory.snapshot import StateSnapshot, snapshot
 
 log = logging.getLogger("jarvis.core")
 
-# Абсолютные пути относительно корня проекта (директория с core.py).
+# Абсолютные пути относительно корня проекта (директория выше src/).
 # systemd, разные CWD, тесты — везде работает одинаково.
-_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PIPER_PATH = str(_PROJECT_ROOT / "piper" / "piper")
 VOICE_MODEL = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.onnx")
 # По умолчанию piper ищет config рядом с моделью под именем
 # <model>.onnx.json — но у оператора файл лежит как <model>.json (без
 # .onnx в середине). Передаём явно через --config, ничего не переименовывая.
 VOICE_CONFIG = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.json")
-SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "system_prompt")
+SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "config" / "system_prompt")
 
 # ───────────── In-process LLM (llama-cpp + iGPU offload) ─────────────
 # ТЗ оператора: уходим с HTTP-Ollama на прямой in-process llama_cpp.Llama

@@ -19,9 +19,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import audio_fft
-from event_bus import EventBus, EventType
-from singleton import Singleton
+import src.audio.fft_analyzer as audio_fft
+from src.common.event_bus import EventBus, EventType
+from src.common.singleton import Singleton
 
 
 def _tone_bytes(freq_hz: float, sample_rate: int = 22050, ms: int = 80) -> bytes:

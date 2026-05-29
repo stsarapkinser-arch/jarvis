@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kwin import KWinOrchestrator, ScreenLayout, WindowInfo
-from singleton import Singleton
+from src.ui.window_manager import KWinOrchestrator, ScreenLayout, WindowInfo
+from src.common.singleton import Singleton
 
 
 def _make_layout() -> ScreenLayout:

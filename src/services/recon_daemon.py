@@ -37,8 +37,8 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from event_bus import Event, EventBus, EventType
-from singleton import Singleton
+from src.common.event_bus import Event, EventBus, EventType
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.recon")
 

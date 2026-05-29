@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from singleton import Singleton
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.kwin")
 

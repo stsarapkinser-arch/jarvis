@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from re import Pattern
 
-from singleton import Singleton
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.repair")
 

@@ -21,23 +21,23 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
 
-from core import (
+from src.core.orchestrator import (
     _HAS_LLAMA_CPP,
     LLAMA_MODEL_NAME,
     LLAMA_MODEL_PATH,
     Jarvis,
 )
-from daemon_swarm import DaemonSwarm
-from deep_watch import DeepWatch
-from event_bus import Event, EventBus, EventType
-from jarvis_hud import JarvisHUD
-from kwin import KWinOrchestrator
-from main import JarvisMain
-from memory_engine import ChronoMemory
-from mnemosyne import Mnemosyne
-from pixel import PixelBridge
-from recon_daemon import ReconDaemon
-from sentinel import Sentinel
+from src.services.daemon_swarm import DaemonSwarm
+from src.services.watch_service import DeepWatch
+from src.common.event_bus import Event, EventBus, EventType
+from src.ui.hud import JarvisHUD
+from src.ui.window_manager import KWinOrchestrator
+from src.core.entry_point import JarvisMain
+from src.memory.engine import ChronoMemory
+from src.memory.storage import Mnemosyne
+from src.ui.pixel_renderer import PixelBridge
+from src.services.recon_daemon import ReconDaemon
+from src.services.sentinel import Sentinel
 
 log = logging.getLogger("jarvis.boot")
 

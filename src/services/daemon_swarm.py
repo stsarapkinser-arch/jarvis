@@ -5,8 +5,8 @@ import logging
 import re
 import shutil
 
-from event_bus import Event, EventBus, EventType
-from singleton import Singleton
+from src.common.event_bus import Event, EventBus, EventType
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.swarm")
 

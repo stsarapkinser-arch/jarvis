@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
 
-from singleton import Singleton
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.bus")
 

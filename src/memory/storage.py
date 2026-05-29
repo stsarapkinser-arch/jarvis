@@ -48,8 +48,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from event_bus import Event, EventBus, EventType
-from singleton import Singleton
+from src.common.event_bus import Event, EventBus, EventType
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.mnemosyne")
 

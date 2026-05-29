@@ -8,8 +8,8 @@ from typing import Final
 import sounddevice as sd
 from vosk import KaldiRecognizer, Model
 
-from event_bus import Event, EventBus, EventType
-from singleton import Singleton
+from src.common.event_bus import Event, EventBus, EventType
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.voice")
 
@@ -19,7 +19,7 @@ BLOCK_SIZE: Final = 16000
 READ_FRAMES: Final = 8000
 
 # Папка с весами Vosk относительно корня проекта.
-_PROJECT_ROOT = Path(__file__).resolve().parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_MODEL_PATH = str(_PROJECT_ROOT / "model")
 
 # Сообщение оператору, когда модель не загружена. Дублируется в HUD

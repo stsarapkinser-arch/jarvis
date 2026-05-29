@@ -13,8 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import mnemosyne
-
+import src.memory.storage
 
 # --- pure helpers ----------------------------------------------------------
 def test_parse_firefox_url_picks_url_only():

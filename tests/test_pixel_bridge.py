@@ -22,9 +22,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import pixel
-from event_bus import Event, EventBus, EventType
-from singleton import Singleton
+import src.ui.pixel_rendererfrom src.common.event_bus import Event, EventBus, EventType
+from src.common.singleton import Singleton
 
 
 def _fresh_bridge() -> pixel.PixelBridge:

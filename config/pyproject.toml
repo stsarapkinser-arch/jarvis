@@ -4,7 +4,7 @@
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["piper", "scripts", "__pycache__", ".venv", "venv", "jarvis_memory"]
+extend-exclude = ["piper", "separated", "__pycache__", ".venv", "venv", "jarvis_memory"]
 
 [tool.ruff.lint]
 # Подмножество стандартного набора: ошибки pyflakes (F), стилевые (E/W),

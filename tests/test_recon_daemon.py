@@ -12,9 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import recon_daemon as rd
-from event_bus import EventBus
-from singleton import Singleton
+import src.services.recon_daemonas rd
+from src.common.event_bus import EventBus
+from src.common.singleton import Singleton
 
 
 def test_parse_intrusion_failed_password() -> None:

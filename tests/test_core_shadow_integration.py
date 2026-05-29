@@ -17,8 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import shadow_exec
-from singleton import Singleton
+import src.security.executionfrom src.common.singleton import Singleton
 
 
 @pytest.fixture(autouse=True)

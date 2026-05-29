@@ -38,7 +38,7 @@ import chromadb
 import ollama
 from chromadb import Documents, EmbeddingFunction, Embeddings
 
-from singleton import Singleton
+from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.memory")
 
