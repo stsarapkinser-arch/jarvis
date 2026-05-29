@@ -18,13 +18,18 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Проверка Python и venv
-if [[ ! -f ".venv/bin/python" ]]; then
+if [[ ! -f "${SCRIPT_DIR}/.venv/bin/python" ]] && [[ ! -f "${SCRIPT_DIR}/venv/bin/python" ]]; then
     echo -e "${RED}❌ venv не найден. Создаю...${NC}"
-    python3 -m venv .venv
-    .venv/bin/pip install -q -r config/requirements.txt
+    python3 -m venv "${SCRIPT_DIR}/.venv"
+    "${SCRIPT_DIR}/.venv/bin/pip" install -q -r config/requirements.txt
 fi
 
-PY=".venv/bin/python"
+# Выбираем существующий venv; путь всегда абсолютный — systemd требует абсолютный ExecStart
+if [[ -f "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+    PY="$(realpath "${SCRIPT_DIR}/.venv/bin/python")"
+else
+    PY="$(realpath "${SCRIPT_DIR}/venv/bin/python")"
+fi
 SUPERVISOR_CMD="$PY -m src.core.supervisor"
 
 # Функция: вывести справку
