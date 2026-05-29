@@ -126,3 +126,29 @@ def test_action_intents_get_a_category_with_execute_bash():
         assert d.category != IntentCategory.CONVERSATION, f"{phrase!r} → {d.category}"
         names = {s["function"]["name"] for s in tools_for_category(d.category)}
         assert "execute_bash" in names, f"{phrase!r} → {d.category} без execute_bash"
+
+
+def test_unknown_command_falls_back_to_action_not_chat():
+    """ГЛОБАЛЬНЫЙ фикс (не костыль из слов): неузнанная КОМАНДА без ключевого
+    слова идёт в action-категорию с execute_bash, а не в CONVERSATION (где модель
+    была бы разоружена и генерила прозу до таймаута)."""
+    from src.inference.tools import tools_for_category
+
+    r = IntentRouter()
+    for phrase in ("почини интернет", "перезагрузи роутер", "разбуди систему"):
+        d = r.route(phrase)
+        assert d.backend == "fallback_command", f"{phrase!r} → {d.backend}"
+        assert d.category != IntentCategory.CONVERSATION
+        names = {s["function"]["name"] for s in tools_for_category(d.category)}
+        assert "execute_bash" in names, f"{phrase!r} → {d.category} без execute_bash"
+
+
+def test_unknown_question_falls_back_to_conversation():
+    """Обратная сторона фикса: вопросительная ФОРМА (без доменных слов) → чат."""
+    r = IntentRouter()
+    for phrase in (
+        "в чём смысл жизни",
+        "сколько звёзд на небе",
+        "что важнее свобода или порядок",
+    ):
+        assert r.route(phrase).category == IntentCategory.CONVERSATION, phrase

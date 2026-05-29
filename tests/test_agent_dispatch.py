@@ -136,3 +136,35 @@ def test_unknown_tool_is_handled_gracefully():
     j = _make_jarvis()
     res = asyncio.run(j._dispatch_tool(_call("frobnicate", {}), "intent", {}, _state()))
     assert "unknown tool" in res.content
+
+
+def test_warmup_sends_tiny_request_with_tools():
+    """Прогрев должен слать один крошечный запрос С tools (греет реальный
+    префикс + компилирует Vulkan-шейдеры), max_tokens мал."""
+    from src.inference.agent import ChatResponse
+
+    j = _make_jarvis()
+    captured: dict = {}
+
+    async def fake_chat(messages, tools=None, **kw):
+        captured["tools"] = tools
+        captured["max_tokens"] = kw.get("max_tokens")
+        return ChatResponse("", (), "stop")
+
+    j._llm.chat = fake_chat  # type: ignore[assignment]
+    assert asyncio.run(j.warmup()) is True
+    assert captured["tools"], "warmup обязан слать tools"
+    assert any("execute_bash" in str(t) for t in captured["tools"])
+    assert captured["max_tokens"] and captured["max_tokens"] <= 8
+
+
+def test_warmup_returns_false_on_server_error():
+    from src.inference.openai_client import LlamaServerError
+
+    j = _make_jarvis()
+
+    async def boom(*a, **kw):
+        raise LlamaServerError("server down")
+
+    j._llm.chat = boom  # type: ignore[assignment]
+    assert asyncio.run(j.warmup()) is False

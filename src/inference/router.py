@@ -107,10 +107,9 @@ _LEXICON: dict[IntentCategory, tuple[str, ...]] = {
         r"приглуш", r"разверн", r"сверн", r"закрой\b", r"переключ", r"workspace",
         r"монитор", r"\bэкран", r"\bобои\b", r"\bтем[аыу]\b", r"\bkwin\b", r"скриншот",
         r"screenshot", r"\bфокус", r"свернуть", r"полноэкран",
-        # действия-«открой/запусти приложение/настройки» — иначе падали в
-        # CONVERSATION (без execute_bash) и модель не могла ничего сделать.
-        r"настройк", r"парамет", r"\bменю\b", r"открой", r"открыть", r"запусти",
-        r"\bприложен", r"\bокно\b", r"\bпанел", r"\bвиджет",
+        # доменные UI-существительные (точность маршрута; общие глаголы вроде
+        # «открой/запусти» намеренно НЕ тут — их ловит imperative-fallback).
+        r"настройк", r"парамет", r"\bменю\b", r"\bприложен", r"\bпанел", r"\bвиджет",
     ),
     IntentCategory.PENTEST_RECON: (
         r"\bnmap\b", r"скан", r"\bпорт", r"wireshark", r"tshark", r"tcpdump",
@@ -131,6 +130,19 @@ _COMPILED: dict[IntentCategory, re.Pattern[str]] = {
     cat: re.compile("|".join(stems), re.IGNORECASE)
     for cat, stems in _LEXICON.items()
 }
+
+# Вопросительная/разговорная ФОРМА — используется ТОЛЬКО в fallback'е (когда ни
+# один доменный лексикон не сработал), чтобы отличить вопрос от неузнанной
+# команды. Вопрос → CONVERSATION (инструменты не нужны); всё остальное считаем
+# повелительной командой → SYSTEM_OPS (полный toolset, модель не разоружена).
+_INTERROGATIVE_RE = re.compile(
+    r"\?\s*$"                                                    # знак вопроса (если есть)
+    r"|^(?:а\s+|ну\s+|и\s+)?(?:что|как|почему|зачем|кто|когда|где|какой|какая|какие|"
+    r"каково|сколько|чей|чь[её]|разве|неужели|правда|можно|можешь|стоит|умеешь|знаешь)\b"
+    r"|^в\s+ч[ёе]м\b|^есть\s+ли\b|^существует\s+ли\b"           # «в чём…», «есть ли…»
+    r"|\b(?:расскаж|объясн|посоветуй|как\s+думаешь|тво[её]\s+мнение|что\s+думаешь)\b",
+    re.IGNORECASE,
+)
 
 # Экземпляры-якоря для embedding-бэкенда (центроиды категорий).
 _EXEMPLARS: dict[IntentCategory, tuple[str, ...]] = {
@@ -232,7 +244,15 @@ class IntentRouter:
                 best_score, best_cat, best_hits = score, cat, hits
 
         if best_score <= 0:
-            return RouteDecision(IntentCategory.CONVERSATION, 0.0, "fallback")
+            # Ни один доменный лексикон не сработал. НЕ падаем слепо в
+            # CONVERSATION (это разоружало бы модель — там нет execute_bash).
+            # Различаем по форме: вопрос → разговор; команда → действие.
+            if _INTERROGATIVE_RE.search(text):
+                return RouteDecision(IntentCategory.CONVERSATION, 0.0, "fallback_question")
+            # Неузнанная команда повелительного наклонения → общий action-набор
+            # (SYSTEM_OPS = полный toolset). Устраняет КЛАСС «команда без
+            # ключевого слова → чат без инструментов → простыня до таймаута».
+            return RouteDecision(IntentCategory.SYSTEM_OPS, 0.0, "fallback_command")
         return RouteDecision(best_cat, float(best_score), "regex", best_hits)
 
     # ─────────────────────── embedding backend ───────────────────────

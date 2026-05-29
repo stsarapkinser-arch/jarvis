@@ -214,15 +214,27 @@ async def initial_hud_pin(kwin: KWinOrchestrator) -> None:
 
 
 async def _prewarm_inference(jarvis: Jarvis) -> None:
-    """Прогреть HTTP-соединение к llama-server в фоне.
+    """Прогреть llama-server в фоне, пока Jarvis договаривает приветствие.
 
-    Сам сервер — отдельный systemd-юнит (jarvis-llm.service), который грузит
-    веса в iGPU независимо от нас. Здесь лишь дёргаем /health, чтобы поднять
-    keep-alive httpx-соединение и убедиться, что демон готов к первой команде.
-    Любые ошибки глушим — реальный запрос всё равно переустановит соединение."""
+    Сам сервер — отдельный systemd-юнит (jarvis-llm.service), грузящий веса в
+    iGPU независимо от нас. Здесь: (1) ждём готовности /health (до ~180с —
+    холодная загрузка + компиляция Vulkan-шейдеров), затем (2) делаем ОДИН
+    крошечный запрос (Jarvis.warmup) — он компилирует шейдеры и греет KV-префикс,
+    чтобы ПЕРВАЯ реальная голосовая команда была мгновенной, а не ждала холодный
+    старт. Любые ошибки глушим — реальный запрос всё равно переподнимет всё."""
     try:
         await asyncio.sleep(2.0)
-        await jarvis._llm.health()
+        ready = False
+        for _ in range(90):                 # 90 × 2с = 180с на холодный старт
+            if await jarvis._llm.health():
+                ready = True
+                break
+            await asyncio.sleep(2.0)
+        if not ready:
+            log.warning("llama-server не готов за 180с — прогрев пропущен")
+            return
+        if await jarvis.warmup():
+            log.info("llama-server прогрет (Vulkan-шейдеры + KV-префикс)")
     except Exception:
         log.debug("inference prewarm skipped", exc_info=True)
 

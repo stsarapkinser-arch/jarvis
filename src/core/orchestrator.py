@@ -467,6 +467,34 @@ class Jarvis(metaclass=Singleton):
             log.error("llama-server completion failed: %s", e)
             return ""
 
+    async def warmup(self) -> bool:
+        """Прогрев llama-server при старте.
+
+        Один крошечный запрос (с tools, по самому частому пути SYSTEM_OPS):
+          * компилирует Vulkan-шейдеры iGPU (главная статья холодного старта —
+            десятки секунд при первой генерации);
+          * греет KV-префикс системного промпта, который переиспользуют реальные
+            запросы.
+        Чтобы ПЕРВАЯ голосовая команда не ждала холодный старт. max_tokens=4 —
+        нужен лишь прогон prefill+decode, результат отбрасываем."""
+        try:
+            system = self.router.system_prompt_for(IntentCategory.SYSTEM_OPS)
+            tools = tooldefs.tools_for_category(IntentCategory.SYSTEM_OPS)
+            await self._llm.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": "ping"},
+                ],
+                tools=tools, temperature=0.0, max_tokens=4,
+            )
+            return True
+        except LlamaServerError as e:
+            log.warning("warmup пропущен (сервер недоступен): %s", e)
+            return False
+        except Exception:
+            log.debug("warmup unexpected error", exc_info=True)
+            return False
+
     # ───────────── Tool dispatch (Native Function Calling) ─────────────
     @staticmethod
     def _tone_for_mood(mood: tooldefs.SpeakMood) -> str:
