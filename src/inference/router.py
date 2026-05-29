@@ -107,6 +107,10 @@ _LEXICON: dict[IntentCategory, tuple[str, ...]] = {
         r"приглуш", r"разверн", r"сверн", r"закрой\b", r"переключ", r"workspace",
         r"монитор", r"\bэкран", r"\bобои\b", r"\bтем[аыу]\b", r"\bkwin\b", r"скриншот",
         r"screenshot", r"\bфокус", r"свернуть", r"полноэкран",
+        # действия-«открой/запусти приложение/настройки» — иначе падали в
+        # CONVERSATION (без execute_bash) и модель не могла ничего сделать.
+        r"настройк", r"парамет", r"\bменю\b", r"открой", r"открыть", r"запусти",
+        r"\bприложен", r"\bокно\b", r"\bпанел", r"\bвиджет",
     ),
     IntentCategory.PENTEST_RECON: (
         r"\bnmap\b", r"скан", r"\bпорт", r"wireshark", r"tshark", r"tcpdump",

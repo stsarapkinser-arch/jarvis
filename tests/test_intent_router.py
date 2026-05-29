@@ -107,3 +107,22 @@ def test_embedding_backend_without_embedder_falls_back_to_regex():
     r = IntentRouter(backend="embedding", embedder=None)
     assert r.backend == "regex"
     assert r.route("установи пакет").category == IntentCategory.SYSTEM_OPS
+
+
+def test_action_intents_get_a_category_with_execute_bash():
+    """Регресс: «открой настройки» раньше падал в CONVERSATION (tools без
+    execute_bash) — модель не могла действовать и генерила прозу до таймаута
+    клиента. Команды-действия обязаны попадать в категорию с execute_bash."""
+    from src.inference.tools import tools_for_category
+
+    r = IntentRouter()
+    for phrase in (
+        "открой настройки",
+        "открой приложение",
+        "запусти приложение",
+        "открой меню",
+    ):
+        d = r.route(phrase)
+        assert d.category != IntentCategory.CONVERSATION, f"{phrase!r} → {d.category}"
+        names = {s["function"]["name"] for s in tools_for_category(d.category)}
+        assert "execute_bash" in names, f"{phrase!r} → {d.category} без execute_bash"

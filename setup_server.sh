@@ -111,17 +111,31 @@ sed \
     -e "s|__JARVIS_HOME__|${REPO_ROOT}|g" \
     -e "s|__LLAMA_SERVER_BIN__|${SERVER_BIN}|g" \
     "$UNIT_TEMPLATE" > "$UNIT_TARGET"
+
+# Version-robustness: снять из unit'а флаги, которых нет в этой сборке бинаря
+# (каждый tuning-флаг — на своей continuation-строке, удаляем строку целиком).
+if [ -x "$SERVER_BIN" ]; then
+    HELP="$("$SERVER_BIN" --help 2>&1 || true)"
+    for flag in --cache-ram --cache-reuse --jinja; do
+        if ! grep -q -- "$flag" <<<"$HELP"; then
+            sed -i "\| ${flag} |d" "$UNIT_TARGET"
+            warn "флаг ${flag} не поддержан этой сборкой llama-server — убран из unit"
+        fi
+    done
+fi
 echo "  ✓ unit: $UNIT_TARGET"
 systemctl --user daemon-reload
 systemctl --user enable jarvis-llm.service
 echo "  ✓ enabled (автозапуск)"
 
-# ───────────── [4/4] Запуск + health ─────────────
+# ───────────── [4/4] Запуск + health + проверка iGPU ─────────────
 say "[4/4] Старт и проверка /health..."
 systemctl --user restart jarvis-llm.service || warn "не удалось стартовать через systemd — проверьте journalctl --user -u jarvis-llm"
 printf "  ожидаю загрузки модели в iGPU"
 HEALTHY=0
-for _ in $(seq 1 60); do          # до 60 с на холодную загрузку весов
+# До 180 с: холодный первый старт = компиляция Vulkan-шейдеров + загрузка весов
+# в shared VRAM. На N100 это легко >60 с (старый лимит давал ложный «не готов»).
+for _ in $(seq 1 180); do
     if curl -fsS http://127.0.0.1:8080/health 2>/dev/null | grep -q '"ok"'; then
         HEALTHY=1; break
     fi
@@ -131,7 +145,18 @@ echo
 if [ "$HEALTHY" = "1" ]; then
     echo "  ✓ llama-server отвечает на http://127.0.0.1:8080"
 else
-    warn "сервер ещё не готов. Логи: journalctl --user -u jarvis-llm -f"
+    warn "сервер ещё не готов за 180с. Логи: journalctl --user -u jarvis-llm -f"
+fi
+
+# Проверка, что инференс реально на iGPU (Vulkan), а не свалился на CPU.
+GPU_LOG="$(journalctl --user -u jarvis-llm --no-pager -n 400 2>/dev/null || true)"
+if grep -qiE "offloaded [0-9]+/[0-9]+ layers to GPU|to the GPU|Vulkan0|ggml_vulkan|using Vulkan|Found .*Vulkan" <<<"$GPU_LOG"; then
+    echo "  ✓ iGPU-оффлоад активен (Vulkan)"
+    grep -iE "offloaded [0-9]+/[0-9]+ layers" <<<"$GPU_LOG" | tail -1 | sed 's/^/    /'
+else
+    warn "не вижу следов Vulkan/GPU-оффлоада — возможно, инференс на CPU (медленно)."
+    echo "    Проверьте: journalctl --user -u jarvis-llm | grep -iE 'vulkan|offloaded|gpu'"
+    echo "    Нужны пакеты: libvulkan1 mesa-vulkan-drivers; и сборка с -DGGML_VULKAN=ON."
 fi
 
 cat <<EOF

@@ -38,6 +38,19 @@ DEFAULT_ENDPOINT = os.getenv("JARVIS_LLM_ENDPOINT", "http://127.0.0.1:8080")
 DEFAULT_MODEL = os.getenv("JARVIS_LLM_MODEL", "llama-3.2-3b-instruct")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+# Потолок ожидания ответа. На N100 холодный первый запрос (компиляция Vulkan-
+# шейдеров + prompt-eval) может быть долгим — даём запас, но оператор может
+# подстроить через JARVIS_LLM_TIMEOUT.
+DEFAULT_REQUEST_TIMEOUT = _env_float("JARVIS_LLM_TIMEOUT", 120.0)
+
+
 class LlamaServerError(RuntimeError):
     """Сервер инференса недоступен или вернул ошибку. Оркестратор ловит это и
     озвучивает оператору сбой мозга вместо немого ухода в IDLE."""
@@ -53,12 +66,12 @@ class LlamaServerClient:
         self,
         endpoint: str | None = None,
         model: str | None = None,
-        request_timeout: float = 120.0,
+        request_timeout: float | None = None,
         connect_timeout: float = 5.0,
     ) -> None:
         self.endpoint = (endpoint or DEFAULT_ENDPOINT).rstrip("/")
         self.model = model or DEFAULT_MODEL
-        self._timeout = request_timeout
+        self._timeout = request_timeout if request_timeout is not None else DEFAULT_REQUEST_TIMEOUT
         self._connect_timeout = connect_timeout
         self._client: Any | None = None  # httpx.AsyncClient | None
 
@@ -124,7 +137,12 @@ class LlamaServerClient:
         try:
             resp = await client.post("/v1/chat/completions", json=body)
         except Exception as exc:  # httpx.ConnectError/ReadTimeout/...
-            raise LlamaServerError(f"llama-server недоступен: {exc}") from exc
+            # У httpx.ReadTimeout пустой str(), поэтому добавляем имя типа —
+            # иначе в логе было голое «llama-server недоступен: ».
+            detail = str(exc) or "превышен таймаут ответа (модель слишком долго думает?)"
+            raise LlamaServerError(
+                f"llama-server недоступен: {type(exc).__name__}: {detail}"
+            ) from exc
 
         if resp.status_code != 200:
             raise LlamaServerError(

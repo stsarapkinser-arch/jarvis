@@ -79,7 +79,10 @@ LLM_MODEL = DEFAULT_MODEL
 # read_telemetry → internal_monologue → set_hud_state → speak_response/execute_bash,
 # и держит TTFT под контролем на слабом железе.
 AGENT_MAX_STEPS = 4
-LLM_MAX_TOKENS_DEFAULT = 512
+# 384 — компактного tool-call'а + короткой речи хватает с запасом; потолок
+# не даёт 3B-модели уходить в простыню (в логах был runaway n_tokens=1489),
+# что на iGPU N100 превращалось в десятки секунд генерации и таймаут клиента.
+LLM_MAX_TOKENS_DEFAULT = 384
 # Болтовня заслуживает чуть больше «температуры» и места; системные операции —
 # почти детерминированы (точность важнее креатива).
 _CATEGORY_TEMPERATURE: dict[IntentCategory, float] = {

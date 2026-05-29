@@ -2,34 +2,41 @@
 Description=JARVIS LLM — native llama-server (Llama-3.2-3B-Instruct, Vulkan/iGPU)
 # Только loopback REST на 127.0.0.1:8080 — графическая сессия не нужна.
 After=network.target
-# Если упадёт сеть/сон — поднимется заново сам (Restart=always ниже).
 
 [Service]
 # llama-server работает в foreground → Type=exec, systemd держит сам процесс.
 Type=exec
 WorkingDirectory=__JARVIS_HOME__
 
-# ─────────────────────────── Запуск (критично для N100) ───────────────────────
-#   --ctx-size 8192      фиксированный контекст (бюджет KV-кэша ~1 ГБ в shared VRAM)
-#   --n-gpu-layers 99    полная выгрузка всех слоёв в Intel iGPU (Vulkan)
-#   --cache-reuse 256    KV-CACHE REUSE: системный микро-промпт НЕ пересчитывается
-#                        между запросами (главный выигрыш TTFT на слабом железе)
-#   --host/--port        OpenAI-совместимый REST на loopback
-#   --jinja              ОБЯЗАТЕЛЬНО для Llama-3.2 tool-calling: сервер берёт
-#                        встроенный chat-template модели и парсит tool_calls в
-#                        OpenAI-формат. Без него Native Function Calling не работает.
-#   --parallel 1         один слот → весь KV-кэш под единственный стабильный
-#                        префикс системного промпта (максимум cache-hit)
-#   --threads 4          N100 = 4 P-core
-#   --alias              имя модели в ответах = JARVIS_LLM_MODEL клиента
+# ─────────────────────── Запуск (критично для N100, 8 ГБ shared RAM) ──────────
+#   --ctx-size 4096      ВАЖНО: на этом железе --ctx-size 8192 давал
+#                        vk::DeviceLostError и раздувал KV-кэш в shared VRAM
+#                        (iGPU делит RAM с системой). 4096 стабилен; микро-промпт
+#                        + 4-секционный контекст укладываются с запасом, ~3000
+#                        токенов остаётся на ответ. Подними, если памяти больше.
+#   --n-gpu-layers 99    полная выгрузка ВСЕХ слоёв в Intel iGPU (Vulkan).
+#   --cache-ram 0        КЛЮЧЕВОЕ для 8 ГБ: отключаем server prompt-cache pool.
+#                        По умолчанию он до 8192 MiB — на 8-гиговой машине это
+#                        своп и дисковый трэш (в логах оператора было
+#                        «prompt cache update took 17888 ms» → запрос >120с →
+#                        таймаут). Префикс системного промпта всё равно
+#                        переиспользуется слотом (--parallel 1) — выигрыш TTFT
+#                        сохраняется БЕЗ дорогого save/restore KV-состояний.
+#   --cache-reuse 256    переиспользование KV-чанков при расхождении промпта.
+#   --parallel 1         один слот → стабильный префикс кэшируется максимально.
+#   --jinja              ОБЯЗАТЕЛЬНО для tool-calling Llama-3.2 (парсинг tool_calls
+#                        в OpenAI-формат через встроенный chat-template).
+#   --threads 4          N100 = 4 P-core.
+# setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря.
 ExecStart=__LLAMA_SERVER_BIN__ \
     --model __JARVIS_HOME__/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
     --alias llama-3.2-3b-instruct \
-    --ctx-size 8192 \
+    --ctx-size 4096 \
     --n-gpu-layers 99 \
-    --cache-reuse 256 \
     --parallel 1 \
     --threads 4 \
+    --cache-ram 0 \
+    --cache-reuse 256 \
     --jinja \
     --host 127.0.0.1 \
     --port 8080
