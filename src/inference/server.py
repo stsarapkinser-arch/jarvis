@@ -1,18 +1,7 @@
 """Standalone inference server for llama-cpp.
 
 Runs in a separate process. If it crashes, Jarvis can restart it without
-being killed. Communicates with the client via a Unix socket or TCP.
-
-Usage:
-    python -m src.inference.server --socket /tmp/jarvis-llm.sock
-
-Environment variables:
-    JARVIS_LLAMA_MODEL_PATH    - Path to GGUF model
-    JARVIS_LLAMA_GPU_LAYERS    - Number of layers to offload to GPU (-1 = all)
-    JARVIS_LLAMA_THREADS       - Number of CPU threads for inference
-    JARVIS_LLAMA_CTX           - Context window size
-    JARVIS_LLAMA_BATCH         - Batch size
-    JARVIS_LLAMA_UBATCH        - Micro-batch size
+being killed. Communicates with the client via a Unix socket.
 """
 from __future__ import annotations
 
@@ -20,8 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import signal
-import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -67,11 +54,23 @@ class LlamaServer:
         if Path(self.socket_path).exists():
             Path(self.socket_path).unlink()
 
-        self._server = await asyncio.start_server(
-            self._handle_client,
+        loop = asyncio.get_event_loop()
+        self._server = await loop.create_unix_server(
+            self._protocol_factory,
             path=self.socket_path,
         )
         log.info("Inference server listening on %s", self.socket_path)
+
+    def _protocol_factory(self):
+        """Factory for creating server-side protocol handlers."""
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader, self._client_connected)
+        protocol._client_connected_cb = self._client_connected  # type: ignore
+        return protocol
+
+    async def _client_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Called when a client connects."""
+        await self._handle_client(reader, writer)
 
     async def _handle_client(
         self,
@@ -79,8 +78,6 @@ class LlamaServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Handle a client connection."""
-        addr = writer.get_extra_info("peername")
-        log.debug("Client connected from %s", addr)
         try:
             while True:
                 # Read one JSON line
@@ -140,9 +137,6 @@ class LlamaServer:
                 messages.append({"role": "system", "content": req.system})
             messages.append({"role": "user", "content": req.prompt})
 
-            # This is the dangerous part: if the model or llama.cpp crashes here,
-            # the whole server process dies. But that's OK — the client detects
-            # the disconnect and can restart us.
             stream = self._llama.create_chat_completion(  # type: ignore[union-attr]
                 messages=messages,
                 stream=True,
