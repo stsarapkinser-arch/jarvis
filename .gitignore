@@ -8,12 +8,8 @@ __pycache__/
 .venv/
 venv/
 
-# Runtime state
-jarvis_memory/
-
 # Large model/binary assets — stored outside the repo
 models/
-model/
 piper/*.onnx
 
 # Generated/ephemeral
