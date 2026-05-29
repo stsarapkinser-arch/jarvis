@@ -99,15 +99,21 @@ def test_resolve_shadow_returns_false_when_no_pending():
 
 
 def test_process_intent_speaks_fallback_on_empty_llm_output():
-    """Regression: a catchable llama-cpp failure makes ``_generate_streaming``
-    return "". Jarvis must SPEAK a fallback instead of silently going IDLE —
-    otherwise the operator never learns the request was even heard.
+    """Regression: ловимый сбой инференса → агент не произвёл НИ действий, НИ
+    речи. Jarvis ОБЯЗАН озвучить сбой, а не молча уйти в IDLE — иначе оператор
+    не узнает, что его вообще услышали.
     """
+    from src.core.orchestrator import _IntentState
+    from src.inference.router import IntentCategory
+
     j = _make_jarvis_with_shadow_engine(True)
     spoken: list[str] = []
     j.say = lambda text, *a, **kw: spoken.append(text)
 
-    with patch.object(j, "_generate_streaming", new=AsyncMock(return_value="")), \
+    # Пустой прогон агента: ничего не сказал, ничего не выполнил, run=None.
+    empty = _IntentState(category=IntentCategory.CONVERSATION)
+
+    with patch.object(j, "_run_agent_for_intent", new=AsyncMock(return_value=empty)), \
          patch.object(j, "_state", new=AsyncMock(return_value=None)), \
          patch("src.core.orchestrator.snapshot", return_value={}):
         out = asyncio.run(j.process_intent("сделай что-нибудь полезное"))

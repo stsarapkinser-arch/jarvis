@@ -1,0 +1,49 @@
+[Unit]
+Description=JARVIS LLM — native llama-server (Llama-3.2-3B-Instruct, Vulkan/iGPU)
+# Только loopback REST на 127.0.0.1:8080 — графическая сессия не нужна.
+After=network.target
+# Если упадёт сеть/сон — поднимется заново сам (Restart=always ниже).
+
+[Service]
+# llama-server работает в foreground → Type=exec, systemd держит сам процесс.
+Type=exec
+WorkingDirectory=__JARVIS_HOME__
+
+# ─────────────────────────── Запуск (критично для N100) ───────────────────────
+#   --ctx-size 8192      фиксированный контекст (бюджет KV-кэша ~1 ГБ в shared VRAM)
+#   --n-gpu-layers 99    полная выгрузка всех слоёв в Intel iGPU (Vulkan)
+#   --cache-reuse 256    KV-CACHE REUSE: системный микро-промпт НЕ пересчитывается
+#                        между запросами (главный выигрыш TTFT на слабом железе)
+#   --host/--port        OpenAI-совместимый REST на loopback
+#   --jinja              ОБЯЗАТЕЛЬНО для Llama-3.2 tool-calling: сервер берёт
+#                        встроенный chat-template модели и парсит tool_calls в
+#                        OpenAI-формат. Без него Native Function Calling не работает.
+#   --parallel 1         один слот → весь KV-кэш под единственный стабильный
+#                        префикс системного промпта (максимум cache-hit)
+#   --threads 4          N100 = 4 P-core
+#   --alias              имя модели в ответах = JARVIS_LLM_MODEL клиента
+ExecStart=__LLAMA_SERVER_BIN__ \
+    --model __JARVIS_HOME__/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+    --alias llama-3.2-3b-instruct \
+    --ctx-size 8192 \
+    --n-gpu-layers 99 \
+    --cache-reuse 256 \
+    --parallel 1 \
+    --threads 4 \
+    --jinja \
+    --host 127.0.0.1 \
+    --port 8080
+
+# Бессмертие сервера: нативный краш бэкенда (Vulkan/GGML_ASSERT) убивает ТОЛЬКО
+# этот демон — Jarvis выживает и переподнимет соединение. systemd рестартит за 2с.
+Restart=always
+RestartSec=2
+# Дать инференсу приоритет планировщика (отзывчивость голоса важнее фона).
+Nice=-5
+# Vulkan/Mesa на Intel: пусть драйвер сам выберет ANV. Переопределяемо в drop-in.
+Environment=GGML_VK_VISIBLE_DEVICES=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

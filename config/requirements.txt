@@ -1,9 +1,11 @@
 ollama>=0.3
-# llama-cpp-python: in-process LLM с iGPU offloading на Intel N100. ставится
-# через setup_igpu.sh с CMAKE_ARGS под выбранный backend (OpenCL/Vulkan/CPU).
-# Версионный потолок берём только из setup-скрипта, тут — нижняя граница
-# чтобы requirements.txt оставался информативным.
-llama-cpp-python>=0.3.0
+# httpx: async-клиент к нативному llama-server (OpenAI REST). Главный мозг
+# теперь ОТДЕЛЬНЫЙ процесс (llama-server из llama.cpp, Vulkan) — собирается и
+# запускается через ./setup_server.sh + jarvis-llm.service. Python весов НЕ грузит.
+httpx>=0.27
+# llama-cpp-python больше НЕ нужен в рантайме (in-process инференс убран).
+# Оставлен закомментированным как опциональный fallback для оффлайн-экспериментов.
+# llama-cpp-python>=0.3.0
 chromadb>=0.5
 vosk>=0.3.45
 sounddevice>=0.4

@@ -17,13 +17,11 @@ except ImportError:
     _ollama_mod = None  # type: ignore[assignment]
     _HAS_OLLAMA = False
 
-from pathlib import Path
-
 from PyQt6.QtWidgets import QApplication
 
 from src.core.orchestrator import (
+    LLM_ENDPOINT,
     LLAMA_MODEL_NAME,
-    LLAMA_MODEL_PATH,
     Jarvis,
 )
 from src.core.immortal import FileChangeWatcher
@@ -52,10 +50,10 @@ REQUIRED_OLLAMA_EMBEDDING_MODELS: tuple[str, ...] = ("all-minilm",)
 async def verify_inference_stack(jarvis: Jarvis) -> None:
     """Двухслойный preflight перед стартом подсистем:
 
-    1. **llama-cpp + GGUF** — главный мозг (qwen2.5-coder:3b в Q4_K_M).
-       Без модели и пакета Jarvis молча уходит в degraded-режим: голосовые
-       команды слышим, но думать нечем — оператору внятно говорим, что
-       запустить.
+    1. **llama-server (HTTP)** — главный мозг (Llama-3.2-3B-Instruct, Q4_K_M)
+       в ОТДЕЛЬНОМ системном процессе. Если демон не отвечает по /health,
+       Jarvis уходит в degraded-режим: голосовые команды слышим, но думать
+       нечем — оператору внятно говорим, что запустить (./setup_server.sh).
     2. **Ollama + all-minilm** — эмбеддинги для ChronoMemory. Если ollama
        лежит, память деградирует до zero-recall, но это не fatal — Sentinel
        и Pixel-bridge всё равно живы.
@@ -64,10 +62,11 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
     чтобы оператор услышал ровно один краткий брифинг."""
     issues: list[str] = []
 
-    # — Layer 1: GGUF model (server loads llama-cpp).
-    if not Path(LLAMA_MODEL_PATH).is_file():
+    # — Layer 1: нативный llama-server (OpenAI REST). Веса грузит ОН, не Python.
+    if not await jarvis._llm.health():
         issues.append(
-            f"GGUF-модель {LLAMA_MODEL_NAME} отсутствует — запустите ./setup_igpu.sh"
+            f"llama-server недоступен на {LLM_ENDPOINT} ({LLAMA_MODEL_NAME}) — "
+            "запустите ./setup_server.sh или: systemctl --user start jarvis-llm"
         )
 
     # — Layer 2: Ollama embeddings (all-minilm).
@@ -126,8 +125,8 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
         )
     else:
         log.info(
-            "inference stack OK: inference server + %s, embeddings via ollama all-minilm",
-            LLAMA_MODEL_NAME,
+            "inference stack OK: llama-server (%s) @ %s, embeddings via ollama all-minilm",
+            LLAMA_MODEL_NAME, LLM_ENDPOINT,
         )
 
 
@@ -215,29 +214,28 @@ async def initial_hud_pin(kwin: KWinOrchestrator) -> None:
 
 
 async def _prewarm_inference(jarvis: Jarvis) -> None:
-    """Поднять сервер инференса ОТДЕЛЬНЫМ процессом заранее, в фоне.
+    """Прогреть HTTP-соединение к llama-server в фоне.
 
-    Дёргаем health_check у клиента — он при отсутствии соединения сам
-    спаунит ``python -m src.inference.server`` (см. client.py::_start_server).
-    Так модель грузится в своём процессе пока Jarvis договаривает приветствие,
-    и первая голосовая команда не ждёт холодный старт. Любые ошибки глушим —
-    при первом реальном запросе клиент всё равно переподнимет сервер."""
+    Сам сервер — отдельный systemd-юнит (jarvis-llm.service), который грузит
+    веса в iGPU независимо от нас. Здесь лишь дёргаем /health, чтобы поднять
+    keep-alive httpx-соединение и убедиться, что демон готов к первой команде.
+    Любые ошибки глушим — реальный запрос всё равно переустановит соединение."""
     try:
         await asyncio.sleep(2.0)
-        await jarvis._inference_client.health_check()
+        await jarvis._llm.health()
     except Exception:
         log.debug("inference prewarm skipped", exc_info=True)
 
 
 async def amain() -> None:
-    # Сервер инференса llama-cpp НЕ запускаем в процессе bootstrap:
-    #  (1) llama-cpp синхронный — генерация в этом же event-loop заморозила бы
-    #      HUD, шину и голос на каждом ответе;
-    #  (2) нативный краш llama-cpp (GGML_ASSERT/segfault) убил бы весь процесс.
-    # InferenceClient сам поднимает сервер ОТДЕЛЬНЫМ процессом при первом
-    # запросе (src/inference/client.py::_start_server) — реальная изоляция
-    # краша и никакой заморозки UI. Модель переживает hot-reload (os.execv),
-    # оставаясь тёплой в своём процессе.
+    # Веса модели НЕ грузятся в этот процесс. Инференс — нативный llama-server
+    # (jarvis-llm.service), который:
+    #  (1) держит KV-кэш системного промпта в VRAM (--cache-reuse) → низкий TTFT;
+    #  (2) изолирует нативные краши бэкенда (Vulkan/GGML_ASSERT) — падает демон,
+    #      а не Jarvis; systemd (Restart=always) поднимает его за 2с;
+    #  (3) переживает hot-reload Jarvis (os.execv), оставаясь тёплым.
+    # Мы общаемся с ним по HTTP (LlamaServerClient, httpx) — неблокирующе, так
+    # что HUD/шина/голос не замирают на раздумьях модели.
 
     bus = EventBus()
     bus.bind_loop(asyncio.get_running_loop())

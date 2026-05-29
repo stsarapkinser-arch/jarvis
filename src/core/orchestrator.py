@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 import re
 import shutil
@@ -10,7 +9,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,16 +21,14 @@ except ImportError:
     _HAS_PSUTIL = False
 
 from src.audio.fft_analyzer import PiperFFTPump
-from src.memory.ephemeral import EphemeralRunner, extract_python
+from src.memory.ephemeral import EphemeralRunner
 from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
 from src.ui.window_manager import KWinOrchestrator
 from src.memory.engine import SIG_WARM, ChronoMemory
 from src.network.scanner import is_nmap_command, stream_nmap
 from src.common.parser import (
-    ParsedResponse,
     clean_bash,
     inject_sudo,
-    parse_response,
     run_bash,
     wrap_sandbox,
 )
@@ -39,7 +36,15 @@ from src.common.repair import QuickPatcher
 from src.security.execution import ShadowExec, needs_shadow
 from src.common.singleton import Singleton
 from src.memory.snapshot import StateSnapshot, snapshot
-from src.inference.client import InferenceClient
+from src.inference.openai_client import (
+    DEFAULT_ENDPOINT,
+    DEFAULT_MODEL,
+    LlamaServerClient,
+    LlamaServerError,
+)
+from src.inference.router import IntentCategory, IntentRouter
+from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
+from src.inference import tools as tooldefs
 
 log = logging.getLogger("jarvis.core")
 
@@ -54,54 +59,45 @@ VOICE_MODEL = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.onnx")
 VOICE_CONFIG = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.json")
 SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "config" / "system_prompt")
 
-# ───────────── In-process LLM (llama-cpp + iGPU offload) ─────────────
-# ТЗ оператора: уходим с HTTP-Ollama на прямой in-process llama_cpp.Llama
-# с GGUF-моделью и offload'ом всех слоёв в Intel iGPU (N100). HUD/шина и
-# Jarvis-ядро живут в одном asyncio-процессе — блокирующий decode оборачиваем
-# в ThreadPoolExecutor, чтобы event loop не тормозил под раздумьями ИИ.
+# ───────────── Out-of-process LLM (native llama-server, OpenAI REST) ─────────
+# Фаза 1 ТЗ: Python больше НЕ грузит веса в RAM. Инференс — отдельный системный
+# процесс (бинарь llama-server из llama.cpp, Vulkan-сборка; см. setup_server.sh
+# и config/jarvis-llm.service). Общаемся по HTTP (httpx) через OpenAI-совместимый
+# /v1/chat/completions с массивом tools (Native Function Calling).
 #
-# n_gpu_layers=-1 — все слои на iGPU (Q4_K_M 3B весит ~1.9 GiB,
-#                   укладывается в shared VRAM N100 c запасом).
-# n_threads=4    — N100 = 4 P-core, ровно одно ядро на токен decode пайплайна.
-# n_ctx=4096     — экономим видеопамять; промпт-погон Context Weaver рассчитан
-#                   ровно под этот бюджет (см. WEAVER_* константы ниже).
-def _env_int(name: str, default: int) -> int:
-    """Read an int from the environment, falling back to ``default``.
-
-    Позволяет оператору подстроить llama-cpp под СВОЮ сборку (CPU-only vs
-    iGPU/Vulkan) без правки кода: например, на CPU-сборке llama-cpp оффлоад
-    в GPU не нужен — ``JARVIS_LLAMA_GPU_LAYERS=0`` отключает его."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        log.warning("env %s=%r не int — использую default %d", name, raw, default)
-        return default
-
-
-LLAMA_MODEL_NAME = "qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+# Что это даёт на N100:
+#   * llama-server держит системный промпт в KV-кэше (--cache-reuse) — микро-
+#     промпт (≤100 слов) не пересчитывается на каждый запрос → низкий TTFT;
+#   * запрос неблокирующий → EventBus, HUD и голос не замирают на раздумьях;
+#   * нативный краш бэкенда не убивает Jarvis — падает лишь отдельный демон,
+#     systemd (jarvis-llm.service, Restart=always) его поднимает.
+#
+# Имя модели — для диагностики/setup-скрипта; сам файл живёт на стороне сервера.
+LLAMA_MODEL_NAME = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 LLAMA_MODEL_PATH = str(_PROJECT_ROOT / "models" / LLAMA_MODEL_NAME)
-# n_gpu_layers=-1 — все слои на iGPU. ВАЖНО: на CPU-only сборке llama-cpp
-# (без Vulkan/CUDA-бэкенда) оффлоад невозможен — выставьте
-# JARVIS_LLAMA_GPU_LAYERS=0, иначе bookkeeping оффлоада может вести себя
-# нестабильно. На сборке с GPU-бэкендом оставьте -1.
-LLAMA_N_GPU_LAYERS = _env_int("JARVIS_LLAMA_GPU_LAYERS", -1)
-LLAMA_N_THREADS = _env_int("JARVIS_LLAMA_THREADS", 4)
-# n_ctx 8192 — модель обучена на 32768, но мы экономим память. n_batch/n_ubatch
-# исторически урезаны под Mesa Vulkan (vk::DeviceLostError на iGPU N100);
-# на CPU-сборке эти ограничения не нужны и их можно поднять через env.
-# Все три параметра переопределяемы env-переменными для подгонки под железо.
-LLAMA_N_CTX = _env_int("JARVIS_LLAMA_CTX", 8192)
-LLAMA_N_BATCH = _env_int("JARVIS_LLAMA_BATCH", 256)
-LLAMA_N_UBATCH = _env_int("JARVIS_LLAMA_UBATCH", 128)
-LLAMA_FLASH_ATTN = False
-LLAMA_MAX_TOKENS_DEFAULT = 1024
-# KV-cache системного промпта: документационная константа (в Llama() не
-# передаётся). system_prompt сейчас ~2500-3500 токенов — llama-cpp удерживает
-# его префикс в KV-кэше между запросами, не пересчитывая.
-LLAMA_SYSTEM_CACHE_TOKENS = 640
+LLM_ENDPOINT = DEFAULT_ENDPOINT
+LLM_MODEL = DEFAULT_MODEL
+# Агентный цикл: максимум раундов tool-calling за один интент. 4 хватает на
+# read_telemetry → internal_monologue → set_hud_state → speak_response/execute_bash,
+# и держит TTFT под контролем на слабом железе.
+AGENT_MAX_STEPS = 4
+LLM_MAX_TOKENS_DEFAULT = 512
+# Болтовня заслуживает чуть больше «температуры» и места; системные операции —
+# почти детерминированы (точность важнее креатива).
+_CATEGORY_TEMPERATURE: dict[IntentCategory, float] = {
+    IntentCategory.CONVERSATION: 0.6,
+    IntentCategory.SYSTEM_OPS: 0.2,
+    IntentCategory.UI_CONTROL: 0.2,
+    IntentCategory.PENTEST_RECON: 0.25,
+}
+# curl|bash, wget|sh, pip install <url>, скачанный и тут же запущенный бинарь —
+# авто-оборачиваем в firejail/systemd-run, не доверяя «флагу» от модели.
+_RISKY_DOWNLOAD_RE = re.compile(
+    r"(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|python\d?)"
+    r"|pip\d?\s+install\s+(?:https?://|git\+)"
+    r"|\bbash\s+<\(\s*curl",
+    re.IGNORECASE,
+)
 
 MAX_HEAL_ATTEMPTS = 3
 RECENT_OS_EVENTS_MAX = 5
@@ -295,6 +291,21 @@ DIAGNOSTIC_RE = re.compile(r"\b(диагностик\w*|diagnostic\w*)\b", re.IG
 DIAGNOSTIC_DURATION_SEC = 10.0
 
 
+@dataclass(slots=True)
+class _IntentState:
+    """Транзиентное состояние одного интента, мутируемое tool-диспетчером.
+
+    Живёт ровно один вызов ``process_intent`` — собирает побочные эффекты
+    (озвучил ли что-то, какие bash выполнил, итог) для записи в память и
+    fallback-логики."""
+    category: IntentCategory
+    spoke: bool = False
+    last_thought: str = ""
+    last_result: str = ""
+    bash_commands: list[str] = field(default_factory=list)
+    run: AgentRun | None = None
+
+
 class _LlamaCompletionAdapter:
     """Совместимый shim под ollama.AsyncClient API surface.
 
@@ -338,11 +349,13 @@ class Jarvis(metaclass=Singleton):
             log.error("system_prompt missing at %s — using minimal fallback", SYSTEM_PROMPT_FILE)
             self.system_prompt = "Ты — JARVIS, краткий ассистент. Отвечай по делу."
 
-        # Inference client: коммуницирует с отдельным процессом llama-cpp.
-        # Если процесс упадёт на нативный краш (GGML_ASSERT и т.п.), он
-        # перезагружается — Jarvis продолжает работу, просто скажет
-        # оператору о сбое мозга.
-        self._inference_client = InferenceClient(model_path=LLAMA_MODEL_PATH)
+        # Inference client: async HTTP к нативному llama-server (OpenAI REST).
+        # Веса модели живут в ОТДЕЛЬНОМ процессе; нативный краш бэкенда не валит
+        # Jarvis — клиент просто получит LlamaServerError, а Jarvis озвучит сбой.
+        self._llm = LlamaServerClient()
+        # Семантический маршрутизатор: core-identity берём из config/system_prompt
+        # (короткий стабильный префикс), правила категорий — внутри роутера.
+        self.router = IntentRouter(core_identity=self.system_prompt)
         # Адаптер под ollama-совместимый интерфейс — для Mnemosyne и т.п.
         self.llm_adapter = _LlamaCompletionAdapter(self)
 
@@ -758,74 +771,220 @@ class Jarvis(metaclass=Singleton):
             + self._fmt_intent(user_text)
         )
 
-    # ───────────── llama-cpp engine ─────────────
-    async def _llama_stream(
-        self,
-        prompt: str,
-        system: str | None = None,
-        max_tokens: int = LLAMA_MAX_TOKENS_DEFAULT,
-        temperature: float = 0.0,
-    ) -> AsyncIterator[str]:
-        """Stream tokens from the inference server.
-
-        Делегирует генерацию в отдельный процесс (src/inference/server.py).
-        Если сервер упадёт на нативный краш (GGML_ASSERT и т.п.), клиент
-        обнаружит разрыв соединения и выбросит RuntimeError, который вышестоящий
-        код поймает и озвучит оператору."""
-        try:
-            async for token in self._inference_client.generate_stream(
-                prompt=prompt,
-                system=system,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ):
-                yield token
-        except RuntimeError as e:
-            log.error("Inference server error: %s", e)
-            raise
-        except Exception as e:
-            log.exception("Unexpected error during generation: %s", e)
-            raise
-
+    # ───────────── llama-server engine (HTTP, OpenAI REST) ─────────────
     async def _llama_complete(
         self,
         prompt: str,
         system: str = "",
-        max_tokens: int = LLAMA_MAX_TOKENS_DEFAULT,
+        max_tokens: int = LLM_MAX_TOKENS_DEFAULT,
         temperature: float = 0.0,
     ) -> str:
-        """Non-streaming convenience: collect the full stream into a string.
-        Используется адаптером совместимости (Mnemosyne)."""
-        chunks: list[str] = []
-        async for tok in self._llama_stream(
-            prompt, system=system, max_tokens=max_tokens, temperature=temperature,
-        ):
-            chunks.append(tok)
-        return "".join(chunks)
+        """Plain (no-tools) completion. Используется адаптером совместимости
+        (Mnemosyne) и проактивным циклом. На сбой сервера возвращает ""."""
+        messages: list[dict[str, Any]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            resp = await self._llm.chat(
+                messages, tools=None, temperature=temperature, max_tokens=max_tokens,
+            )
+            return resp.content.strip()
+        except LlamaServerError as e:
+            log.error("llama-server completion failed: %s", e)
+            return ""
 
-    async def _generate_streaming(
+    # ───────────── Tool dispatch (Native Function Calling) ─────────────
+    @staticmethod
+    def _tone_for_mood(mood: tooldefs.SpeakMood) -> str:
+        """speak_response.mood → SOX-профиль голоса (_play_tts)."""
+        return {
+            tooldefs.SpeakMood.ALERT: "alert",
+            tooldefs.SpeakMood.PROFESSIONAL: "normal",
+            tooldefs.SpeakMood.IRONIC: "normal",
+        }.get(mood, "normal")
+
+    async def _apply_hud_state(self, color: str, animation: tooldefs.HudAnimation) -> None:
+        """set_hud_state → событие HUD_STATE. Нейросеть сама рулит визором Aegis."""
+        await self.bus.publish(Event(
+            EventType.HUD_STATE,
+            {"color": color, "animation": animation.value},
+        ))
+
+    def _read_sensor(self, sensor: tooldefs.TelemetrySensor) -> str:
+        """read_telemetry → короткая строка с живыми метриками (уходит в модель).
+
+        Читаем из SystemState (поддерживается Sentinel'ом, без свежего psutil-
+        опроса) — почти мгновенно, что и нужно для горячего пути."""
+        snap = SystemState().snapshot()
+        if sensor == tooldefs.TelemetrySensor.CPU:
+            return (
+                f"cpu={snap.cpu:.0f}% thermal={snap.thermal:.0f}C "
+                f"gpu={snap.gpu:.0f}% load={snap.load.value}"
+            )
+        if sensor == tooldefs.TelemetrySensor.RAM:
+            disk = self._disk_percent("/")
+            disk_part = f" disk={disk:.0f}%" if disk is not None else ""
+            return f"ram={snap.ram:.0f}%{disk_part}"
+        if sensor == tooldefs.TelemetrySensor.NETWORK:
+            for e in reversed(self._recent_os):
+                if e.get("sensor") == "internet":
+                    return f"network: {e.get('value')} ({e.get('level')})"
+            return "network: соединение в норме"
+        if sensor == tooldefs.TelemetrySensor.PIXEL_PHONE:
+            if self._last_battery:
+                tag = "charging" if self._last_battery.get("charging") else "discharging"
+                return f"pixel battery={self._last_battery.get('charge')}% ({tag})"
+            return "pixel: данных нет"
+        return "unknown sensor"
+
+    async def _run_background(self, cmd: str) -> int:
+        """Detached фоновый запуск (execute_bash background=true). Возвращает PID."""
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc.pid
+
+    async def _agent_execute_bash(
+        self,
+        args: tooldefs.ExecuteBashArgs,
+        intent: str,
+        snap: StateSnapshot | dict | None,
+    ) -> tuple[str, bool]:
+        """Исполнить execute_bash через существующий конвейер безопасности.
+
+        Возвращает (краткий результат для модели, stop) — stop=True означает,
+        что команда ушла на голосовое подтверждение или была отклонена в
+        симуляции, и агентный цикл нужно остановить."""
+        cmd = args.command.strip()
+        if not cmd:
+            return "пустая команда", False
+
+        # sudo: явный флаг модели → префикс; иначе авто-детект известных глаголов.
+        if args.requires_sudo and not cmd.lstrip().startswith("sudo "):
+            cmd = "sudo -n " + cmd
+        else:
+            cmd = inject_sudo(cmd)
+
+        # curl|bash и подобное — авто-jail, не доверяя «честности» модели.
+        if _RISKY_DOWNLOAD_RE.search(cmd):
+            cmd = wrap_sandbox(cmd)
+            log.info("agent bash auto-sandboxed: %s", cmd[:200])
+
+        if args.background:
+            if self._is_destructive(cmd):
+                await self._gate_destructive(cmd, intent, snap)
+                return "разрушительная фоновая команда — жду подтверждения", True
+            pid = await self._run_background(cmd)
+            await asyncio.to_thread(
+                self.memory.remember, intent, cmd, f"background pid={pid}", "agent_bg", snap,
+            )
+            return f"запущено в фоне, pid {pid}", False
+
+        # Shadow Exec dry-run → реальное исполнение (тот же путь, что был).
+        if needs_shadow(cmd):
+            shadow_kind = await self._shadow_then_real(cmd, intent, snap)
+            if shadow_kind == "queued":
+                return "симуляция чиста — жду голосового подтверждения оператора", True
+            if shadow_kind == "rejected":
+                return "симуляция отклонила команду (rc!=0)", True
+            # "direct" → стандартный путь ниже.
+
+        rc, stdout, stderr = await self._execute_with_healing(cmd, intent, current_snap=snap)
+        if rc is None and "awaiting confirmation" in stderr:
+            return "команда разрушительна — жду голосового подтверждения", True
+
+        result = stdout.strip() or stderr.strip() or (
+            f"rc={rc}" if rc is not None else "detached"
+        )
+        await asyncio.to_thread(self.memory.remember, intent, cmd, result, "agent_bash", snap)
+        return f"rc={rc}; {result[:400]}", False
+
+    async def _dispatch_tool(
+        self,
+        call: ToolCall,
+        intent: str,
+        snap: StateSnapshot | dict | None,
+        st: _IntentState,
+    ) -> ToolResult:
+        """Связывает абстрактный ToolCall с реальной подсистемой Jarvis."""
+        name = call.name
+        if name == tooldefs.ToolName.INTERNAL_MONOLOGUE:
+            thought = tooldefs.MonologueArgs.from_dict(call.arguments).thought
+            log.info("CoT: %s", thought[:300])
+            st.last_thought = thought
+            return ToolResult(call.id, "logged")
+
+        if name == tooldefs.ToolName.SPEAK_RESPONSE:
+            sp = tooldefs.SpeakArgs.from_dict(call.arguments)
+            if sp.text.strip():
+                self.say(sp.text.strip(), tone=self._tone_for_mood(sp.mood))
+                st.spoke = True
+                # HUD ticker continuity (раньше его кормил token-stream).
+                await self.bus.publish(Event(EventType.TOKEN_STREAM, sp.text.strip()))
+            return ToolResult(call.id, "spoken")
+
+        if name == tooldefs.ToolName.SET_HUD_STATE:
+            hud = tooldefs.HudArgs.from_dict(call.arguments)
+            await self._apply_hud_state(hud.color, hud.animation)
+            return ToolResult(call.id, "hud updated")
+
+        if name == tooldefs.ToolName.READ_TELEMETRY:
+            tel = tooldefs.TelemetryArgs.from_dict(call.arguments)
+            reading = self._read_sensor(tel.sensor)
+            return ToolResult(call.id, reading)
+
+        if name == tooldefs.ToolName.EXECUTE_BASH:
+            ba = tooldefs.ExecuteBashArgs.from_dict(call.arguments)
+            st.bash_commands.append(ba.command)
+            summary, stop = await self._agent_execute_bash(ba, intent, snap)
+            st.last_result = summary
+            return ToolResult(call.id, summary, stop=stop)
+
+        log.warning("unknown tool call: %s", name)
+        return ToolResult(call.id, f"unknown tool {name}")
+
+    async def _run_agent_for_intent(
         self,
         user_text: str,
         past: list[dict],
-        current_snap: StateSnapshot | dict | None = None,
-        extra: str = "",
-    ) -> str:
-        # current_snap is accepted for backwards compat with self-heal paths
-        # but no longer used — SystemState() is the live source of truth.
-        del current_snap
+        snap: StateSnapshot | dict | None,
+    ) -> _IntentState:
+        """Маршрутизация → микро-промпт + tools → агентный цикл с tool-dispatch."""
+        decision = self.router.route(user_text)
+        system_prompt = self.router.system_prompt_for(decision.category)
+        tools = tooldefs.tools_for_category(decision.category)
+        temperature = _CATEGORY_TEMPERATURE.get(decision.category, 0.2)
+        log.info(
+            "route=%s (backend=%s score=%.1f) tools=%d",
+            decision.category.value, decision.backend, decision.score, len(tools),
+        )
+
         context = self.build_context(user_text, past)
-        prompt = f"{context}\n{extra}" if extra else context
-        chunks: list[str] = []
-        try:
-            async for tok in self._llama_stream(
-                prompt, system=self.system_prompt,
-                max_tokens=LLAMA_MAX_TOKENS_DEFAULT, temperature=0.0,
-            ):
-                chunks.append(tok)
-                await self.bus.publish(Event(EventType.TOKEN_STREAM, tok))
-        except Exception:
-            log.exception("llama-cpp streaming failed")
-        return "".join(chunks)
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context},
+        ]
+
+        st = _IntentState(category=decision.category)
+
+        async def dispatch(call: ToolCall) -> ToolResult:
+            return await self._dispatch_tool(call, user_text, snap, st)
+
+        run: AgentRun = await run_agent(
+            self._llm, messages, tools, dispatch,
+            max_steps=AGENT_MAX_STEPS, temperature=temperature,
+            max_tokens=LLM_MAX_TOKENS_DEFAULT,
+        )
+        st.run = run
+        # Модель ответила голым текстом вместо speak_response — всё равно озвучим.
+        if not st.spoke and run.stopped == "no_tools" and run.final_content.strip():
+            self.say(run.final_content.strip()[:400])
+            st.spoke = True
+        return st
 
     async def _run(self, cmd: str) -> tuple[int | None, str, str]:
         injected = inject_sudo(cmd)
@@ -955,16 +1114,18 @@ class Jarvis(metaclass=Singleton):
                 current = fixed
             else:
                 await self._state("THINKING", f"LLM heal #{attempts}")
-                heal = await self._generate_streaming(
-                    intent, past=[], current_snap=current_snap,
-                    extra=(
+                heal = await self._llama_complete(
+                    (
+                        "Команда упала. Верни ТОЛЬКО одну исправленную bash-команду, "
+                        "без пояснений, без markdown, без backticks.\n"
                         f"PREVIOUS_CMD: {current}\n"
                         f"ERROR: {stderr.strip()[:400]}\n"
-                        f"Return ONLY a corrected bash command.\n"
                     ),
+                    system=self.router.system_prompt_for(IntentCategory.SYSTEM_OPS),
+                    max_tokens=160,
+                    temperature=0.0,
                 )
-                parsed = parse_response(heal)
-                fixed = clean_bash(parsed.bash)
+                fixed = clean_bash(heal)
                 if not fixed or fixed == current:
                     break
                 current = fixed
@@ -1047,93 +1208,39 @@ class Jarvis(metaclass=Singleton):
 
         await self._state("THINKING", text[:60])
         snap = await asyncio.to_thread(snapshot)
-
         past = await asyncio.to_thread(self.memory.recall, text)
-        raw = await self._generate_streaming(text, past, current_snap=snap)
 
-        # Защита от «немоты»: если генерация вернула пустоту — это, как правило,
-        # ловимый сбой llama-cpp (ошибка decode, модель не загрузилась). Раньше
-        # пустой raw → parsed.say == "" → Jarvis молча уходил в IDLE, и оператор
-        # не понимал, услышали ли его. Теперь отвечаем голосом о сбое.
-        if not raw.strip():
-            log.error("LLM вернул пустой ответ на интент %r — озвучиваю сбой", text[:80])
-            self.say("Сэр, мозг не ответил — похоже, модель дала сбой. Проверьте llama-cpp.")
+        # Агентный цикл: маршрутизация → микро-промпт + tools → Native Function
+        # Calling. Никакого текстового парсинга — модель ДЕЙСТВУЕТ инструментами
+        # (speak_response / execute_bash / set_hud_state / read_telemetry).
+        try:
+            st = await self._run_agent_for_intent(text, past, snap)
+        except LlamaServerError as e:
+            log.error("llama-server недоступен на интенте %r: %s", text[:80], e)
+            self.say("Сэр, мозг не ответил — llama-server недоступен. Проверьте jarvis-llm.")
             await self._state("IDLE", "")
             return ""
 
-        parsed: ParsedResponse = parse_response(raw)
+        # Защита от «немоты»: модель не позвала ни одного инструмента и не
+        # сказала ни слова — ловимый сбой инференса. Озвучиваем, а не уходим
+        # молча в IDLE (оператор должен знать, что его услышали).
+        if not st.spoke and not st.bash_commands and (
+            st.run is None or st.run.tool_calls_made == 0
+        ):
+            log.error("агент не произвёл действий на интенте %r — озвучиваю сбой", text[:80])
+            self.say("Сэр, мозг не ответил — похоже, модель дала сбой. Проверьте llama-server.")
+            await self._state("IDLE", "")
+            return ""
 
-        await self._state("SPEAKING", parsed.thought or parsed.say or text[:60])
-        if parsed.say:
-            self.say(parsed.say)
-
-        # KWin action: LLM asked for a window-manager operation via <kwin>name</kwin>.
-        # name must match a script in scripts/<name>.js. Runs in parallel with any
-        # <bash>/<python> the same response carried.
-        if parsed.kwin:
-            kwin_name = parsed.kwin.strip()
-            ok = await self.kwin.execute(kwin_name)
-            await asyncio.to_thread(
-                self.memory.remember,
-                text,
-                f"<kwin>{kwin_name}</kwin>",
-                "ok" if ok else "fail",
-                "kwin",
-                snap,
-            )
-            if not ok:
-                log.warning("kwin script '%s' not found or failed", kwin_name)
-
-        # Ephemeral Programming: if the LLM authored a <python>...</python>
-        # block, run it through the sandbox runner. The script's last-line
-        # JSON becomes a synthesized <thought> in memory.
-        if extract_python(raw) is not None:
-            try:
-                eph = await self._ephemeral.run_from_llm(raw)
-            except Exception:
-                log.exception("ephemeral runner crashed")
-                eph = None
-            if eph is not None:
-                outcome = (
-                    f"ephemeral rc={eph.rc} engine={eph.engine} "
-                    f"thought={(eph.parsed or {}).get('thought', '')[:140]}"
-                )
-                speak = (eph.parsed or {}).get("speak")
-                if isinstance(speak, str) and speak.strip():
-                    self.say(speak.strip()[:200])
-                await asyncio.to_thread(
-                    self.memory.remember, text, "<python ephemeral>", outcome, "ephemeral", snap,
-                )
-
-        bash = parsed.bash
-        if bash and parsed.sandbox:
-            bash = wrap_sandbox(bash)
-            log.info("sandbox wrap applied: %s", bash[:200])
-            await self._state("THINKING", "Sandbox engaged")
-
-        rc, stdout, stderr = (0, "", "")
-        if bash:
-            # All LLM-emitted bash dry-runs in Shadow Exec first — there is no
-            # static command book anymore, so this is the only safety net.
-            if needs_shadow(bash):
-                shadow_kind = await self._shadow_then_real(bash, text, snap)
-                if shadow_kind == "queued":
-                    return raw
-                if shadow_kind == "rejected":
-                    await self._state("IDLE", "")
-                    return raw
-                # shadow_kind == "direct" → fall through into the standard
-                # execute_with_healing path so the regular destructive-gate
-                # and quick-patch loop still apply.
-            rc, stdout, stderr = await self._execute_with_healing(bash, text, current_snap=snap)
-
-        result = stdout.strip() or stderr.strip() or (
-            f"rc={rc}" if rc is not None else "detached"
+        # Память: что просили, что выполнили, чем кончилось.
+        bash_joined = " && ".join(c for c in st.bash_commands if c)
+        result = st.last_result or st.last_thought or ("spoken" if st.spoke else "no-op")
+        await asyncio.to_thread(
+            self.memory.remember,
+            text, bash_joined, result, f"agent_{st.category.value.lower()}", snap,
         )
-        kind = "qwen_sandbox" if parsed.sandbox else "qwen"
-        await asyncio.to_thread(self.memory.remember, text, bash, result, kind, snap)
         await self._state("IDLE", "")
-        return raw
+        return "[agent_done]"
 
     async def _shadow_then_real(
         self, bash: str, intent: str, snap: StateSnapshot | dict | None,
@@ -1208,6 +1315,25 @@ class Jarvis(metaclass=Singleton):
             "suggest": "",
             "ts": event.ts,
         })
+
+    async def _maybe_agentic_event(self, summary: str) -> bool:
+        """Phase 5: отдать системное событие мозгу через Function Calling.
+
+        Оркестратор формирует скрытый запрос ``[SYSTEM_EVENT: ...]``; роутер
+        отправляет его в SYSTEM_OPS, и модель сама вызывает speak_response +
+        execute_bash (например, cpupower frequency-set -g powersave).
+
+        Возвращает True, если llama-server жив и событие обработано агентом.
+        False — мозг недоступен, и вызывающий ОБЯЗАН сделать детерминированный
+        fallback: защита железа N100 не должна зависеть от доступности LLM."""
+        try:
+            if not await self._llm.health():
+                return False
+            await self.process_intent(summary)
+            return True
+        except Exception:
+            log.exception("agentic system-event failed: %s", summary[:80])
+            return False
 
     async def on_daemon_alert(self, event: Event) -> None:
         line = str(event.data)
@@ -1294,11 +1420,21 @@ class Jarvis(metaclass=Singleton):
 
         await self._state("ALERT", f"{sensor}={value}{unit} [{level}]")
         if sensor == "thermal":
-            self.say(
-                f"Внимание. Температура {int(float(value))} градусов. "
-                f"Рекомендую energy-saving.",
-                tone="alert",
-            )
+            temp_c = int(float(value))
+            handled = False
+            if level == "critical":
+                # Phase 5: мозг сам решает и митигирует через Function Calling.
+                # Детерминированная фраза ниже — fallback, если llama-server лёг.
+                handled = await self._maybe_agentic_event(
+                    f"[SYSTEM_EVENT: thermal={temp_c}C critical] "
+                    "Перегрев SoC — требуется немедленная митигация."
+                )
+            if not handled:
+                self.say(
+                    f"Внимание. Температура {temp_c} градусов. "
+                    f"Рекомендую energy-saving.",
+                    tone="alert",
+                )
         elif sensor == "loadavg":
             self.say(f"Нагрузка превышена: {float(value):.1f}.", tone="alert")
         elif sensor == "packages":
@@ -1666,21 +1802,19 @@ class Jarvis(metaclass=Singleton):
                     "Она должна органично вытекать из контекста выше: "
                     "заметь что-то конкретное в системе или поведении оператора. "
                     "Никаких шаблонов «Сэр, краткий статус» — только живое наблюдение. "
-                    "Ответь ТОЛЬКО тегом <say>...</say> с одной фразой, без другого текста."
+                    "Ответь одной фразой живой речью, без markdown и без пояснений."
                 )
                 try:
-                    raw = await self._llama_complete(
+                    # Лёгкий completion без tools — проактивной реплике не нужен
+                    # function-calling, только одна фраза. CONVERSATION-промпт даёт
+                    # персону, не нагружая модель системными правилами.
+                    phrase = await self._llama_complete(
                         proactive_prompt,
-                        system=self.system_prompt,
+                        system=self.router.system_prompt_for(IntentCategory.CONVERSATION),
                         max_tokens=120,
                         temperature=0.7,
                     )
-                    from src.common.parser import parse_response as _parse
-                    parsed = _parse(raw)
-                    phrase = (parsed.say or "").strip()
-                    if not phrase:
-                        # Если LLM не обернул в тег — берём весь ответ как есть
-                        phrase = raw.strip()[:200]
+                    phrase = phrase.strip()[:200]
                 except Exception:
                     log.exception("proactive phrase generation failed")
                     phrase = ""

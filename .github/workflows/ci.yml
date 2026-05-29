@@ -24,10 +24,11 @@ jobs:
         run: ruff check .
 
       - name: Install runtime + test dependencies
-        # llama-cpp-python и PyQt6 не нужны для unit-тестов и тянут тяжёлые
+        # PyQt6 и нативный llama-server не нужны для unit-тестов и тянут тяжёлые
         # системные зависимости — ставим только то, на чём держатся тесты.
+        # httpx — клиент к llama-server (импорт мягкий, тесты транспорта его юзают).
         run: |
-          pip install pytest pytest-asyncio numpy chromadb ollama
+          pip install pytest pytest-asyncio numpy chromadb ollama httpx
 
       - name: pytest
         run: pytest tests/ -q

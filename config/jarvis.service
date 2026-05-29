@@ -1,9 +1,11 @@
 [Unit]
 Description=JARVIS Protocol — AI Orchestrator for Kali Linux
-After=graphical-session.target sound.target plasma-kwin_wayland.service
+After=graphical-session.target sound.target plasma-kwin_wayland.service jarvis-llm.service
 PartOf=graphical-session.target
-# Ollama (LLM brain) и KDE Connect (Pixel bridge) — soft-dep,
-# не падаем если их нет, но дожидаемся графической сессии.
+# jarvis-llm (нативный llama-server, главный мозг) и ollama (эмбеддинги памяти)
+# — soft-dep: не падаем, если их нет (Jarvis скажет голосом и продолжит), но
+# стараемся поднять мозг до оркестратора.
+Wants=jarvis-llm.service
 Wants=ollama.service
 
 [Service]
@@ -26,14 +28,11 @@ StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=__JARVIS_HOME__
-# llama-cpp: iGPU по умолчанию. Если GPU-probe (subprocess-тест загрузки модели)
-# упадёт с SIGABRT/SIGSEGV, сервер автоматически откатится на CPU.
-# Чтобы принудительно отключить probe: JARVIS_LLAMA_GPU_PROBE=0
-# Чтобы использовать CPU-only: JARVIS_LLAMA_GPU_LAYERS=0
-Environment=JARVIS_LLAMA_GPU_LAYERS=-1
-# n_ctx=4096 — вдвое меньше n_ctx=8192; KV-кэш занимает ~0.5 ГБ вместо ~1 ГБ.
-# N100 iGPU делит RAM с системой; 8192 был причиной vk::DeviceLostError.
-Environment=JARVIS_LLAMA_CTX=4096
+# Инференс вынесен в отдельный демон (jarvis-llm.service). Python только
+# ходит к нему по HTTP (OpenAI REST). Все llama-cpp env (GPU layers, ctx,
+# batch) теперь живут в config/jarvis-llm.service, а не здесь.
+Environment=JARVIS_LLM_ENDPOINT=http://127.0.0.1:8080
+Environment=JARVIS_LLM_MODEL=llama-3.2-3b-instruct
 Environment=QT_QPA_PLATFORM=wayland
 # OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
 # падал на llvmpipe. Если у пользователя другой драйвер — пусть

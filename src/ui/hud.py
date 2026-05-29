@@ -70,6 +70,17 @@ STATE_FRAME_COLORS: dict[str, QColor] = {
     "ALERT":    FRAME_ALERT,
 }
 
+# ───────── set_hud_state палитра (нейросеть сама называет цвет) ─────────
+# Имена из tool-схемы set_hud_state(color, animation). Неизвестное имя → cyan.
+HUD_TOOL_COLORS: dict[str, QColor] = {
+    "cyan":   QColor( 30, 180, 200, 200),
+    "blue":   FRAME_IDLE_BRIGHT,
+    "amber":  FRAME_ALERT,
+    "red":    QColor(220,  70,  60, 225),
+    "green":  QColor( 60, 200, 120, 215),
+    "white":  QColor(200, 220, 240, 210),
+}
+
 # ───────── Geometry / timing ─────────
 SPHERE_BASE_R       = 52
 WHISPER_FONT_SIZE   = 9
@@ -86,6 +97,7 @@ class JarvisHUD(QMainWindow):
 
     # ──── Cross-thread signals ────
     state_signal          = pyqtSignal(str, str)
+    hud_state_signal      = pyqtSignal(str, str)   # set_hud_state: color, animation
     token_signal          = pyqtSignal(str)
     position_signal       = pyqtSignal(float, float)
     fft_signal            = pyqtSignal(list, float)
@@ -123,6 +135,7 @@ class JarvisHUD(QMainWindow):
 
         # ─── Сигналы → главный Qt-тред (все Cross-thread издатели делают .emit) ───
         self.state_signal.connect(self.set_state)
+        self.hud_state_signal.connect(self._apply_hud_state_cmd)
         self.token_signal.connect(self._append_token)
         self.position_signal.connect(self.set_core_position)
         self.fft_signal.connect(self._on_fft)
@@ -275,6 +288,28 @@ class JarvisHUD(QMainWindow):
         # WhisperLine трекает последнее событие
         if new_state == "ALERT" and thought:
             self._last_event_text = thought[:60]
+        self.update()
+
+    @pyqtSlot(str, str)
+    def _apply_hud_state_cmd(self, color: str, animation: str) -> None:
+        """set_hud_state(color, animation) — нейросеть прямо рулит визором.
+
+        Мапим в существующую state-машину рамки: glitch→тревога, idle→покой,
+        pulse→активная работа. Явный цвет из tool'а перекрывает палитру состояния.
+        Речь (SPEAKING, FFT-пульс) приоритетнее и перехватит рамку, когда
+        зазвучит голос."""
+        qc = HUD_TOOL_COLORS.get(color.strip().lower(), HUD_TOOL_COLORS["cyan"])
+        anim = animation.strip().lower()
+        if anim == "glitch":
+            self.state = "ALERT"
+            self._animate_frame_to(qc, FRAME_TRANSITION_MS)
+        elif anim == "idle":
+            self.state = "IDLE"
+            self._animate_frame_to(qc, FRAME_TRANSITION_MS)
+            QTimer.singleShot(FRAME_TRANSITION_MS + 50, self._restart_idle_pulse)
+        else:  # "pulse" / default — активная работа
+            self.state = "THINKING"
+            self._animate_frame_to(qc, FRAME_TRANSITION_MS)
         self.update()
 
     @pyqtSlot(str)
@@ -571,6 +606,7 @@ class JarvisHUD(QMainWindow):
         from src.common.event_bus import EventType
         self._bus = bus
         bus.subscribe(EventType.STATE_CHANGE,     self._on_state)
+        bus.subscribe(EventType.HUD_STATE,        self._on_hud_state)
         bus.subscribe(EventType.TOKEN_STREAM,     self._on_token)
         bus.subscribe(EventType.KWIN_ACTION,      self._on_kwin_action)
         bus.subscribe(EventType.AUDIO_FFT,        self._on_audio_fft)
@@ -590,6 +626,13 @@ class JarvisHUD(QMainWindow):
         else:
             state, thought = str(data), ""
         self.state_signal.emit(str(state), str(thought))
+
+    async def _on_hud_state(self, event) -> None:
+        """set_hud_state tool → визор. Нейросеть сама называет color+animation."""
+        data = event.data if isinstance(event.data, dict) else {}
+        color = str(data.get("color", "cyan"))
+        animation = str(data.get("animation", "pulse"))
+        self.hud_state_signal.emit(color, animation)
 
     async def _on_token(self, event) -> None:
         self.token_signal.emit(str(event.data))

@@ -23,6 +23,7 @@ class EventType(StrEnum):
     OS_EVENT = "OS_EVENT"
     PIXEL_EVENT = "PIXEL_EVENT"
     STATE_CHANGE = "STATE_CHANGE"
+    HUD_STATE = "HUD_STATE"        # set_hud_state tool: нейросеть сама рулит визором (color+animation)
     TOKEN_STREAM = "TOKEN_STREAM"
     KWIN_ACTION = "KWIN_ACTION"
     # Aegis / Wraith / Navigator additions.
