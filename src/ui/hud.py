@@ -483,7 +483,7 @@ class JarvisHUD(QMainWindow):
     def _refresh_whisper_cache(self) -> None:
         out: dict[str, Any] = {}
         try:
-            from event_bus import SystemState
+            from src.common.event_bus import SystemState
             snap = SystemState().snapshot()
             out["load"] = str(getattr(snap.load, "value", snap.load))
             out["cpu"] = snap.cpu
@@ -503,7 +503,7 @@ class JarvisHUD(QMainWindow):
     # --- Диагностический overlay (4 угла) ---
     def _draw_diagnostic(self, painter: QPainter, w: int, h: int) -> None:
         try:
-            from event_bus import SystemState
+            from src.common.event_bus import SystemState
             snap = SystemState().snapshot()
         except Exception:
             return
@@ -535,7 +535,7 @@ class JarvisHUD(QMainWindow):
 
     # ──────── Bus wiring ────────
     def subscribe_to_bus(self, bus: Any) -> None:
-        from event_bus import EventType
+        from src.common.event_bus import EventType
         self._bus = bus
         bus.subscribe(EventType.STATE_CHANGE,     self._on_state)
         bus.subscribe(EventType.TOKEN_STREAM,     self._on_token)

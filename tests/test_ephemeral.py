@@ -19,7 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.memory.ephemeralimport shadow_exec
+import src.memory.ephemeral as ephemeral
+import src.security.execution as shadow_exec
 
 
 class DirectShadow(shadow_exec.ShadowExec):

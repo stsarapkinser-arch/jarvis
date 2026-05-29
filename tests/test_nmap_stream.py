@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.network.scanneras ns
+import src.network.scanner as ns
 
 
 def test_is_nmap_command_basic() -> None:

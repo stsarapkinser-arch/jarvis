@@ -27,7 +27,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication
 
-import src.ui.hud
+import src.ui.hud as hud
 
 @pytest.fixture(scope="module")
 def app():
@@ -129,7 +129,7 @@ def test_no_gl_imports(app) -> None:
     реальные import-statement'ы — упоминания в docstring разрешены."""
     import re
 
-    import jarvis_hud as jh
+    import src.ui.hud as jh
     src = Path(jh.__file__).read_text(encoding="utf-8")
     # Грубо рубим всё кроме исполняемого кода: убираем строковые литералы.
     code_only = re.sub(r'"""(.|\n)*?"""', '', src)

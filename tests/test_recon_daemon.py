@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.services.recon_daemonas rd
+import src.services.recon_daemon as rd
 from src.common.event_bus import EventBus
 from src.common.singleton import Singleton
 

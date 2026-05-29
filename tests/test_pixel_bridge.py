@@ -22,7 +22,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.ui.pixel_rendererfrom src.common.event_bus import Event, EventBus, EventType
+import src.ui.pixel_renderer as pixel
+from src.common.event_bus import Event, EventBus, EventType
 from src.common.singleton import Singleton
 
 
@@ -233,7 +234,7 @@ async def test_stale_call_sweep_fires_call_ended_via_ttl():
 async def test_resume_media_skips_when_playerctl_missing():
     """_resume_media is a no-op (and must not raise) without playerctl."""
     bridge = _fresh_bridge()
-    with patch("pixel.shutil.which", return_value=None):
+    with patch("src.ui.pixel_renderer.shutil.which", return_value=None):
         await bridge._resume_media()  # must not raise
 
 
@@ -250,7 +251,7 @@ async def test_resume_media_invokes_playerctl_play(monkeypatch):
 
         return _P()
 
-    with patch("pixel.shutil.which", return_value="/usr/bin/playerctl"):
+    with patch("src.ui.pixel_renderer.shutil.which", return_value="/usr/bin/playerctl"):
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         await bridge._resume_media()
 

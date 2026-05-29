@@ -17,7 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.security.executionfrom src.common.singleton import Singleton
+import src.security.execution as shadow_exec
+from src.common.singleton import Singleton
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,7 @@ class _NullMemory:
 
 def _make_jarvis_with_shadow_engine(present: bool = True):
     """Construct a Jarvis without actually running its real subsystems."""
-    from core import Jarvis
+    from src.core.orchestrator import Jarvis
     j = Jarvis()
     # Force the shadow engine choice for the test.
     j._shadow = shadow_exec.ShadowExec(
@@ -95,3 +96,22 @@ def test_resolve_shadow_returns_false_when_no_pending():
     j = _make_jarvis_with_shadow_engine(True)
     handled = asyncio.run(j._try_resolve_shadow("да"))
     assert handled is False
+
+
+def test_process_intent_speaks_fallback_on_empty_llm_output():
+    """Regression: a catchable llama-cpp failure makes ``_generate_streaming``
+    return "". Jarvis must SPEAK a fallback instead of silently going IDLE —
+    otherwise the operator never learns the request was even heard.
+    """
+    j = _make_jarvis_with_shadow_engine(True)
+    spoken: list[str] = []
+    j.say = lambda text, *a, **kw: spoken.append(text)
+
+    with patch.object(j, "_generate_streaming", new=AsyncMock(return_value="")), \
+         patch.object(j, "_state", new=AsyncMock(return_value=None)), \
+         patch("src.core.orchestrator.snapshot", return_value={}):
+        out = asyncio.run(j.process_intent("сделай что-нибудь полезное"))
+
+    assert out == ""
+    assert spoken, "Jarvis должен озвучить сбой, а не молчать"
+    assert any("сбой" in s.lower() or "модель" in s.lower() for s in spoken)

@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import src.security.execution
+import src.security.execution as shadow_exec
 
 def _write_shim(path: Path, body: str) -> str:
     path.write_text(body, encoding="utf-8")

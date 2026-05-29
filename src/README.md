@@ -57,12 +57,12 @@ src/
 
 ```python
 # Правильно ✓
-from src.core.orchestrator import CoreEngine
+from src.core.orchestrator import Jarvis
 from src.common.event_bus import EventBus, EventType
 from src.memory.engine import ChronoMemory
 
 # Неправильно ✗ (больше не работает)
-from core import CoreEngine
+from core import Jarvis
 from event_bus import EventBus
 ```
 

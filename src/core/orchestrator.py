@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 import shutil
@@ -70,22 +71,42 @@ SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "config" / "system_prompt")
 # n_threads=4    — N100 = 4 P-core, ровно одно ядро на токен decode пайплайна.
 # n_ctx=4096     — экономим видеопамять; промпт-погон Context Weaver рассчитан
 #                   ровно под этот бюджет (см. WEAVER_* константы ниже).
+def _env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back to ``default``.
+
+    Позволяет оператору подстроить llama-cpp под СВОЮ сборку (CPU-only vs
+    iGPU/Vulkan) без правки кода: например, на CPU-сборке llama-cpp оффлоад
+    в GPU не нужен — ``JARVIS_LLAMA_GPU_LAYERS=0`` отключает его."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("env %s=%r не int — использую default %d", name, raw, default)
+        return default
+
+
 LLAMA_MODEL_NAME = "qwen2.5-coder-3b-instruct-q4_k_m.gguf"
 LLAMA_MODEL_PATH = str(_PROJECT_ROOT / "models" / LLAMA_MODEL_NAME)
-LLAMA_N_GPU_LAYERS = -1
-LLAMA_N_THREADS = 4
-# Контекст 4096 — по ТЗ оператора (8192/4096 на выбор; 4096 — безопасный
-# баланс под N100 + Mesa Vulkan). n_batch/n_ubatch остаются урезанными:
-# без них iGPU валится в vk::DeviceLostError даже при n_ctx=2048. flash_attn
-# тоже выключен — этот combo стабилен по long-run тестам.
-LLAMA_N_CTX = 8192
-LLAMA_N_BATCH = 256
-LLAMA_N_UBATCH = 128
+# n_gpu_layers=-1 — все слои на iGPU. ВАЖНО: на CPU-only сборке llama-cpp
+# (без Vulkan/CUDA-бэкенда) оффлоад невозможен — выставьте
+# JARVIS_LLAMA_GPU_LAYERS=0, иначе bookkeeping оффлоада может вести себя
+# нестабильно. На сборке с GPU-бэкендом оставьте -1.
+LLAMA_N_GPU_LAYERS = _env_int("JARVIS_LLAMA_GPU_LAYERS", -1)
+LLAMA_N_THREADS = _env_int("JARVIS_LLAMA_THREADS", 4)
+# n_ctx 8192 — модель обучена на 32768, но мы экономим память. n_batch/n_ubatch
+# исторически урезаны под Mesa Vulkan (vk::DeviceLostError на iGPU N100);
+# на CPU-сборке эти ограничения не нужны и их можно поднять через env.
+# Все три параметра переопределяемы env-переменными для подгонки под железо.
+LLAMA_N_CTX = _env_int("JARVIS_LLAMA_CTX", 8192)
+LLAMA_N_BATCH = _env_int("JARVIS_LLAMA_BATCH", 256)
+LLAMA_N_UBATCH = _env_int("JARVIS_LLAMA_UBATCH", 128)
 LLAMA_FLASH_ATTN = False
 LLAMA_MAX_TOKENS_DEFAULT = 1024
-# KV-cache системного промпта: резервируем первые N слотов под static prefix.
-# system_prompt в нашем проекте ~520 токенов. Добавим запас → 640.
-# llama-cpp удерживает этот префикс в KV-кэше между запросами, не пересчитывая.
+# KV-cache системного промпта: документационная константа (в Llama() не
+# передаётся). system_prompt сейчас ~2500-3500 токенов — llama-cpp удерживает
+# его префикс в KV-кэше между запросами, не пересчитывая.
 LLAMA_SYSTEM_CACHE_TOKENS = 640
 
 MAX_HEAL_ATTEMPTS = 3
@@ -1152,6 +1173,17 @@ class Jarvis(metaclass=Singleton):
 
         past = await asyncio.to_thread(self.memory.recall, text)
         raw = await self._generate_streaming(text, past, current_snap=snap)
+
+        # Защита от «немоты»: если генерация вернула пустоту — это, как правило,
+        # ловимый сбой llama-cpp (ошибка decode, модель не загрузилась). Раньше
+        # пустой raw → parsed.say == "" → Jarvis молча уходил в IDLE, и оператор
+        # не понимал, услышали ли его. Теперь отвечаем голосом о сбое.
+        if not raw.strip():
+            log.error("LLM вернул пустой ответ на интент %r — озвучиваю сбой", text[:80])
+            self.say("Сэр, мозг не ответил — похоже, модель дала сбой. Проверьте llama-cpp.")
+            await self._state("IDLE", "")
+            return ""
+
         parsed: ParsedResponse = parse_response(raw)
 
         await self._state("SPEAKING", parsed.thought or parsed.say or text[:60])
@@ -1325,7 +1357,7 @@ class Jarvis(metaclass=Singleton):
                 + (f"Готовлю блокировку: {ufw}." if ufw else "Прикажете заблокировать?")
             )
             self.say(phrase, tone="alert")
-            from pixel import PixelBridge
+            from src.ui.pixel_renderer import PixelBridge
             asyncio.create_task(
                 PixelBridge().push_to_phone("Jarvis [INTRUSION]", summary[:120]),
                 name="phone-push-recon",
@@ -1455,7 +1487,7 @@ class Jarvis(metaclass=Singleton):
         # Push critical alerts to the phone so the operator is notified even
         # when away from the machine.
         if level == "critical" and sensor in ("disk", "thermal", "memory", "battery"):
-            from pixel import PixelBridge
+            from src.ui.pixel_renderer import PixelBridge
             asyncio.create_task(
                 PixelBridge().push_to_phone(
                     f"Jarvis [{sensor}]",
@@ -1701,7 +1733,7 @@ class Jarvis(metaclass=Singleton):
         phrase = " ".join(parts)
         self.say(phrase, tone="normal")
 
-        from pixel import PixelBridge
+        from src.ui.pixel_renderer import PixelBridge
         bridge = PixelBridge()
         asyncio.create_task(
             bridge.push_to_phone("Jarvis", phrase[:120]),
@@ -1766,7 +1798,7 @@ class Jarvis(metaclass=Singleton):
                         max_tokens=120,
                         temperature=0.7,
                     )
-                    from parser import parse_response as _parse
+                    from src.common.parser import parse_response as _parse
                     parsed = _parse(raw)
                     phrase = (parsed.say or "").strip()
                     if not phrase:
