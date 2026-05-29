@@ -24,11 +24,13 @@ if [[ ! -f "${SCRIPT_DIR}/.venv/bin/python" ]] && [[ ! -f "${SCRIPT_DIR}/venv/bi
     "${SCRIPT_DIR}/.venv/bin/pip" install -q -r config/requirements.txt
 fi
 
-# Выбираем существующий venv; путь всегда абсолютный — systemd требует абсолютный ExecStart
+# Путь абсолютный, но без разрешения симлинков: Python определяет venv через
+# pyvenv.cfg рядом с bin/. Если передать /usr/bin/python3.13 (realpath),
+# venv не активируется и пакеты из .venv/lib/ не видны.
 if [[ -f "${SCRIPT_DIR}/.venv/bin/python" ]]; then
-    PY="$(realpath "${SCRIPT_DIR}/.venv/bin/python")"
+    PY="${SCRIPT_DIR}/.venv/bin/python"
 else
-    PY="$(realpath "${SCRIPT_DIR}/venv/bin/python")"
+    PY="${SCRIPT_DIR}/venv/bin/python"
 fi
 SUPERVISOR_CMD="$PY -m src.core.supervisor"
 
