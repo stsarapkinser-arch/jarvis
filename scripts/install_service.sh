@@ -34,7 +34,7 @@ declare -a CANDIDATES=(
 PY=""
 for cand in "${CANDIDATES[@]}"; do
     if [[ -x "${cand}" ]] && "${cand}" -c "import PyQt6" >/dev/null 2>&1; then
-        PY="${cand}"
+        PY="$(realpath "${cand}")"
         break
     fi
 done
