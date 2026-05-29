@@ -314,7 +314,10 @@ class ChronoMemory(metaclass=Singleton):
         where: Mapping[str, Any] | None,
     ) -> list[dict]:
         try:
-            kwargs: dict[str, Any] = {"query_texts": [query], "n_results": n_results}
+            count = col.count()
+            if count == 0:
+                return []
+            kwargs: dict[str, Any] = {"query_texts": [query], "n_results": min(n_results, count)}
             if where:
                 kwargs["where"] = dict(where)
             res = col.query(**kwargs)

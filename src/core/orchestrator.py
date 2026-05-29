@@ -795,6 +795,9 @@ class Jarvis(metaclass=Singleton):
             log.warning("LLM KV-cache warm failed (non-fatal)", exc_info=True)
 
     async def _llama_stream(
+        self,
+        prompt: str,
+        system: str | None = None,
         max_tokens: int = LLAMA_MAX_TOKENS_DEFAULT,
         temperature: float = 0.0,
     ) -> AsyncIterator[str]:
