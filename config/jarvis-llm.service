@@ -27,6 +27,10 @@ WorkingDirectory=__JARVIS_HOME__
 #   --jinja              ОБЯЗАТЕЛЬНО для tool-calling Llama-3.2 (парсинг tool_calls
 #                        в OpenAI-формат через встроенный chat-template).
 #   --threads 4          N100 = 4 P-core.
+#   __EXTRA_FLAGS__      опц. перф-флаги от оператора: запусти setup_server.sh с
+#                        JARVIS_LLM_EXTRA_FLAGS="--flash-attn on" (ускоряет декод
+#                        и вдвое режет KV) или "--cache-type-k q8_0". Не в дефолте,
+#                        т.к. поведение Vulkan-FA зависит от версии Mesa.
 # setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря.
 ExecStart=__LLAMA_SERVER_BIN__ \
     --model __JARVIS_HOME__/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
@@ -38,6 +42,7 @@ ExecStart=__LLAMA_SERVER_BIN__ \
     --cache-ram 0 \
     --cache-reuse 256 \
     --jinja \
+    __EXTRA_FLAGS__ \
     --host 127.0.0.1 \
     --port 8080
 

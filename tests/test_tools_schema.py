@@ -43,7 +43,16 @@ def test_conversation_category_cannot_execute_bash():
     """Безопасность: чистый разговор не должен иметь доступа к системе."""
     convo = {s["function"]["name"] for s in t.tools_for_category("CONVERSATION")}
     assert "execute_bash" not in convo
-    assert {"speak_response", "internal_monologue", "set_hud_state"} <= convo
+    assert {"speak_response", "set_hud_state"} <= convo
+
+
+def test_internal_monologue_excluded_from_hot_path():
+    """На слабом железе internal_monologue не в боевых подмножествах (лишний
+    раунд диалога при декоде ~1 т/с), хотя схема инструмента сохранена."""
+    assert "internal_monologue" in t.TOOLS_BY_NAME
+    for cat in ("SYSTEM_OPS", "UI_CONTROL", "PENTEST_RECON", "CONVERSATION"):
+        names = {s["function"]["name"] for s in t.tools_for_category(cat)}
+        assert "internal_monologue" not in names, f"{cat} всё ещё тянет internal_monologue"
 
 
 def test_system_ops_has_full_toolset():

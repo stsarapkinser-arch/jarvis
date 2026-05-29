@@ -53,7 +53,10 @@ from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.mnemosyne")
 
-HARVEST_INTERVAL = 10.0          # seconds between scheduled snapshots
+# 30с (было 10): каждый снимок персистится через эмбеддинг в ollama (CPU +
+# память). На N100 это конкурирует за единственный канал LPDDR5 с iGPU-декодом
+# llama-server. Втрое реже harvest = втрое меньше паразитной нагрузки на мозг.
+HARVEST_INTERVAL = 30.0          # seconds between scheduled snapshots
 ASSIMILATE_COOLDOWN = 12.0       # don't re-think the same clipboard within 12s
 MAX_EDITOR_FILE_BYTES = 8192     # cap how much of an open file we read
 

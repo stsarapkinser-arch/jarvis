@@ -13,6 +13,9 @@
 #   MODEL_URL      — переопределить URL GGUF
 #   JOBS           — параллелизм сборки (по умолчанию nproc)
 #   SKIP_BUILD=1   — пропустить компиляцию (только модель + unit)
+#   JARVIS_LLM_EXTRA_FLAGS — доп. флаги llama-server для перфоманса, напр.
+#                  "--flash-attn on" (ускоряет декод, вдвое режет KV) или
+#                  "--cache-type-k q8_0". Зависят от версии Mesa/сборки.
 #
 # Идемпотентен: повторный запуск делает git pull + пересборку и не качает
 # модель заново.
@@ -107,9 +110,19 @@ if [ ! -x "$SERVER_BIN" ]; then
     warn "Бинарь $SERVER_BIN отсутствует (SKIP_BUILD?) — unit будет ссылаться на него; соберите перед стартом."
 fi
 mkdir -p "$USER_UNIT_DIR"
+# Опциональные перф-флаги оператора (напр. JARVIS_LLM_EXTRA_FLAGS="--flash-attn on").
+# Пусто → строку-плейсхолдер удаляем; иначе подставляем.
+EXTRA="${JARVIS_LLM_EXTRA_FLAGS:-}"
+if [ -n "$EXTRA" ]; then
+    EXTRA_SED="s|__EXTRA_FLAGS__|${EXTRA}|"
+    echo "  → доп. флаги сервера: ${EXTRA}"
+else
+    EXTRA_SED="/__EXTRA_FLAGS__/d"
+fi
 sed \
     -e "s|__JARVIS_HOME__|${REPO_ROOT}|g" \
     -e "s|__LLAMA_SERVER_BIN__|${SERVER_BIN}|g" \
+    -e "$EXTRA_SED" \
     "$UNIT_TEMPLATE" > "$UNIT_TARGET"
 
 # Version-robustness: снять из unit'а флаги, которых нет в этой сборке бинаря

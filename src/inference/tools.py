@@ -88,41 +88,25 @@ _SPEAK_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
     "function": {
         "name": ToolName.SPEAK_RESPONSE.value,
         "description": (
-            "ЕДИНСТВЕННЫЙ способ заговорить с оператором вслух. Живая речь, без "
-            "markdown и списков. Ты УПРАВЛЯЕШЬ своим голосом пунктуацией: "
-            "многоточие … — глубокая пауза (анализ, раздумье); короткие "
-            "предложения — динамика; критические данные разделяй точками "
-            "(«Цель. Один. Девять. Два.»). Обращение «сэр»."
+            "Сказать вслух (единственный голосовой канал). Кратко, без markdown. "
+            "Пунктуация = ритм: … пауза, точки разделяют важное. «сэр»."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Что произнести голосом. Только живая речь, с осмысленной пунктуацией.",
-                },
+                "text": {"type": "string", "description": "Текст речи."},
                 "mood": {
                     "type": "string",
                     "enum": [m.value for m in SpeakMood],
-                    "description": (
-                        "professional — спокойный баритон по умолчанию; "
-                        "alert — срочно/сухо (тревога, перегрев); "
-                        "ironic — точная ирония equals-to-equals."
-                    ),
+                    "description": "professional / alert (срочно) / ironic.",
                 },
                 "speed": {
                     "type": "number",
-                    "description": (
-                        "Темп: 1.0 — норма, <1 медленнее/размереннее (аристократично), "
-                        ">1 быстрее (срочность). Опционально; по умолчанию — по состоянию."
-                    ),
+                    "description": "темп: 1.0 норма, <1 медленнее, >1 быстрее (опц.).",
                 },
                 "pause": {
                     "type": "number",
-                    "description": (
-                        "Пауза между предложениями, сек: ~0.1 резко/по-военному, "
-                        "~0.4 размеренно. Опционально."
-                    ),
+                    "description": "пауза между предложениями, сек (опц.).",
                 },
             },
             "required": ["text"],
@@ -135,28 +119,18 @@ _SET_HUD_STATE_SCHEMA: Final[dict[str, Any]] = {
     "type": "function",
     "function": {
         "name": ToolName.SET_HUD_STATE.value,
-        "description": (
-            "Управление визором Aegis (прозрачный HUD). Меняй состояние, чтобы "
-            "оператор видел, что ты делаешь: думаешь, говоришь, тревога. Это твои руки "
-            "на интерфейсе."
-        ),
+        "description": "Визор Aegis: покажи состояние (работа/тревога/успех).",
         "parameters": {
             "type": "object",
             "properties": {
                 "color": {
                     "type": "string",
-                    "description": (
-                        "Цвет рамки: cyan/blue — норма и раздумье, amber — внимание, "
-                        "red — тревога, green — успех/проверено, white — нейтрально."
-                    ),
+                    "description": "cyan/blue норма, amber внимание, red тревога, green успех, white нейтрально.",
                 },
                 "animation": {
                     "type": "string",
                     "enum": [a.value for a in HudAnimation],
-                    "description": (
-                        "idle — спокойная пульсация; pulse — активная работа/речь; "
-                        "glitch — тревожный глитч (только для red/критичных событий)."
-                    ),
+                    "description": "idle покой / pulse работа / glitch тревога.",
                 },
             },
             "required": ["color", "animation"],
@@ -169,20 +143,14 @@ _READ_TELEMETRY_SCHEMA: Final[dict[str, Any]] = {
     "type": "function",
     "function": {
         "name": ToolName.READ_TELEMETRY.value,
-        "description": (
-            "Прочитать живой сенсор. Результат вернётся тебе обратно как tool-ответ — "
-            "используй его, прежде чем говорить или действовать. Не выдумывай цифры."
-        ),
+        "description": "Прочитать сенсор; результат вернётся тебе — не выдумывай цифры.",
         "parameters": {
             "type": "object",
             "properties": {
                 "sensor": {
                     "type": "string",
                     "enum": [s.value for s in TelemetrySensor],
-                    "description": (
-                        "cpu — загрузка/температура SoC; ram — память; "
-                        "network — интерфейсы/трафик; pixel_phone — батарея телефона."
-                    ),
+                    "description": "cpu / ram / network / pixel_phone.",
                 }
             },
             "required": ["sensor"],
@@ -196,25 +164,23 @@ _EXECUTE_BASH_SCHEMA: Final[dict[str, Any]] = {
     "function": {
         "name": ToolName.EXECUTE_BASH.value,
         "description": (
-            "Выполнить bash-команду в реальной системе. Каждая команда сперва "
-            "прогоняется в Shadow Exec (изолированный сэндбокс); разрушительные "
-            "(rm -rf, dd, mkfs, apt purge, poweroff) требуют голосового подтверждения "
-            "оператора — это ядро делает само, ты не дублируешь гейтинг."
+            "Выполнить bash в реальной системе. Сэндбокс и подтверждение "
+            "разрушительных команд ядро делает само — не дублируй гейтинг."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Одна bash-команда без markdown-обёрток и backticks.",
+                    "description": "Одна команда, без markdown и backticks.",
                 },
                 "requires_sudo": {
                     "type": "boolean",
-                    "description": "true, если команде нужны root-привилегии (sudo -n).",
+                    "description": "true — нужен root (sudo -n).",
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "true — запустить в фоне (detached), не ждать вывода.",
+                    "description": "true — в фоне, не ждать.",
                 },
             },
             "required": ["command"],
@@ -241,8 +207,13 @@ TOOLS_BY_NAME: Final[dict[str, dict[str, Any]]] = {
 # Семантический маршрутизатор отдаёт модели ТОЛЬКО релевантные инструменты.
 # CONVERSATION намеренно лишён execute_bash — чистый разговор не должен иметь
 # возможности случайно тронуть систему (это бесплатное свойство безопасности).
+#
+# internal_monologue НЕ входит в боевые подмножества: на N100 (декод ~1 т/с)
+# отдельный tool-вызов «подумать» — это лишний раунд диалога (модель думает →
+# мы логируем → модель продолжает), удваивающий латентность. Модель прекрасно
+# рассуждает «про себя» и без отдельного инструмента. Схема сохранена (на случай
+# мощного железа), но в горячий путь не попадает.
 _COMMON = (
-    ToolName.INTERNAL_MONOLOGUE.value,
     ToolName.SPEAK_RESPONSE.value,
     ToolName.SET_HUD_STATE.value,
 )

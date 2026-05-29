@@ -45,10 +45,12 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Потолок ожидания ответа. На N100 холодный первый запрос (компиляция Vulkan-
-# шейдеров + prompt-eval) может быть долгим — даём запас, но оператор может
+# Потолок ожидания ответа. На N100 декод ~1 т/с — даже ограниченный ответ
+# (max_tokens) может занять до ~2.5 мин в худшем случае, поэтому запас 180с
+# (это не «костыль-чтобы-не-падало», а соответствие реальному bounded-времени:
+# генерация ограничена max_tokens, висеть бесконечно не может). Оператор может
 # подстроить через JARVIS_LLM_TIMEOUT.
-DEFAULT_REQUEST_TIMEOUT = _env_float("JARVIS_LLM_TIMEOUT", 120.0)
+DEFAULT_REQUEST_TIMEOUT = _env_float("JARVIS_LLM_TIMEOUT", 180.0)
 
 
 class LlamaServerError(RuntimeError):

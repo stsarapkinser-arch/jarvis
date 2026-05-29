@@ -78,11 +78,14 @@ LLM_MODEL = DEFAULT_MODEL
 # Агентный цикл: максимум раундов tool-calling за один интент. 4 хватает на
 # read_telemetry → internal_monologue → set_hud_state → speak_response/execute_bash,
 # и держит TTFT под контролем на слабом железе.
-AGENT_MAX_STEPS = 4
-# 384 — компактного tool-call'а + короткой речи хватает с запасом; потолок
-# не даёт 3B-модели уходить в простыню (в логах был runaway n_tokens=1489),
-# что на iGPU N100 превращалось в десятки секунд генерации и таймаут клиента.
-LLM_MAX_TOKENS_DEFAULT = 384
+# 2 раунда: один tool-вызов + опциональный follow-up (напр. read_telemetry→speak).
+# На N100 декод ~1 т/с — каждый лишний раунд это +десятки секунд, так что 2 < 4.
+AGENT_MAX_STEPS = 2
+# 160 — одного speak_response (+ set_hud_state/execute_bash) хватает. Жёсткий
+# потолок критичен: на iGPU N100 декод ~1 токен/сек (в логах eval 1473 мс/ток),
+# поэтому каждый сгенерированный токен ≈ секунда ответа. Раньше 3B уходила в
+# простыню (n_tokens=1489) → таймаут.
+LLM_MAX_TOKENS_DEFAULT = 160
 # Болтовня заслуживает чуть больше «температуры» и места; системные операции —
 # почти детерминированы (точность важнее креатива).
 _CATEGORY_TEMPERATURE: dict[IntentCategory, float] = {
@@ -915,7 +918,14 @@ class Jarvis(metaclass=Singleton):
 
         await self._state("THINKING", text[:60])
         snap = await asyncio.to_thread(snapshot)
-        past = await asyncio.to_thread(self.memory.recall, text)
+        # RAG-recall — это эмбеддинг-вызов в ollama (CPU + память). На N100 он
+        # конкурирует за единственный канал памяти с iGPU-декодом llama-server.
+        # Под HIGH/CRITICAL пропускаем recall: лучше ответить без памяти, чем
+        # задушить мозг лишней нагрузкой ровно перед генерацией. Symbiote-degrade.
+        if SystemState().load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
+            past = []
+        else:
+            past = await asyncio.to_thread(self.memory.recall, text)
 
         # Агентный цикл: маршрутизация → микро-промпт + tools → Native Function
         # Calling. Никакого текстового парсинга — модель ДЕЙСТВУЕТ инструментами
