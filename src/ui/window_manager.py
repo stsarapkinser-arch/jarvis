@@ -122,12 +122,27 @@ class KWinOrchestrator(metaclass=Singleton):
             log.error("loadScript failed: rc=%s err=%s", rc, err)
             return None
         try:
-            return int(out)
+            script_id = int(out)
         except ValueError:
             log.error("loadScript returned non-int: %r", out)
             return None
+        # KWin возвращает -1, если скрипт с таким plugin_name УЖЕ загружен
+        # (или внутренняя ошибка регистрации). Запуск /Scripting/Script-1 даёт
+        # «is not a valid path name» — поэтому отрицательный id это провал
+        # загрузки. Снимаем possible-залипший плагин, чтобы следующий вызов
+        # прошёл чисто.
+        if script_id < 0:
+            log.warning("loadScript вернул %d для %s — скрипт уже загружен? выгружаю",
+                        script_id, plugin_name)
+            await self.unload_script(plugin_name)
+            return None
+        return script_id
 
     async def run_script(self, script_id: int) -> bool:
+        # Защита от невалидного пути: отрицательный/нулевой id недопустим.
+        if script_id < 0:
+            log.error("run_script: невалидный script_id=%d — пропускаю", script_id)
+            return False
         rc, _, err = await self._qdbus_call(f"/Scripting/Script{script_id}", "run")
         if rc != 0:
             log.error("run script %s failed: %s", script_id, err)

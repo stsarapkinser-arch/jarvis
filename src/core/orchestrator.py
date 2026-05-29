@@ -151,6 +151,9 @@ TONE_PRESETS: dict[str, tuple[float, float]] = {
 # conversion (RVC / so-vits-svc), обученного на сэмплах. См. README раздел TTS.
 # Все профили — sox-аргументы без бинарника и формата (это в DSP_IO_ARGS).
 SOX_BIN = shutil.which("sox")
+# Однократный флаг: предупреждаем про отсутствие sox только один раз за процесс
+# (иначе лог засорится на каждой фразе). Читается/пишется в _play_tts.
+_SOX_MISSING_WARNED = False
 DSP_IO_ARGS: tuple[str, ...] = (
     "-q", "-V0",
     "-t", "raw", "-r", "22050", "-e", "signed", "-b", "16", "-c", "1", "-",
@@ -592,6 +595,19 @@ class Jarvis(metaclass=Singleton):
                 except Exception:
                     log.exception("sox DSP startup failed; fallback to direct piper→aplay")
                     sox = None
+            elif aplay is not None and not SOX_BIN:
+                # Без sox голос идёт «сырым» из piper — тембр/кино-постобработка
+                # НЕ применяются. Это самая частая причина «голос не изменился».
+                # Предупреждаем ОДИН раз, громко, с инструкцией.
+                global _SOX_MISSING_WARNED
+                if not _SOX_MISSING_WARNED:
+                    _SOX_MISSING_WARNED = True
+                    log.warning(
+                        "sox не найден в PATH — голос идёт БЕЗ кино-постобработки "
+                        "(тембр/эквализация/реверб профиля '%s' пропущены). "
+                        "Установите: sudo apt install sox",
+                        sox_profile_name,
+                    )
 
             sink_stdin = (sox.stdin if sox is not None
                           else (aplay.stdin if aplay is not None else None))

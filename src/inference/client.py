@@ -133,11 +133,14 @@ class InferenceClient:
                 else:
                     return
 
-            # Try to connect; if that fails, start the server and retry
+            # Try to connect; if that fails, start the server and retry.
+            # ВАЖНО: open_unix_connection, а не open_connection(path=...) —
+            # на Python 3.13 второй падает с TypeError (create_connection не
+            # знает аргумент path). Это зеркало бага сервера.
             for attempt in range(2):
                 try:
-                    self._reader, self._writer = await asyncio.open_connection(
-                        path=self.socket_path
+                    self._reader, self._writer = await asyncio.open_unix_connection(
+                        self.socket_path
                     )
                     log.info("Connected to inference server")
                     return

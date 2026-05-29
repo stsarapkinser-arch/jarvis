@@ -17,6 +17,9 @@ WAKE_WORDS: Final[tuple[str, ...]] = ("джарвис", "jarvis", "компью�
 SAMPLE_RATE: Final = 16000
 BLOCK_SIZE: Final = 16000
 READ_FRAMES: Final = 8000
+# Окно дедупликации: одинаковый интент в пределах N секунд считаем
+# одним (partial → final одной фразы). 6 с покрывает паузу распознавания.
+INTENT_DEDUP_SEC: Final = 6.0
 
 # Папка с весами Vosk относительно корня проекта.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -73,7 +76,24 @@ class JarvisMain(metaclass=Singleton):
 
         log.info("voice listener ready")
         print("🎙 Джарвис слушает...")
-        _last_partial_intent: str = ""
+        # Дедуп: храним последний ОПУБЛИКОВАННЫЙ интент и его время. Без этого
+        # одна фраза стреляла дважды — сначала на partial-результате (мы ловим
+        # команды без паузы), затем на final-результате с тем же текстом →
+        # Джарвис отвечал на одно и то же два раза.
+        _last_published: str = ""
+        _last_published_ts: float = 0.0
+        import time as _time
+
+        def _publish_intent(intent: str) -> None:
+            nonlocal _last_published, _last_published_ts
+            now = _time.monotonic()
+            # Тот же интент в пределах окна — это partial→final дубль, глушим.
+            if intent == _last_published and (now - _last_published_ts) < INTENT_DEDUP_SEC:
+                return
+            _last_published = intent
+            _last_published_ts = now
+            bus.publish_threadsafe(Event(EventType.VOICE_INTENT, intent))
+
         while True:
             try:
                 with sd.RawInputStream(
@@ -91,13 +111,12 @@ class JarvisMain(metaclass=Singleton):
                             except Exception:
                                 log.exception("vosk result parse failed")
                                 continue
-                            _last_partial_intent = ""
                             if not text:
                                 continue
                             intent = self._extract_intent(text)
                             if not intent:
                                 continue
-                            bus.publish_threadsafe(Event(EventType.VOICE_INTENT, intent))
+                            _publish_intent(intent)
                         else:
                             # Partial result — ловим команды без паузы в конце.
                             # Если partial уже содержит wake word + хвост, и хвост
@@ -109,14 +128,13 @@ class JarvisMain(metaclass=Singleton):
                             if not partial_text:
                                 continue
                             intent = self._extract_intent(partial_text)
-                            if not intent or intent == _last_partial_intent:
+                            if not intent:
                                 continue
                             # Ждём достаточно слов (≥2 слова в интенте) чтобы не
                             # срабатывать на каждый фонем
                             if len(intent.split()) < 2:
                                 continue
-                            _last_partial_intent = intent
-                            bus.publish_threadsafe(Event(EventType.VOICE_INTENT, intent))
+                            _publish_intent(intent)
             except Exception:
                 log.exception("voice loop crashed — restarting in 3s")
                 import time as _time

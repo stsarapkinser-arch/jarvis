@@ -323,9 +323,34 @@ class ChronoMemory(metaclass=Singleton):
                 kwargs["where"] = dict(where)
             res = col.query(**kwargs)
         except ChromaDBInternalError:
-            # ChromaDB can throw "Error finding id" on empty/filtered subsets.
-            # Return empty results instead of crashing the voice pipeline.
-            log.warning("ChromaDB internal error on %s (likely empty collection)", getattr(col, "name", "?"))
+            # ChromaDB бросает "Error finding id" при рассинхроне HNSW-сегмента
+            # с WAL — чаще всего это провоцирует именно where-фильтр по ts.
+            # Пробуем ещё раз БЕЗ фильтра (вернём свежие записи, отфильтруем
+            # по ts уже в Python), чтобы не терять воспоминания целиком.
+            if where:
+                try:
+                    res = col.query(query_texts=[query], n_results=min(n_results, col.count()))
+                    docs = (res.get("documents") or [[]])[0]
+                    metas = (res.get("metadatas") or [[]])[0]
+                    out: list[dict] = []
+                    for d, m in zip(docs, metas, strict=False):
+                        m = m or {}
+                        # Воспроизводим семантику where={"ts": {"$gte": cutoff}}.
+                        cutoff = None
+                        ts_cond = where.get("ts") if isinstance(where, Mapping) else None
+                        if isinstance(ts_cond, Mapping):
+                            cutoff = ts_cond.get("$gte")
+                        if cutoff is None or float(m.get("ts", 0.0)) >= float(cutoff):
+                            out.append({"document": d, "metadata": m})
+                    log.warning("ChromaDB internal error on %s — fallback без where, %d записей",
+                                getattr(col, "name", "?"), len(out))
+                    return out
+                except Exception:
+                    log.warning("ChromaDB internal error on %s — пустой результат",
+                                getattr(col, "name", "?"))
+                    return []
+            log.warning("ChromaDB internal error on %s (likely empty collection)",
+                        getattr(col, "name", "?"))
             return []
         except Exception:
             log.exception("query failed on %s", getattr(col, "name", "?"))

@@ -21,3 +21,6 @@ models/
 .DS_Store
 Thumbs.db
 jarvis_memory/
+
+# Локальные хуки/настройки агента — не часть репозитория
+.claude/

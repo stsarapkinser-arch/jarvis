@@ -20,7 +20,7 @@ except ImportError:
     Llama = None  # type: ignore
     _HAS_LLAMA_CPP = False
 
-from .protocol import GenerateRequest, GenerateChunk, HealthCheck, HealthReply, ServerError
+from .protocol import GenerateRequest, GenerateChunk, HealthReply, ServerError
 
 log = logging.getLogger("jarvis.llm_server")
 
@@ -50,27 +50,23 @@ class LlamaServer:
         self._server = None
 
     async def start(self) -> None:
-        """Start the server listening on the socket."""
+        """Start the server listening on the Unix domain socket.
+
+        Используем ``asyncio.start_unix_server`` — НЕ ``start_server(path=...)``.
+        В Python 3.13 ``start_server`` пробрасывает ``path`` в
+        ``loop.create_server()``, который такого аргумента не принимает →
+        ``TypeError: create_server() got an unexpected keyword argument 'path'``
+        (именно этот краш зацикливал сервер инференса в логах оператора).
+        ``start_unix_server`` — штатный путь для AF_UNIX и сразу даёт
+        (reader, writer) в колбэк."""
         if Path(self.socket_path).exists():
             Path(self.socket_path).unlink()
 
-        loop = asyncio.get_event_loop()
-        self._server = await loop.create_unix_server(
-            self._protocol_factory,
+        self._server = await asyncio.start_unix_server(
+            self._handle_client,
             path=self.socket_path,
         )
         log.info("Inference server listening on %s", self.socket_path)
-
-    def _protocol_factory(self):
-        """Factory for creating server-side protocol handlers."""
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader, self._client_connected)
-        protocol._client_connected_cb = self._client_connected  # type: ignore
-        return protocol
-
-    async def _client_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Called when a client connects."""
-        await self._handle_client(reader, writer)
 
     async def _handle_client(
         self,

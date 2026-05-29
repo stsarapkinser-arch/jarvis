@@ -27,10 +27,9 @@ from src.core.orchestrator import (
     Jarvis,
 )
 from src.core.immortal import FileChangeWatcher
-from src.inference.server import LlamaServer
 from src.services.daemon_swarm import DaemonSwarm
 from src.services.watch_service import DeepWatch
-from src.common.event_bus import Event, EventBus, EventType
+from src.common.event_bus import EventBus, EventType
 from src.ui.hud import JarvisHUD
 from src.ui.window_manager import KWinOrchestrator
 from src.core.entry_point import JarvisMain
@@ -215,25 +214,30 @@ async def initial_hud_pin(kwin: KWinOrchestrator) -> None:
         log.exception("initial HUD pin failed")
 
 
-async def _run_llm_server(server: LlamaServer) -> None:
-    """Run the inference server. If it crashes, log and try to restart after 5s."""
-    while True:
-        try:
-            await server.run()
-        except KeyboardInterrupt:
-            log.info("LLM server shutdown requested")
-            break
-        except Exception:
-            log.exception("LLM server crashed; restarting in 5s...")
-            await asyncio.sleep(5.0)
+async def _prewarm_inference(jarvis: Jarvis) -> None:
+    """Поднять сервер инференса ОТДЕЛЬНЫМ процессом заранее, в фоне.
+
+    Дёргаем health_check у клиента — он при отсутствии соединения сам
+    спаунит ``python -m src.inference.server`` (см. client.py::_start_server).
+    Так модель грузится в своём процессе пока Jarvis договаривает приветствие,
+    и первая голосовая команда не ждёт холодный старт. Любые ошибки глушим —
+    при первом реальном запросе клиент всё равно переподнимет сервер."""
+    try:
+        await asyncio.sleep(2.0)
+        await jarvis._inference_client.health_check()
+    except Exception:
+        log.debug("inference prewarm skipped", exc_info=True)
 
 
 async def amain() -> None:
-    # Start the inference server in the background before anything else.
-    # The server runs in a separate process so crashes don't kill Jarvis.
-    socket_path = os.getenv("JARVIS_LLAMA_SOCKET", "/tmp/jarvis-llm.sock")
-    llm_server = LlamaServer(socket_path, model_path=LLAMA_MODEL_PATH)
-    asyncio.create_task(_run_llm_server(llm_server), name="llm-server")
+    # Сервер инференса llama-cpp НЕ запускаем в процессе bootstrap:
+    #  (1) llama-cpp синхронный — генерация в этом же event-loop заморозила бы
+    #      HUD, шину и голос на каждом ответе;
+    #  (2) нативный краш llama-cpp (GGML_ASSERT/segfault) убил бы весь процесс.
+    # InferenceClient сам поднимает сервер ОТДЕЛЬНЫМ процессом при первом
+    # запросе (src/inference/client.py::_start_server) — реальная изоляция
+    # краша и никакой заморозки UI. Модель переживает hot-reload (os.execv),
+    # оставаясь тёплой в своём процессе.
 
     bus = EventBus()
     bus.bind_loop(asyncio.get_running_loop())
@@ -287,6 +291,7 @@ async def amain() -> None:
 
     jarvis.start_proactive_loop()
     asyncio.create_task(_boot_greeting(jarvis), name="boot-greeting")
+    asyncio.create_task(_prewarm_inference(jarvis), name="llm-prewarm")
 
     voice = JarvisMain()
     # Голосовой тред запускается через watchdog-обёртку: если run() завершится
