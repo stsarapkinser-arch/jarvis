@@ -12,14 +12,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
-
-try:
-    from llama_cpp import Llama
-    _HAS_LLAMA_CPP = True
-except ImportError:
-    Llama = None  # type: ignore
-    _HAS_LLAMA_CPP = False
+from typing import Any, Optional
 
 try:
     import psutil  # type: ignore
@@ -46,6 +39,7 @@ from src.common.repair import QuickPatcher
 from src.security.execution import ShadowExec, needs_shadow
 from src.common.singleton import Singleton
 from src.memory.snapshot import StateSnapshot, snapshot
+from src.inference.client import InferenceClient
 
 log = logging.getLogger("jarvis.core")
 
@@ -312,20 +306,11 @@ class Jarvis(metaclass=Singleton):
             log.error("system_prompt missing at %s — using minimal fallback", SYSTEM_PROMPT_FILE)
             self.system_prompt = "Ты — JARVIS, краткий ассистент. Отвечай по делу."
 
-        # llama-cpp lazy-load: модель тяжёлая (~1.9 GiB GGUF + iGPU layers),
-        # грузим на ПЕРВЫЙ запрос, не на boot — оператору не нужно ждать
-        # старта Jarvis ради одной верхней команды. Lock защищает от гонки
-        # двух одновременных process_intent при холодном кэше.
-        self._llama: Any | None = None  # llama_cpp.Llama
-        self._llama_load_lock = asyncio.Lock()
-        # Single-worker executor: llama_cpp.Llama НЕ thread-safe; одновременных
-        # decode'ов быть не должно. Отдельный pool вместо default, чтобы
-        # asyncio.to_thread на побочные вещи (run_bash, snapshot) не толкался
-        # с inference-петлёй.
-        from concurrent.futures import ThreadPoolExecutor
-        self._llama_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="jarvis-llama"
-        )
+        # Inference client: коммуницирует с отдельным процессом llama-cpp.
+        # Если процесс упадёт на нативный краш (GGML_ASSERT и т.п.), он
+        # перезагружается — Jarvis продолжает работу, просто скажет
+        # оператору о сбое мозга.
+        self._inference_client = InferenceClient(model_path=LLAMA_MODEL_PATH)
         # Адаптер под ollama-совместимый интерфейс — для Mnemosyne и т.п.
         self.llm_adapter = _LlamaCompletionAdapter(self)
 
@@ -729,92 +714,6 @@ class Jarvis(metaclass=Singleton):
         )
 
     # ───────────── llama-cpp engine ─────────────
-    async def _ensure_llama(self) -> bool:
-        """Idempotent lazy load of the GGUF brain.
-
-        Возвращает True, если ``self._llama`` готов к ``create_chat_completion``.
-        Грузим в ``asyncio.to_thread`` — Llama() в конструкторе делает mmap
-        весов + iGPU-инициализацию (на N100 ~3-6 секунд), это блокировало
-        бы event loop. Lock защищает: если две process_intent гонкой попали
-        в _ensure_llama до прогрева, вторая просто ждёт первую."""
-        if self._llama is not None:
-            return True
-        if not _HAS_LLAMA_CPP:
-            log.error(
-                "llama-cpp-python не установлен — мозг отключён. "
-                "Запустите ./setup_igpu.sh"
-            )
-            return False
-        if not Path(LLAMA_MODEL_PATH).is_file():
-            log.error(
-                "GGUF-модель не найдена: %s — запустите ./setup_igpu.sh",
-                LLAMA_MODEL_PATH,
-            )
-            return False
-        async with self._llama_load_lock:
-            if self._llama is not None:
-                return True
-            log.info(
-                "loading %s (n_gpu_layers=%d, n_threads=%d, n_ctx=%d, n_batch=%d, flash_attn=%s) — N100 iGPU offload",
-                LLAMA_MODEL_NAME, LLAMA_N_GPU_LAYERS, LLAMA_N_THREADS,
-                LLAMA_N_CTX, LLAMA_N_BATCH, LLAMA_FLASH_ATTN,
-            )
-            try:
-                self._llama = await asyncio.to_thread(
-                    Llama,
-                    model_path=LLAMA_MODEL_PATH,
-                    n_gpu_layers=LLAMA_N_GPU_LAYERS,
-                    n_threads=LLAMA_N_THREADS,
-                    n_ctx=LLAMA_N_CTX,
-                    n_batch=LLAMA_N_BATCH,
-                    n_ubatch=LLAMA_N_UBATCH,
-                    flash_attn=LLAMA_FLASH_ATTN,
-                    chat_format="chatml",   # Qwen2.5 — ChatML; форсим явно,
-                                            # чтобы не зависеть от metadata конкретного билда GGUF.
-                    verbose=False,
-                )
-                log.info("LLM ready: %s", LLAMA_MODEL_NAME)
-                # Прогрев KV-кэша системного промпта: делаем один холостой запрос
-                # с system+пустым user prompt, чтобы llama-cpp зафиксировал
-                # system-prefix в KV и не пересчитывал его при каждом интенте.
-                await asyncio.to_thread(self._warm_system_prompt_cache)
-                return True
-            except Exception:
-                log.exception("Llama(%s) load failed", LLAMA_MODEL_PATH)
-                self._llama = None
-                return False
-
-    def _warm_system_prompt_cache(self) -> None:
-        """Прогреваем KV-кэш системного промпта одним холостым вызовом.
-
-        llama-cpp хранит prefill-результат в KV-кэше. Если system-сообщение
-        одинаково между запросами — следующий create_chat_completion просто
-        «до-префилит» только user-часть. Без этого каждый запрос тратит
-        ~0.5 с на пересчёт 520+ токенов system-промпта заново.
-        Вызывается синхронно ВНУТРИ llama_executor-треда, поэтому self._llama
-        жив и thread-safe."""
-        if self._llama is None:
-            return
-        try:
-            # Минимальный холостой запрос: system + пустой user, max_tokens=1.
-            # Цель — не получить ответ, а прогреть prefill-кэш.
-            self._llama.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user",   "content": "init"},
-                ],
-                max_tokens=1,
-                temperature=0.0,
-                stream=False,
-            )
-            log.info(
-                "LLM system-prompt KV-cache warmed (%d chars / ~%d tokens)",
-                len(self.system_prompt),
-                LLAMA_SYSTEM_CACHE_TOKENS,
-            )
-        except Exception:
-            log.warning("LLM KV-cache warm failed (non-fatal)", exc_info=True)
-
     async def _llama_stream(
         self,
         prompt: str,
@@ -822,93 +721,26 @@ class Jarvis(metaclass=Singleton):
         max_tokens: int = LLAMA_MAX_TOKENS_DEFAULT,
         temperature: float = 0.0,
     ) -> AsyncIterator[str]:
-        """Yield-каждый-токен generator поверх блокирующего llama-cpp.
+        """Stream tokens from the inference server.
 
-        llama_cpp.Llama.create_chat_completion(stream=True) — sync-итератор,
-        каждый next() считает следующий токен на CPU/iGPU. Чтобы asyncio
-        loop не фризил под decode'ом, producer крутится в нашем single-worker
-        executor'е и пушит токены через ``loop.call_soon_threadsafe`` в
-        ``asyncio.Queue``; основная корутина их await'ит и отдаёт наружу.
-
-        Sentinel-объект завершает поток — обычный None не годится, llama-cpp
-        иногда генерирует пустые delta, которые мы хотим отличать от EOF."""
-        if not await self._ensure_llama():
-            return
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        SENTINEL = object()
-
-        messages: list[dict[str, str]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        def _producer() -> None:
-            try:
-                # ── Token budget guard ─────────────────────────────────────────
-                # Runs synchronously inside the single-worker executor where
-                # self._llama lives. tokenize() is read-only on model weights,
-                # safe to call here. Prevents ValueError: Requested tokens exceed
-                # context window that happened with large memory/system blocks.
-                budget = LLAMA_N_CTX - max_tokens - 16  # 16 = ChatML framing overhead
-                total_toks = 3  # BOS + initial assistant marker
-                for m in messages:
-                    raw = (m.get("content") or "").encode()
-                    try:
-                        total_toks += len(
-                            self._llama.tokenize(raw, add_bos=False, special=False)  # type: ignore[union-attr]
-                        ) + 4  # per-message ChatML tokens
-                    except Exception:
-                        total_toks += len(raw) // 3 + 4
-
-                if total_toks > budget:
-                    over = total_toks - budget
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i]["role"] == "user":
-                            content = messages[i]["content"]
-                            try:
-                                toks = self._llama.tokenize(  # type: ignore[union-attr]
-                                    content.encode(), add_bos=False, special=False
-                                )
-                                keep = max(40, len(toks) - over - 10)
-                                kept = self._llama.detokenize(toks[:keep]).decode("utf-8", errors="replace")  # type: ignore[union-attr]
-                                messages[i] = {**messages[i], "content": kept + "\n[…обрезано…]"}
-                                log.warning(
-                                    "LLM: user prompt trimmed %d→%d tokens (ctx=%d budget=%d)",
-                                    len(toks), keep, LLAMA_N_CTX, budget,
-                                )
-                            except Exception:
-                                trim_chars = (over + 20) * 4
-                                messages[i] = {
-                                    **messages[i],
-                                    "content": content[: max(100, len(content) - trim_chars)] + "\n[…обрезано…]",
-                                }
-                            break
-                # ── end token guard ────────────────────────────────────────────
-
-                stream = self._llama.create_chat_completion(  # type: ignore[union-attr]
-                    messages=messages,
-                    stream=True,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=1.0,
-                )
-                for chunk in stream:
-                    delta = chunk["choices"][0].get("delta", {}) if chunk.get("choices") else {}
-                    content = delta.get("content") if isinstance(delta, dict) else None
-                    if content:
-                        loop.call_soon_threadsafe(queue.put_nowait, content)
-            except Exception:
-                log.exception("llama-cpp producer crashed")
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
-
-        loop.run_in_executor(self._llama_executor, _producer)
-        while True:
-            item = await queue.get()
-            if item is SENTINEL:
-                return
-            yield item
+        Делегирует генерацию в отдельный процесс (src/inference/server.py).
+        Если сервер упадёт на нативный краш (GGML_ASSERT и т.п.), клиент
+        обнаружит разрыв соединения и выбросит RuntimeError, который вышестоящий
+        код поймает и озвучит оператору."""
+        try:
+            async for token in self._inference_client.generate_stream(
+                prompt=prompt,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                yield token
+        except RuntimeError as e:
+            log.error("Inference server error: %s", e)
+            raise
+        except Exception as e:
+            log.exception("Unexpected error during generation: %s", e)
+            raise
 
     async def _llama_complete(
         self,

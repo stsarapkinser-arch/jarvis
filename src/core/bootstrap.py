@@ -22,11 +22,11 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 
 from src.core.orchestrator import (
-    _HAS_LLAMA_CPP,
     LLAMA_MODEL_NAME,
     LLAMA_MODEL_PATH,
     Jarvis,
 )
+from src.inference.server import LlamaServer
 from src.services.daemon_swarm import DaemonSwarm
 from src.services.watch_service import DeepWatch
 from src.common.event_bus import Event, EventBus, EventType
@@ -64,10 +64,8 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
     чтобы оператор услышал ровно один краткий брифинг."""
     issues: list[str] = []
 
-    # — Layer 1: llama-cpp + GGUF.
-    if not _HAS_LLAMA_CPP:
-        issues.append("llama-cpp-python не установлен — запустите ./setup_igpu.sh")
-    elif not Path(LLAMA_MODEL_PATH).is_file():
+    # — Layer 1: GGUF model (server loads llama-cpp).
+    if not Path(LLAMA_MODEL_PATH).is_file():
         issues.append(
             f"GGUF-модель {LLAMA_MODEL_NAME} отсутствует — запустите ./setup_igpu.sh"
         )
@@ -128,7 +126,7 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
         )
     else:
         log.info(
-            "inference stack OK: llama-cpp + %s, embeddings via ollama all-minilm",
+            "inference stack OK: inference server + %s, embeddings via ollama all-minilm",
             LLAMA_MODEL_NAME,
         )
 
@@ -235,7 +233,26 @@ async def initial_hud_pin(kwin: KWinOrchestrator) -> None:
         log.exception("initial HUD pin failed")
 
 
+async def _run_llm_server(server: LlamaServer) -> None:
+    """Run the inference server. If it crashes, log and try to restart after 5s."""
+    while True:
+        try:
+            await server.run()
+        except KeyboardInterrupt:
+            log.info("LLM server shutdown requested")
+            break
+        except Exception:
+            log.exception("LLM server crashed; restarting in 5s...")
+            await asyncio.sleep(5.0)
+
+
 async def amain() -> None:
+    # Start the inference server in the background before anything else.
+    # The server runs in a separate process so crashes don't kill Jarvis.
+    socket_path = os.getenv("JARVIS_LLAMA_SOCKET", "/tmp/jarvis-llm.sock")
+    llm_server = LlamaServer(socket_path, model_path=LLAMA_MODEL_PATH)
+    asyncio.create_task(_run_llm_server(llm_server), name="llm-server")
+
     bus = EventBus()
     bus.bind_loop(asyncio.get_running_loop())
 
@@ -246,7 +263,7 @@ async def amain() -> None:
     kwin = KWinOrchestrator()
     hud.subscribe_to_bus(bus)
 
-    # Runtime-верификация LLM-стека (llama-cpp GGUF + ollama embeddings).
+    # Runtime-верификация LLM-стека (inference server + ollama embeddings).
     # Если чего-то нет — Джарвис скажет голосом и продолжит запуск без падения.
     await verify_inference_stack(jarvis)
 
