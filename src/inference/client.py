@@ -50,8 +50,9 @@ class InferenceClient:
     ) -> AsyncIterator[str]:
         """Stream tokens from the model.
 
-        Yields tokens one by one. If the server crashes, raises an exception
-        which the caller (orchestrator) should catch and handle gracefully."""
+        If the server crashes before yielding any token, restarts it and
+        retries once. Mid-stream crashes raise immediately (partial output
+        already sent to caller)."""
         req = GenerateRequest(
             prompt=prompt,
             system=system,
@@ -59,46 +60,53 @@ class InferenceClient:
             temperature=temperature,
         )
 
-        await self._ensure_connected()
+        for attempt in range(2):
+            try:
+                await self._ensure_connected()
+                req_line = json.dumps({"_type": "generate", **req._asdict()})
+                self._writer.write(req_line.encode() + b"\n")  # type: ignore[union-attr]
+                await self._writer.drain()  # type: ignore[union-attr]
 
-        try:
-            # Send request as JSON line
-            req_line = json.dumps({"_type": "generate", **req._asdict()})
-            self._writer.write(req_line.encode() + b"\n")  # type: ignore[union-attr]
-            await self._writer.drain()  # type: ignore[union-attr]
+                tokens_yielded = 0
+                while True:
+                    line = await self._reader.readline()  # type: ignore[union-attr]
+                    if not line:
+                        self._disconnect()
+                        if tokens_yielded == 0 and attempt == 0:
+                            log.warning(
+                                "Server disconnected before output; retrying after restart"
+                            )
+                            break  # exit inner while → next attempt
+                        log.error("Server disconnected unexpectedly")
+                        raise RuntimeError("Inference server disconnected")
 
-            # Stream responses
-            while True:
-                line = await self._reader.readline()  # type: ignore[union-attr]
-                if not line:
-                    log.error("Server disconnected unexpectedly")
-                    self._disconnect()
-                    raise RuntimeError("Inference server disconnected")
+                    try:
+                        resp_data = json.loads(line.decode())
+                    except json.JSONDecodeError:
+                        log.error("Malformed response from server: %r", line)
+                        self._disconnect()
+                        raise RuntimeError("Server protocol error")
 
-                try:
-                    resp_data = json.loads(line.decode())
-
-                    # Check for error
                     if "error" in resp_data:
                         err = ServerError(**resp_data)
                         log.error("Server error: %s — %s", err.error, err.detail)
                         raise RuntimeError(f"Server error: {err.error}")
 
-                    # Check for chunk
                     if "token" in resp_data:
                         chunk = GenerateChunk(**resp_data)
                         if chunk.is_done:
-                            break
+                            return
+                        tokens_yielded += 1
                         yield chunk.token
 
-                except json.JSONDecodeError:
-                    log.error("Malformed response from server: %r", line)
-                    self._disconnect()
-                    raise RuntimeError("Server protocol error")
+            except RuntimeError:
+                self._disconnect()
+                raise
+            except Exception:
+                self._disconnect()
+                raise
 
-        except Exception:
-            self._disconnect()
-            raise
+        raise RuntimeError("Inference server disconnected after retry")
 
     async def health_check(self) -> bool:
         """Check if the server is alive."""
@@ -124,20 +132,21 @@ class InferenceClient:
             return False
 
     async def _ensure_connected(self) -> None:
-        """Connect to the server, starting it if necessary."""
+        """Connect to the server, starting it if necessary.
+
+        Polls up to 30 s so slow model loading (large GGUF on CPU) doesn't
+        cause a spurious "could not connect" error."""
         async with self._connect_lock:
             if self._reader is not None and self._writer is not None:
-                # Already connected; do a quick health check
-                if not await self._health_check_quick():
-                    self._disconnect()
-                else:
+                if await self._health_check_quick():
                     return
+                self._disconnect()
 
-            # Try to connect; if that fails, start the server and retry.
+            # Poll for the server; start it on the first miss.
             # ВАЖНО: open_unix_connection, а не open_connection(path=...) —
-            # на Python 3.13 второй падает с TypeError (create_connection не
-            # знает аргумент path). Это зеркало бага сервера.
-            for attempt in range(2):
+            # на Python 3.13 второй падает с TypeError.
+            server_started = False
+            for _ in range(60):  # 60 × 0.5 s = 30 s total
                 try:
                     self._reader, self._writer = await asyncio.open_unix_connection(
                         self.socket_path
@@ -145,11 +154,13 @@ class InferenceClient:
                     log.info("Connected to inference server")
                     return
                 except (FileNotFoundError, ConnectionRefusedError):
-                    if attempt == 0:
+                    if not server_started:
                         log.warning("Server not running; starting it...")
                         await self._start_server()
-                    else:
-                        raise RuntimeError("Could not connect to inference server")
+                        server_started = True
+                    await asyncio.sleep(0.5)
+
+            raise RuntimeError("Could not connect to inference server after 30 s")
 
     async def _health_check_quick(self) -> bool:
         """Quick health check without raising on failure."""
@@ -190,9 +201,7 @@ class InferenceClient:
                 start_new_session=True,  # Separate process group so Ctrl+C doesn't kill it
             )
             log.info("Started inference server (PID %d)", self._server_proc.pid)
-
-            # Give it a moment to start
-            await asyncio.sleep(0.5)
+            # No sleep here — _ensure_connected polls until socket is ready.
 
         except Exception as e:
             log.error("Failed to start inference server: %s", e)

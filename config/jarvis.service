@@ -26,6 +26,9 @@ StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=__JARVIS_HOME__
+# llama-cpp: CPU-only по умолчанию — стабильно на N100 без Vulkan-краша.
+# Для GPU-offload добавьте drop-in: JARVIS_LLAMA_GPU_LAYERS=-1 (все слои).
+Environment=JARVIS_LLAMA_GPU_LAYERS=0
 Environment=QT_QPA_PLATFORM=wayland
 # OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
 # падал на llvmpipe. Если у пользователя другой драйвер — пусть
