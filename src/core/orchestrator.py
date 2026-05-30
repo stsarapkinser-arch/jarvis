@@ -297,6 +297,13 @@ class Jarvis(metaclass=Singleton):
         # не бубнить «Температура 83 градуса» каждые 60 секунд.
         self._os_alert_last_say: dict[str, float] = {}
 
+        # Голосовые интенты сериализуем + коалесцируем: EventBus пускает каждый
+        # отдельной задачей, а llama-server одно-слотовый (--parallel 1). Без этого
+        # бурст команд давал конкурентные запросы → очередь на сервере → ReadTimeout
+        # у 2-го+. Свежий интент вытесняет устаревший (latest-wins).
+        self._voice_lock: asyncio.Lock | None = None
+        self._voice_seq: int = 0
+
     async def _state(self, state: str, thought: str = "") -> None:
         self._state_label = state
         await self.bus.publish(Event(EventType.STATE_CHANGE, (state, thought)))
@@ -1024,7 +1031,16 @@ class Jarvis(metaclass=Singleton):
         return "queued"
 
     async def on_voice_intent(self, event: Event) -> None:
-        await self.process_intent(str(event.data))
+        # Сериализация + коалесценция голосовых команд (см. _voice_lock в __init__).
+        if self._voice_lock is None:
+            self._voice_lock = asyncio.Lock()
+        self._voice_seq += 1
+        seq = self._voice_seq
+        async with self._voice_lock:
+            if seq != self._voice_seq:
+                log.info("voice intent superseded — skip stale: %r", str(event.data)[:60])
+                return
+            await self.process_intent(str(event.data))
 
     async def on_deep_watch(self, event: Event) -> None:
         """Ring-0 eBPF sample (execve / tcp_v4_connect).

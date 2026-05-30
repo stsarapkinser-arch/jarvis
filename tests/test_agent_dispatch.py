@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.common.event_bus import EventType
+from src.common.event_bus import Event, EventType
 from src.common.singleton import Singleton
 from src.inference.agent import ToolCall
 from src.inference.router import IntentCategory
@@ -170,3 +170,36 @@ def test_warmup_returns_false_on_server_error():
 
     j._llm.chat = boom  # type: ignore[assignment]
     assert asyncio.run(j.warmup()) is False
+
+
+def test_voice_intents_coalesce_to_latest():
+    """Сериализация + latest-wins: пока обрабатывается команда, бурст новых
+    голосовых интентов не плодит конкурентные запросы к одно-слотовому серверу —
+    выполняется первый (уже стартовавший) и самый свежий; промежуточные
+    вытесняются."""
+    j = _make_jarvis()
+    processed: list = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_process(text):
+        processed.append(text)
+        if text == "first":
+            started.set()
+            await release.wait()
+
+    j.process_intent = slow_process  # type: ignore[assignment]
+
+    async def scenario():
+        t1 = asyncio.create_task(j.on_voice_intent(Event(EventType.VOICE_INTENT, "first")))
+        await started.wait()
+        t2 = asyncio.create_task(j.on_voice_intent(Event(EventType.VOICE_INTENT, "second")))
+        t3 = asyncio.create_task(j.on_voice_intent(Event(EventType.VOICE_INTENT, "third")))
+        await asyncio.sleep(0.05)
+        release.set()
+        await asyncio.gather(t1, t2, t3)
+
+    asyncio.run(scenario())
+    assert "first" in processed
+    assert "third" in processed
+    assert "second" not in processed  # вытеснен более свежим

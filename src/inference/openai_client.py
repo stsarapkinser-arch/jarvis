@@ -17,6 +17,7 @@ Vulkan, см. ``setup_server.sh`` / ``config/jarvis-llm.service``). Здесь �
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Sequence
@@ -80,6 +81,10 @@ class LlamaServerClient:
         self._timeout = request_timeout if request_timeout is not None else DEFAULT_REQUEST_TIMEOUT
         self._connect_timeout = connect_timeout
         self._client: Any | None = None  # httpx.AsyncClient | None
+        # llama-server держит ОДИН слот (--parallel 1). Сериализуем все
+        # запросы здесь: конкурентные вызовы иначе выстраиваются в очередь на
+        # сервере, и httpx-таймаут 2-го+ истекает, пока сервер доделывает 1-й.
+        self._request_lock: asyncio.Lock | None = None
 
     # ───────────────────────── lifecycle ─────────────────────────
     def _ensure_client(self) -> Any:
@@ -140,15 +145,20 @@ class LlamaServerClient:
             body["tools"] = list(tools)
             body["tool_choice"] = tool_choice
 
-        try:
-            resp = await client.post("/v1/chat/completions", json=body)
-        except Exception as exc:  # httpx.ConnectError/ReadTimeout/...
-            # У httpx.ReadTimeout пустой str(), поэтому добавляем имя типа —
-            # иначе в логе было голое «llama-server недоступен: ».
-            detail = str(exc) or "превышен таймаут ответа (модель слишком долго думает?)"
-            raise LlamaServerError(
-                f"llama-server недоступен: {type(exc).__name__}: {detail}"
-            ) from exc
+        # Сериализация: один HTTP-запрос к серверу за раз (у llama-server один
+        # слот). Лок создаём лениво — конструктор может вызываться вне event-loop.
+        if self._request_lock is None:
+            self._request_lock = asyncio.Lock()
+        async with self._request_lock:
+            try:
+                resp = await client.post("/v1/chat/completions", json=body)
+            except Exception as exc:  # httpx.ConnectError/ReadTimeout/...
+                # У httpx.ReadTimeout пустой str(), поэтому добавляем имя типа —
+                # иначе в логе было голое «llama-server недоступен: ».
+                detail = str(exc) or "превышен таймаут ответа (модель слишком долго думает?)"
+                raise LlamaServerError(
+                    f"llama-server недоступен: {type(exc).__name__}: {detail}"
+                ) from exc
 
         if resp.status_code != 200:
             raise LlamaServerError(

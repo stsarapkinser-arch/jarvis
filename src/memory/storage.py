@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.common.event_bus import Event, EventBus, EventType
+from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
 from src.common.singleton import Singleton
 
 log = logging.getLogger("jarvis.mnemosyne")
@@ -232,6 +232,12 @@ class Mnemosyne(metaclass=Singleton):
     async def _harvest_loop(self) -> None:
         while not self._stopping:
             try:
+                # Под HIGH/CRITICAL пропускаем тик: персист слайса = эмбеддинг в
+                # ollama (CPU + память), а это душит iGPU-декод llama-server на
+                # общей шине LPDDR5. Память подождёт — отзывчивость мозга важнее.
+                if SystemState().load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
+                    await asyncio.sleep(HARVEST_INTERVAL)
+                    continue
                 slice_ = await self._capture_slice()
                 # None = тик пропущен (KWin не ответил). Не персистим, не
                 # сравниваем, ждём следующий цикл.
