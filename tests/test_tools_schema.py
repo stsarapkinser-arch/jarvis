@@ -60,6 +60,16 @@ def test_system_ops_has_full_toolset():
     assert {"execute_bash", "read_telemetry", "speak_response", "set_hud_state"} <= ops
 
 
+def test_action_categories_share_identical_toolset():
+    """Кэш-стабильность: три action-категории дают ИДЕНТИЧНЫЙ набор и порядок
+    инструментов → сервер переиспользует KV-префикс (prefill не пересчитывает
+    tool-схемы на переключении категории)."""
+    ops = [s["function"]["name"] for s in t.tools_for_category("SYSTEM_OPS")]
+    ui = [s["function"]["name"] for s in t.tools_for_category("UI_CONTROL")]
+    pen = [s["function"]["name"] for s in t.tools_for_category("PENTEST_RECON")]
+    assert ops == ui == pen, "action-категории должны делить идентичный tool-набор"
+
+
 def test_unknown_category_returns_all_tools():
     assert len(t.tools_for_category("???")) == len(t.TOOL_SCHEMAS)
 

@@ -36,6 +36,10 @@ log = logging.getLogger("jarvis.llm_http")
 
 DEFAULT_ENDPOINT = os.getenv("JARVIS_LLM_ENDPOINT", "http://127.0.0.1:8080")
 DEFAULT_MODEL = os.getenv("JARVIS_LLM_MODEL", "llama-3.2-3b-instruct")
+# "required" грамматически принуждает сервер к валидному tool-call (3B иначе
+# пишет прозу → 500). Если сборка сервера не поддерживает required — оператор
+# может выставить JARVIS_TOOL_CHOICE=auto.
+DEFAULT_TOOL_CHOICE = os.getenv("JARVIS_TOOL_CHOICE", "required")
 
 
 def _env_float(name: str, default: float) -> float:

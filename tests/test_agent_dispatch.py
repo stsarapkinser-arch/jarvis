@@ -77,6 +77,8 @@ def test_speak_response_calls_say_with_mapped_tone():
     assert spoken and spoken[0] == ("Сэр, готово", "alert")
     assert st.spoke is True
     assert res.content == "spoken"
+    # speak_response терминален — иначе при tool_choice=required цикл не остановится.
+    assert res.stop is True
 
 
 def test_set_hud_state_publishes_hud_event():

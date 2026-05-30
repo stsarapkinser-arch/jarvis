@@ -217,10 +217,17 @@ _COMMON = (
     ToolName.SPEAK_RESPONSE.value,
     ToolName.SET_HUD_STATE.value,
 )
+# Три action-категории делят ИДЕНТИЧНЫЙ набор (и порядок) инструментов. Это
+# даёт серверу стабильный KV-префикс [tools + core] между запросами → prefill
+# не пересчитывает ~500 токенов tool-схем на каждом переключении категории
+# (в логах было sim_best=0.18 → полный prefill ~40с; теперь меняется только
+# короткий хвост правил категории). CONVERSATION держим отдельно и БЕЗ
+# execute_bash — чистый разговор не должен иметь доступа к системе.
+_ACTION = _COMMON + (ToolName.READ_TELEMETRY.value, ToolName.EXECUTE_BASH.value)
 _CATEGORY_TOOLS: Final[dict[str, tuple[str, ...]]] = {
-    "SYSTEM_OPS": _COMMON + (ToolName.READ_TELEMETRY.value, ToolName.EXECUTE_BASH.value),
-    "UI_CONTROL": _COMMON + (ToolName.EXECUTE_BASH.value,),
-    "PENTEST_RECON": _COMMON + (ToolName.READ_TELEMETRY.value, ToolName.EXECUTE_BASH.value),
+    "SYSTEM_OPS": _ACTION,
+    "UI_CONTROL": _ACTION,
+    "PENTEST_RECON": _ACTION,
     "CONVERSATION": _COMMON,
 }
 

@@ -106,9 +106,15 @@ async def run_agent(
     max_steps: int = DEFAULT_MAX_STEPS,
     temperature: float = 0.3,
     max_tokens: int = 512,
+    tool_choice: str = "required",
 ) -> AgentRun:
     """Прогнать агентный цикл. Исключения транспорта пробрасываются наружу
-    (оркестратор их ловит и озвучивает сбой)."""
+    (оркестратор их ловит и озвучивает сбой).
+
+    ``tool_choice="required"`` грамматически принуждает сервер выдавать ТОЛЬКО
+    валидный tool-call (не свободную прозу) — критично для маленькой 3B, которая
+    иначе пишет markdown и роняет парсер сервера (500). Терминальность раунда
+    обеспечивает ``ToolResult.stop`` (диспетчер ставит его после речи)."""
     convo: list[Message] = list(messages)
     tool_calls_made = 0
 
@@ -116,7 +122,7 @@ async def run_agent(
         resp = await client.chat(
             convo,
             tools=tools,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             temperature=temperature,
             max_tokens=max_tokens,
         )

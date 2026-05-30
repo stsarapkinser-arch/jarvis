@@ -24,6 +24,7 @@ class FakeClient:
     async def chat(self, messages, tools=None, tool_choice="auto",
                    temperature=0.3, max_tokens=512):
         self.calls.append(list(messages))
+        self.last_tool_choice = tool_choice
         return self._responses.pop(0)
 
 
@@ -53,6 +54,17 @@ def test_agent_dispatches_then_stops_on_no_tools():
     assert run.tool_calls_made == 1
     roles = [m["role"] for m in run.messages]
     assert "assistant" in roles and "tool" in roles
+
+
+def test_agent_defaults_to_required_tool_choice():
+    """3B иначе пишет прозу → 500. run_agent по умолчанию принуждает tool-call."""
+    client = FakeClient([ChatResponse("", (), "stop")])
+
+    async def dispatch(call):
+        return ToolResult(call.id, "ok")
+
+    _run(run_agent(client, [{"role": "user", "content": "x"}], [], dispatch, max_steps=1))
+    assert client.last_tool_choice == "required"
 
 
 def test_agent_feeds_tool_result_back_to_model():

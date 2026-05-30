@@ -37,6 +37,7 @@ from src.memory.snapshot import StateSnapshot, snapshot
 from src.inference.openai_client import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
+    DEFAULT_TOOL_CHOICE,
     LlamaServerClient,
     LlamaServerError,
 )
@@ -86,6 +87,9 @@ AGENT_MAX_STEPS = 2
 # поэтому каждый сгенерированный токен ≈ секунда ответа. Раньше 3B уходила в
 # простыню (n_tokens=1489) → таймаут.
 LLM_MAX_TOKENS_DEFAULT = 160
+# tool_choice для агентного цикла. "required" грамматически принуждает сервер
+# к валидному tool-call — 3B иначе пишет markdown-прозу и роняет парсер (500).
+AGENT_TOOL_CHOICE = DEFAULT_TOOL_CHOICE
 # Болтовня заслуживает чуть больше «температуры» и места; системные операции —
 # почти детерминированы (точность важнее креатива).
 _CATEGORY_TEMPERATURE: dict[IntentCategory, float] = {
@@ -635,7 +639,10 @@ class Jarvis(metaclass=Singleton):
                 st.spoke = True
                 # HUD ticker continuity (раньше его кормил token-stream).
                 await self.bus.publish(Event(EventType.TOKEN_STREAM, sp.text.strip()))
-            return ToolResult(call.id, "spoken")
+            # speak_response ТЕРМИНАЛЕН: модель произнесла ответ → агентный цикл
+            # завершаем. Без этого при tool_choice=required цикл крутился бы до
+            # max_steps (модель всегда обязана звать инструмент).
+            return ToolResult(call.id, "spoken", stop=True)
 
         if name == tooldefs.ToolName.SET_HUD_STATE:
             hud = tooldefs.HudArgs.from_dict(call.arguments)
@@ -687,12 +694,17 @@ class Jarvis(metaclass=Singleton):
         run: AgentRun = await run_agent(
             self._llm, messages, tools, dispatch,
             max_steps=AGENT_MAX_STEPS, temperature=temperature,
-            max_tokens=LLM_MAX_TOKENS_DEFAULT,
+            max_tokens=LLM_MAX_TOKENS_DEFAULT, tool_choice=AGENT_TOOL_CHOICE,
         )
         st.run = run
         # Модель ответила голым текстом вместо speak_response — всё равно озвучим.
         if not st.spoke and run.stopped == "no_tools" and run.final_content.strip():
             self.say(run.final_content.strip()[:400])
+            st.spoke = True
+        # Сетка безопасности: модель ДЕЙСТВОВАЛА (звала инструменты), но не
+        # озвучила — короткий ack, чтобы оператор не остался в тишине.
+        if not st.spoke and (st.bash_commands or run.tool_calls_made > 0):
+            self.say(self.ack("ok"))
             st.spoke = True
         return st
 
