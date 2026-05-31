@@ -21,9 +21,9 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.inference.embeddings import EmbeddingClient, EmbeddingServerError
-from src.inference.semantic import DEFAULT_MARGIN, evaluate
-from tests.semantic_dataset import NEGATIVES, POSITIVES
+from src.inference.embeddings import EmbeddingClient, EmbeddingServerError  # noqa: E402
+from src.inference.semantic import DEFAULT_MARGIN, evaluate  # noqa: E402
+from tests.semantic_dataset import NEGATIVES, POSITIVES  # noqa: E402
 
 # Свип порогов: грубая сетка по диапазону косинуса коротких фраз.
 _THRESHOLDS = [round(0.30 + 0.02 * i, 2) for i in range(31)]  # 0.30 … 0.90

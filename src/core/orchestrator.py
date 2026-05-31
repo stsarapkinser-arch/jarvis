@@ -294,6 +294,10 @@ class Jarvis(metaclass=Singleton):
         # Семантический маршрутизатор: core-identity берём из config/system_prompt
         # (короткий стабильный префикс), правила категорий — внутри роутера.
         self.router = IntentRouter(core_identity=self.system_prompt)
+        # L2: семантический матч навыка через эмбеддинги. OFF по умолчанию —
+        # порог косинуса калибруется на железе (scripts/calibrate_semantic.py).
+        # Включение: JARVIS_SEMANTIC_MATCH=1. Сбой инициализации не валит ассистента.
+        self._semantic = self._init_semantic_matcher()
         # Адаптер под ollama-совместимый интерфейс — для Mnemosyne и т.п.
         self.llm_adapter = _LlamaCompletionAdapter(self)
 
