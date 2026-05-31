@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import skills
 from src.inference.router import IntentCategory
-from src.skills.screen import _clean_ocr, _ocr_command
+from src.skills.screen import clean_ocr, ocr_command
 
 
 class _FakeCtx:
@@ -36,7 +36,7 @@ def test_screen_skills_registered_in_ui():
 
 
 def test_ocr_command_uses_tesseract_and_cleanup():
-    cmd = _ocr_command()
+    cmd = ocr_command()
     assert "tesseract" in cmd
     assert "mktemp" in cmd and "rm -f" in cmd
     assert "grim" in cmd  # Wayland-захват в цепочке
@@ -44,7 +44,7 @@ def test_ocr_command_uses_tesseract_and_cleanup():
 
 def test_clean_ocr_collapses_noise():
     raw = "Error:   file\n\n   not   found\n\n\n"
-    assert _clean_ocr(raw) == "Error: file not found"
+    assert clean_ocr(raw) == "Error: file not found"
 
 
 def test_read_screen_speaks_recognised_text():

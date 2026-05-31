@@ -43,7 +43,47 @@ _GRAB_CHAIN = (
 )
 
 
-def _ocr_command(region: str = "") -> str:
+# Маркеры «сообщение об ошибке» (рус/eng) — общие для ручного навыка и
+# проактивного взгляда. Вынесены, чтобы логика детекции была одна и тестируемая.
+ERROR_RE = re.compile(
+    r"(error|exception|traceback|failed|fatal|denied|not found|cannot|segfault|"
+    r"panic|ошибк\w*|сбой|отказ\w*|не удал\w*|не найден\w*)",
+    re.IGNORECASE,
+)
+
+# Заголовки окон, где появление ошибки наиболее вероятно (терминал/редактор/IDE/
+# отладчик). Дешёвый пред-фильтр: OCR (дорогой на N100) запускаем ТОЛЬКО если
+# активное окно похоже на dev-контекст — и приватность, и экономия CPU.
+DEV_CONTEXT_RE = re.compile(
+    r"(konsole|yakuake|terminal|term\b|tilix|alacritty|kitty|xterm|"
+    r"kate|kwrite|gedit|\bcode\b|vscodium|vscode|vim|nvim|neovim|emacs|"
+    r"pycharm|qtcreator|kdevelop|clion|gdb|lldb|python|node\b|cargo|"
+    r"traceback|exception|error|сбор\w*|\.py\b|\.rs\b|\.c\b|\.cpp\b|\.js\b)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_dev_context(window_title: str) -> bool:
+    """Похоже ли активное окно на терминал/редактор/IDE/отладчик."""
+    return bool(DEV_CONTEXT_RE.search(window_title or ""))
+
+
+def extract_error_fragments(ocr_text: str) -> list[str]:
+    """Фрагменты распознанного текста, похожие на сообщение об ошибке."""
+    text = clean_ocr(ocr_text)
+    if not text:
+        return []
+    fragments = re.split(r"(?<=[.!?:;])\s+", text)
+    return [f for f in fragments if ERROR_RE.search(f)]
+
+
+def build_error_offer(fragments: list[str]) -> str:
+    """Проактивная реплика-предложение помощи по найденной на экране ошибке."""
+    joined = " ".join(fragments)[:_OCR_SPEAK_LIMIT]
+    return f"Сэр, вижу на экране ошибку. {joined}. Подсказать, в чём дело?"
+
+
+def ocr_command(region: str = "") -> str:
     """Собрать одну shell-команду: захват экрана → tesseract (rus+eng) → cleanup.
 
     ``region`` (если задан) подменяет цепочку захвата на захват области (geometry
@@ -61,7 +101,7 @@ def _ocr_command(region: str = "") -> str:
     )
 
 
-def _clean_ocr(text: str) -> str:
+def clean_ocr(text: str) -> str:
     """Схлопнуть OCR-шум: пустые строки, повторные пробелы, обрезки-артефакты."""
     lines = [ln.strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
@@ -74,8 +114,8 @@ def _clean_ocr(text: str) -> str:
        aliases=("что на экране", "прочитай экран", "распознай экран",
                 "что написано", "прочитай что на экране"))
 async def read_screen(ctx: SkillContext, args: dict[str, Any]) -> str:
-    rc, out, _ = await ctx.run(_ocr_command())
-    text = _clean_ocr(out)
+    rc, out, _ = await ctx.run(ocr_command())
+    text = clean_ocr(out)
     if rc != 0 and not text:
         return ("Не удалось прочитать экран, сэр — нет утилиты скриншота или "
                 "tesseract. Установите grim и tesseract.")
@@ -109,22 +149,15 @@ async def read_active_window(ctx: SkillContext, args: dict[str, Any]) -> str:
        aliases=("что за ошибка", "прочитай ошибку", "какая ошибка на экране",
                 "что за ошибка на экране"))
 async def describe_error_on_screen(ctx: SkillContext, args: dict[str, Any]) -> str:
-    rc, out, _ = await ctx.run(_ocr_command())
-    text = _clean_ocr(out)
+    rc, out, _ = await ctx.run(ocr_command())
+    text = clean_ocr(out)
     if rc != 0 and not text:
         return ("Не удалось прочитать экран, сэр — нет утилиты скриншота или "
                 "tesseract.")
     if not text:
         return "Текста на экране не вижу, сэр."
-    # Выцепляем строки, похожие на ошибку (рус/eng маркеры).
-    err_re = re.compile(
-        r"(error|exception|traceback|failed|fatal|denied|not found|cannot|"
-        r"ошибк\w*|сбой|отказ\w*|не удал\w*|не найден\w*)",
-        re.IGNORECASE,
-    )
-    # OCR уже схлопнут в одну строку — режем по предложениям для поиска маркеров.
-    fragments = re.split(r"(?<=[.!?:;])\s+", text)
-    hits = [f for f in fragments if err_re.search(f)]
+    # Та же детекция, что у проактивного взгляда (общий ERROR_RE).
+    hits = extract_error_fragments(text)
     if not hits:
         return "Явных сообщений об ошибке на экране не вижу, сэр."
     joined = " ".join(hits)[:_OCR_SPEAK_LIMIT]

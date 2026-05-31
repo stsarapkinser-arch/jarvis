@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 import shutil
@@ -45,6 +46,7 @@ from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
 from src.skills import macros
+from src.skills import screen as screen_skills
 from src.skills.learning import Candidate, SkillLearner
 from src.skills.healing import SkillHealer, first_binary
 from src.core.volition import ProactiveGate
@@ -1944,6 +1946,80 @@ class Jarvis(metaclass=Singleton):
 
     def start_proactive_loop(self) -> asyncio.Task:
         return asyncio.create_task(self._proactive_loop(), name="jarvis-proactive")
+
+    # ──────────────────── proactive screen perception ────────────────────────
+    # Каденция дорогого OCR. Запускаем РЕДКО и только когда оператор в простое
+    # (тот же ProactiveGate) — N100 не должен пыхтеть OCR'ом в фоне.
+    SCREEN_WATCH_INTERVAL = 90  # сек между проверками (не чаще, и лишь при простое)
+
+    @staticmethod
+    def _screen_watch_enabled() -> bool:
+        # Приватность: постоянное чтение экрана — сильная штука. По умолчанию
+        # включено (оператор сам просил «глаза»), но отключаемо одним env.
+        return os.getenv("JARVIS_SCREEN_WATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+
+    async def _screen_watch_loop(self) -> None:
+        """Проактивный взгляд: заметив на экране НОВЫЙ стек-трейс/ошибку в
+        dev-контексте, Джарвис сам предлагает помощь — связка «глаз» (OCR) с
+        волей (ProactiveGate). Дёшево по такту: пред-фильтр по заголовку окна,
+        дорогой OCR — только в терминале/IDE и только в простое."""
+        if not self._screen_watch_enabled():
+            log.info("screen-watch disabled (JARVIS_SCREEN_WATCH=0)")
+            return
+        await asyncio.sleep(90)  # дать загрузке устаканиться
+        last_offer_ts: float = 0.0
+        while True:
+            try:
+                await asyncio.sleep(self.SCREEN_WATCH_INTERVAL)
+                now = time.time()
+                state = SystemState()
+                # Тот же такт, что у проактивной речи: тихие часы, простой,
+                # анти-спам. Если оператор активен/система занята — даже не OCR'им.
+                if not self._proactive_gate.should_speak(
+                    now=now,
+                    last_say_ts=self._last_say_ts,
+                    last_proactive_ts=last_offer_ts,
+                    load_busy=state.load in (SystemLoad.HIGH, SystemLoad.CRITICAL),
+                    hour=time.localtime(now).tm_hour,
+                ):
+                    continue
+
+                # Дёшево: заголовок активного окна. OCR только если это похоже на
+                # терминал/редактор/IDE (и приватность, и экономия CPU).
+                _, title_out, _ = await self._run(
+                    "kdotool getactivewindow getwindowname 2>/dev/null "
+                    "|| xdotool getactivewindow getwindowname 2>/dev/null"
+                )
+                title = (title_out.strip().splitlines() or [""])[0].strip()
+                if not screen_skills.looks_like_dev_context(title):
+                    continue
+
+                # Дорого: OCR экрана. Сюда доходим редко — гейт + dev-контекст.
+                _, ocr_out, _ = await self._run(screen_skills.ocr_command())
+                frags = screen_skills.extract_error_fragments(ocr_out)
+                if not frags:
+                    continue
+
+                offer = screen_skills.build_error_offer(frags)
+                # Не предлагать одно и то же (окно дедупа гейта).
+                if self._proactive_gate.is_repeat(offer):
+                    continue
+                last_offer_ts = time.time()
+                self._proactive_gate.record(offer)
+                self.say(offer, tone="idle")
+                # В память — факт инициативы (без полного текста экрана: приватность).
+                await asyncio.to_thread(
+                    self.memory.remember,
+                    "[SCREEN_WATCH]", f"window={title[:60]}",
+                    "proactive error offer", "screen_watch", None,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("screen-watch loop error")
+
+    def start_screen_watch_loop(self) -> asyncio.Task:
+        return asyncio.create_task(self._screen_watch_loop(), name="jarvis-screen-watch")
 
     # ──────────────────── nightly memory reflection ──────────────────────────
 
