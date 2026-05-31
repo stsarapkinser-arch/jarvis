@@ -41,6 +41,7 @@ AUDIO_FFT → сфера HUD пульсирует синхронно с голо
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import shutil
@@ -53,12 +54,18 @@ from pathlib import Path
 from typing import IO, Any, Optional
 
 from src.audio.fft_analyzer import PiperFFTPump
+from src.audio.segmentation import split_sentences
 from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
 
 log = logging.getLogger("jarvis.acoustic")
 
 SOX_BIN: Optional[str] = shutil.which("sox")
 APLAY_BIN: Optional[str] = shutil.which("aplay")
+# Стриминг TTS: предложения короче этого склеиваются с соседним, чтобы не
+# дробить речь на интонационные обрывки («Да.», «Сэр.»). Порог низкий —
+# нормальные короткие фразы («Цель захвачена.») стримим отдельно (в этом и смысл),
+# склеиваем лишь совсем мелкие огрызки.
+_STREAM_MIN_SENTENCE_CHARS = 12
 _SAMPLE_RATE = 22050
 
 # Ambient-источник света/proximity (внешний продьюсер пишет JSON). Если файл
@@ -264,6 +271,11 @@ class AcousticEngine:
         self._active_lock = threading.Lock()
         self._speaking = False
         self._sox_missing_warned = False
+        # Стриминг TTS (Tier0 #2): длинную реплику режем на предложения и кладём
+        # в очередь по одному — первое короткое предложение звучит раньше, чем
+        # синтезируется вся реплика. OFF по умолчанию (между piper-процессами
+        # появляется стык; включать осознанно через JARVIS_STREAM_TTS=1).
+        self._stream_tts = os.getenv("JARVIS_STREAM_TTS", "0") == "1"
 
         self._worker = threading.Thread(
             target=self._worker_loop, daemon=True, name="jarvis-acoustic"
@@ -300,6 +312,17 @@ class AcousticEngine:
             interrupt = vs == VoiceState.ALERT
         if interrupt:
             self._interrupt()
+
+        # Стриминг: режем на предложения и ставим по одному (первое короткое
+        # зазвучит раньше). Просодия/состояние одинаковы для всех кусков одной
+        # реплики. min_chars склеивает обрывки, чтобы не дробить на «Да.»/«Сэр.».
+        # OFF или одно предложение → прежний единичный путь (байт-в-байт).
+        if self._stream_tts:
+            segments = split_sentences(clean, min_chars=_STREAM_MIN_SENTENCE_CHARS)
+            if len(segments) > 1:
+                for seg in segments:
+                    self._queue.put((seg, vs, eff_speed, eff_pause))
+                return
 
         self._queue.put((clean, vs, eff_speed, eff_pause))
 
