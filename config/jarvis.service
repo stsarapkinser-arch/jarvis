@@ -32,7 +32,8 @@ Environment=PYTHONPATH=__JARVIS_HOME__
 # ходит к нему по HTTP (OpenAI REST). Все llama-cpp env (GPU layers, ctx,
 # batch) теперь живут в config/jarvis-llm.service, а не здесь.
 Environment=JARVIS_LLM_ENDPOINT=http://127.0.0.1:8080
-Environment=JARVIS_LLM_MODEL=llama-3.2-3b-instruct
+# ДОЛЖЕН совпадать с --alias в jarvis-llm.service (MODEL_ALIAS в setup_server.sh).
+Environment=JARVIS_LLM_MODEL=qwen2.5-3b-instruct
 Environment=QT_QPA_PLATFORM=wayland
 # OpenGL на Intel N100: дать Mesa выбрать iris (Gen12) — без override
 # падал на llvmpipe. Если у пользователя другой драйвер — пусть

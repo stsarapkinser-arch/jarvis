@@ -80,7 +80,7 @@ SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "config" / "system_prompt")
 #     systemd (jarvis-llm.service, Restart=always) его поднимает.
 #
 # Имя модели — для диагностики/setup-скрипта; сам файл живёт на стороне сервера.
-LLAMA_MODEL_NAME = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+LLAMA_MODEL_NAME = "Qwen2.5-3B-Instruct-Q4_K_M.gguf"
 LLAMA_MODEL_PATH = str(_PROJECT_ROOT / "models" / LLAMA_MODEL_NAME)
 LLM_ENDPOINT = DEFAULT_ENDPOINT
 LLM_MODEL = DEFAULT_MODEL

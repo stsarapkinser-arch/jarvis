@@ -3,7 +3,7 @@
 #
 # Фаза 1 ТЗ «Отвязка инференса»: Python больше НЕ грузит веса. Этот скрипт:
 #   1) собирает бинарь llama-server из llama.cpp с бэкендом Vulkan (iGPU);
-#   2) качает Llama-3.2-3B-Instruct (GGUF Q4_K_M) — нативный tool-calling;
+#   2) качает Qwen2.5-3B-Instruct (GGUF Q4_K_M) — сильный native tool-calling;
 #   3) ставит systemd --user unit jarvis-llm.service (KV-cache reuse, ctx 8192);
 #   4) проверяет /health.
 #
@@ -26,9 +26,18 @@ LLAMA_DIR="$REPO_ROOT/llama.cpp"
 BUILD_DIR="$LLAMA_DIR/build"
 SERVER_BIN="$BUILD_DIR/bin/llama-server"
 MODELS_DIR="$REPO_ROOT/models"
-MODEL_NAME="Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+# Мозг по умолчанию — Qwen2.5-3B-Instruct: тот же footprint Q4_K_M (~1.9 ГБ),
+# но заметно сильнее в русском и в native tool-calling (на нём стоит весь Skill
+# Registry). Переопределяемо: MODEL_NAME/MODEL_URL/MODEL_ALIAS (откат на Llama —
+# выставить все три на старые значения). Алиас ДОЛЖЕН совпадать с
+# JARVIS_LLM_MODEL у клиента (config/jarvis.service) и --alias в unit'е.
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B-Instruct-Q4_K_M.gguf}"
 MODEL_PATH="$MODELS_DIR/$MODEL_NAME"
-MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=true}"
+MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf?download=true}"
+# Алиас, под которым сервер отдаёт модель в /v1/models. ОБЯЗАН совпадать с
+# JARVIS_LLM_MODEL у клиента — иначе запросы уйдут с неизвестным "model" и
+# сервер ответит 404. setup подставит его в unit (--alias) сам.
+MODEL_ALIAS="${MODEL_ALIAS:-qwen2.5-3b-instruct}"
 LLAMA_CPP_REF="${LLAMA_CPP_REF:-master}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
@@ -84,7 +93,7 @@ else
     echo "  ✓ llama-server: $SERVER_BIN"
 fi
 
-# ───────────── [2/4] Загрузка GGUF Llama-3.2-3B ─────────────
+# ───────────── [2/4] Загрузка GGUF мозга (Qwen2.5-3B по умолчанию) ─────────────
 say "[2/4] Модель $MODEL_NAME..."
 mkdir -p "$MODELS_DIR"
 if [ -f "$MODEL_PATH" ]; then
@@ -122,6 +131,8 @@ fi
 sed \
     -e "s|__JARVIS_HOME__|${REPO_ROOT}|g" \
     -e "s|__LLAMA_SERVER_BIN__|${SERVER_BIN}|g" \
+    -e "s|__MODEL_NAME__|${MODEL_NAME}|g" \
+    -e "s|__MODEL_ALIAS__|${MODEL_ALIAS}|g" \
     -e "$EXTRA_SED" \
     "$UNIT_TEMPLATE" > "$UNIT_TARGET"
 

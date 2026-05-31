@@ -43,7 +43,7 @@ HUD_REPOSITION_PERIOD_SEC = 6.0
 async def verify_inference_stack(jarvis: Jarvis) -> None:
     """Двухслойный preflight перед стартом подсистем:
 
-    1. **llama-server (HTTP, :8080)** — главный мозг (Llama-3.2-3B-Instruct,
+    1. **llama-server (HTTP, :8080)** — главный мозг (Qwen2.5-3B-Instruct,
        Q4_K_M) в ОТДЕЛЬНОМ системном процессе. Если демон не отвечает по
        /health, Jarvis уходит в degraded-режим: голосовые команды слышим, но
        думать нечем — оператору внятно говорим, что запустить (./setup_server.sh).

@@ -1,5 +1,5 @@
 [Unit]
-Description=JARVIS LLM — native llama-server (Llama-3.2-3B-Instruct, Vulkan/iGPU)
+Description=JARVIS LLM — native llama-server (Qwen2.5-3B-Instruct, Vulkan/iGPU)
 # Только loopback REST на 127.0.0.1:8080 — графическая сессия не нужна.
 After=network.target
 
@@ -33,8 +33,8 @@ WorkingDirectory=__JARVIS_HOME__
 #                        т.к. поведение Vulkan-FA зависит от версии Mesa.
 # setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря.
 ExecStart=__LLAMA_SERVER_BIN__ \
-    --model __JARVIS_HOME__/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf \
-    --alias llama-3.2-3b-instruct \
+    --model __JARVIS_HOME__/models/__MODEL_NAME__ \
+    --alias __MODEL_ALIAS__ \
     --ctx-size 4096 \
     --n-gpu-layers 99 \
     --parallel 1 \
