@@ -10,12 +10,13 @@
 ``src.core.orchestrator`` (там, где есть доступ к шине/ShadowExec/TTS), а
 транспортный цикл — в ``src.inference.agent``.
 
-Пять инструментов из ТЗ оператора:
-    * ``internal_monologue`` — Chain-of-Thought; Python логирует, но НЕ озвучивает.
-    * ``speak_response``     — единственный путь голоса наружу (mood → SOX-профиль).
-    * ``set_hud_state``      — нейросеть сама управляет визором Aegis.
-    * ``read_telemetry``     — чтение живых сенсоров (фидбэк уходит обратно в модель).
-    * ``execute_bash``       — команда в реальную систему (через Shadow Exec + гейты).
+Инструменты после перехода на Skill Registry:
+    * ``run_skill``      — выполнить ГОТОВЫЙ навык по skill_id (предпочтительно;
+                           grammar-enum по каталогу). Строится динамически —
+                           см. ``build_run_skill_schema``.
+    * ``execute_bash``   — gated-fallback для длинного хвоста (Shadow Exec + гейты).
+    * ``speak_response`` — голос наружу для CONVERSATION (mood → SOX-профиль).
+    * ``set_hud_state``  — визор Aegis (для разговора).
 """
 from __future__ import annotations
 
@@ -40,20 +41,10 @@ class HudAnimation(StrEnum):
     GLITCH = "glitch"
 
 
-class TelemetrySensor(StrEnum):
-    """Доступные сенсоры для read_telemetry."""
-    CPU = "cpu"
-    RAM = "ram"
-    NETWORK = "network"
-    PIXEL_PHONE = "pixel_phone"
-
-
 # ─────────────────────────── Имена инструментов ───────────────────────────────
 class ToolName(StrEnum):
-    INTERNAL_MONOLOGUE = "internal_monologue"
     SPEAK_RESPONSE = "speak_response"
     SET_HUD_STATE = "set_hud_state"
-    READ_TELEMETRY = "read_telemetry"
     EXECUTE_BASH = "execute_bash"
     RUN_SKILL = "run_skill"
 
@@ -61,29 +52,6 @@ class ToolName(StrEnum):
 # ─────────────────────────── JSON Schemas (OpenAI Tool-Use) ───────────────────
 # Формат строго соответствует тому, что ждёт /v1/chat/completions у llama-server:
 #   {"type": "function", "function": {"name", "description", "parameters": <JSON Schema>}}
-_INTERNAL_MONOLOGUE_SCHEMA: Final[dict[str, Any]] = {
-    "type": "function",
-    "function": {
-        "name": ToolName.INTERNAL_MONOLOGUE.value,
-        "description": (
-            "Внутреннее рассуждение Джарвиса (Chain-of-Thought). Используй, когда "
-            "нужно подумать перед действием. Это НЕ озвучивается оператору — только "
-            "пишется в лог. Одно-два предложения."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "thought": {
-                    "type": "string",
-                    "description": "Краткая мысль на русском. Видишь только ты и лог.",
-                }
-            },
-            "required": ["thought"],
-            "additionalProperties": False,
-        },
-    },
-}
-
 _SPEAK_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
     "type": "function",
     "function": {
@@ -140,26 +108,6 @@ _SET_HUD_STATE_SCHEMA: Final[dict[str, Any]] = {
     },
 }
 
-_READ_TELEMETRY_SCHEMA: Final[dict[str, Any]] = {
-    "type": "function",
-    "function": {
-        "name": ToolName.READ_TELEMETRY.value,
-        "description": "Прочитать сенсор; результат вернётся тебе — не выдумывай цифры.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sensor": {
-                    "type": "string",
-                    "enum": [s.value for s in TelemetrySensor],
-                    "description": "cpu / ram / network / pixel_phone.",
-                }
-            },
-            "required": ["sensor"],
-            "additionalProperties": False,
-        },
-    },
-}
-
 _EXECUTE_BASH_SCHEMA: Final[dict[str, Any]] = {
     "type": "function",
     "function": {
@@ -190,12 +138,12 @@ _EXECUTE_BASH_SCHEMA: Final[dict[str, Any]] = {
     },
 }
 
-# Полный реестр.
+# Статичные схемы инструментов (run_skill строится динамически — см.
+# build_run_skill_schema). speak_response/set_hud_state — для CONVERSATION;
+# execute_bash — gated-fallback action-категорий.
 TOOL_SCHEMAS: Final[tuple[dict[str, Any], ...]] = (
-    _INTERNAL_MONOLOGUE_SCHEMA,
     _SPEAK_RESPONSE_SCHEMA,
     _SET_HUD_STATE_SCHEMA,
-    _READ_TELEMETRY_SCHEMA,
     _EXECUTE_BASH_SCHEMA,
 )
 
@@ -264,10 +212,6 @@ def build_run_skill_schema(skill_ids: list[str]) -> dict[str, Any]:
 #
 # CONVERSATION намеренно БЕЗ системного доступа — только речь и визор (это
 # бесплатное свойство безопасности: чистый разговор не тронет систему).
-#
-# internal_monologue НЕ входит в боевые подмножества: на N100 отдельный
-# tool-вызов «подумать» — лишний раунд диалога. Схема сохранена, в горячий путь
-# не попадает.
 def tools_for_category(category: str) -> list[dict[str, Any]]:
     """Вернуть подмножество JSON-схем для категории интента.
 
@@ -326,15 +270,6 @@ def parse_arguments(raw: Any) -> dict[str, Any]:
 
 
 @dataclass(frozen=True, slots=True)
-class MonologueArgs:
-    thought: str
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> MonologueArgs:
-        return cls(thought=_coerce_str(d.get("thought")))
-
-
-@dataclass(frozen=True, slots=True)
 class SpeakArgs:
     text: str
     mood: SpeakMood = SpeakMood.PROFESSIONAL
@@ -369,20 +304,6 @@ class HudArgs:
         except ValueError:
             animation = HudAnimation.PULSE
         return cls(color=_coerce_str(d.get("color"), "cyan").lower(), animation=animation)
-
-
-@dataclass(frozen=True, slots=True)
-class TelemetryArgs:
-    sensor: TelemetrySensor
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> TelemetryArgs:
-        raw = _coerce_str(d.get("sensor"), TelemetrySensor.CPU.value).lower()
-        try:
-            sensor = TelemetrySensor(raw)
-        except ValueError:
-            sensor = TelemetrySensor.CPU
-        return cls(sensor=sensor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,17 +347,14 @@ class RunSkillArgs:
 __all__ = [
     "SpeakMood",
     "HudAnimation",
-    "TelemetrySensor",
     "ToolName",
     "TOOL_SCHEMAS",
     "TOOLS_BY_NAME",
     "tools_for_category",
     "build_run_skill_schema",
     "parse_arguments",
-    "MonologueArgs",
     "SpeakArgs",
     "HudArgs",
-    "TelemetryArgs",
     "ExecuteBashArgs",
     "RunSkillArgs",
 ]

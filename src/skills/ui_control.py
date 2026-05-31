@@ -209,3 +209,146 @@ async def switch_desktop_prev(ctx: SkillContext, args: dict[str, Any]) -> str:
         "qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut 'Switch to Previous Desktop'"
     )
     return "desktop prev" if rc == 0 else "switch attempted"
+
+
+# ───────────────────────── Запуск приложений (доп.) ─────────────────────────
+@skill(id="open_text_editor", category=_UI,
+       description="открыть текстовый редактор (Kate)",
+       aliases=("редактор", "блокнот", "kate"))
+async def open_text_editor(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn("kate || kwrite || gedit || nano")
+    return f"editor launched pid={pid}"
+
+
+@skill(id="open_calculator", category=_UI,
+       description="открыть калькулятор",
+       aliases=("калькулятор", "посчитать"))
+async def open_calculator(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn("kcalc || gnome-calculator || qalculate-gtk")
+    return f"calculator launched pid={pid}"
+
+
+@skill(id="open_system_monitor", category=_UI,
+       description="открыть системный монитор",
+       aliases=("монитор системы", "диспетчер задач", "ksysguard"))
+async def open_system_monitor(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn("plasma-systemmonitor || ksysguard || gnome-system-monitor")
+    return f"system monitor launched pid={pid}"
+
+
+@skill(id="open_app_launcher", category=_UI,
+       description="открыть поиск приложений (KRunner)",
+       aliases=("запуск приложений", "поиск", "krunner"))
+async def open_app_launcher(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn(
+        "qdbus6 org.kde.krunner /App org.kde.krunner.App.display 2>/dev/null || krunner"
+    )
+    return f"launcher opened pid={pid}"
+
+
+# ───────────────────────── Медиа (playerctl) ─────────────────────────
+@skill(id="media_play_pause", category=_UI,
+       description="воспроизведение/пауза медиа",
+       aliases=("пауза", "плей", "поставь на паузу", "продолжи"))
+async def media_play_pause(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, err = await ctx.run("playerctl play-pause")
+    return "media toggled" if rc == 0 else f"media rc={rc} {err[:80]}"
+
+
+@skill(id="media_next", category=_UI, description="следующий трек",
+       aliases=("следующий трек", "переключи трек", "дальше"))
+async def media_next(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, err = await ctx.run("playerctl next")
+    return "media next" if rc == 0 else f"media rc={rc} {err[:80]}"
+
+
+@skill(id="media_previous", category=_UI, description="предыдущий трек",
+       aliases=("предыдущий трек", "верни трек", "назад"))
+async def media_previous(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, err = await ctx.run("playerctl previous")
+    return "media prev" if rc == 0 else f"media rc={rc} {err[:80]}"
+
+
+@skill(id="media_stop", category=_UI, description="остановить воспроизведение",
+       aliases=("останови музыку", "стоп музыка"))
+async def media_stop(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, err = await ctx.run("playerctl stop")
+    return "media stopped" if rc == 0 else f"media rc={rc} {err[:80]}"
+
+
+@skill(id="mic_mute_toggle", category=_UI,
+       description="приглушить/включить микрофон (toggle)",
+       aliases=("выключи микрофон", "включи микрофон", "мьют микрофона"))
+async def mic_mute_toggle(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, err = await ctx.run("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
+    return "mic toggled" if rc == 0 else f"mic rc={rc} {err[:80]}"
+
+
+# ───────────────────────── Скриншоты (доп.) ─────────────────────────
+@skill(id="screenshot_region", category=_UI,
+       description="скриншот выделенной области",
+       aliases=("скриншот области", "выдели и сними"))
+async def screenshot_region(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn("spectacle -r -b")
+    return f"region screenshot pid={pid}"
+
+
+@skill(id="screenshot_active_window", category=_UI,
+       description="скриншот активного окна",
+       aliases=("скриншот окна", "сними окно"))
+async def screenshot_active_window(ctx: SkillContext, args: dict[str, Any]) -> str:
+    pid = await ctx.spawn("spectacle -a -b")
+    return f"window screenshot pid={pid}"
+
+
+# ───────────────────────── Окна (доп., KWin shortcuts) ─────────────────────────
+# VERIFY on target — имена ярлыков KWin между версиями Plasma менялись.
+@skill(id="maximize_window", category=_UI, description="развернуть активное окно",
+       aliases=("разверни окно", "на весь экран"))
+async def maximize_window(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, _ = await ctx.run(
+        "qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut 'Window Maximize'"
+    )
+    return "window maximized" if rc == 0 else "maximize attempted"
+
+
+@skill(id="minimize_window", category=_UI, description="свернуть активное окно",
+       aliases=("сверни окно",))
+async def minimize_window(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, _ = await ctx.run(
+        "qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut 'Window Minimize'"
+    )
+    return "window minimized" if rc == 0 else "minimize attempted"
+
+
+@skill(id="toggle_fullscreen", category=_UI,
+       description="полноэкранный режим активного окна",
+       aliases=("полный экран", "фуллскрин"))
+async def toggle_fullscreen(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, _ = await ctx.run(
+        "qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut 'Window Fullscreen'"
+    )
+    return "fullscreen toggled" if rc == 0 else "fullscreen attempted"
+
+
+@skill(id="switch_window", category=_UI,
+       description="переключиться между окнами (Alt-Tab)",
+       aliases=("переключи окно", "следующее окно"))
+async def switch_window(ctx: SkillContext, args: dict[str, Any]) -> str:
+    rc, _, _ = await ctx.run(
+        "qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut 'Walk Through Windows'"
+    )
+    return "window switched" if rc == 0 else "switch attempted"
+
+
+# ───────────────────────── Сессия ─────────────────────────
+@skill(id="log_out", category=_UI, destructive=True,
+       description="выйти из сессии (закрывает все приложения)",
+       aliases=("выйти из системы", "разлогинься", "выход из сессии"))
+async def log_out(ctx: SkillContext, args: dict[str, Any]) -> str:
+    # VERIFY on target. destructive=True → ядро спросит подтверждение голосом.
+    rc, _, _ = await ctx.run(
+        "qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout"
+    )
+    return "logout requested" if rc == 0 else "logout attempted"
+

@@ -1,9 +1,9 @@
-"""Тесты привязки tool-вызовов к подсистемам Jarvis (Phase 3 + 5).
+"""Тесты привязки tool-вызовов к подсистемам Jarvis.
 
 Проверяем, что каждый инструмент бьёт в нужную подсистему: speak_response →
-TTS, set_hud_state → шина HUD_STATE, read_telemetry → SystemState,
-execute_bash → конвейер ShadowExec (со стопом цикла на подтверждении/реджекте),
-internal_monologue → лог (без речи).
+TTS, set_hud_state → шина HUD_STATE, execute_bash → конвейер ShadowExec (со
+стопом цикла на подтверждении/реджекте), run_skill → каталог навыков (речь +
+хендлер, разрушительные — через подтверждение).
 """
 from __future__ import annotations
 
@@ -53,17 +53,6 @@ def _call(name, args):
     return ToolCall(id="c1", name=name, arguments=args)
 
 
-def test_internal_monologue_is_silent():
-    j = _make_jarvis()
-    spoken: list = []
-    j.say = lambda *a, **kw: spoken.append(a)
-    res = asyncio.run(
-        j._dispatch_tool(_call("internal_monologue", {"thought": "подумаю"}), "intent", {}, _state())
-    )
-    assert res.content == "logged"
-    assert spoken == []
-
-
 def test_speak_response_calls_say_with_mapped_tone():
     j = _make_jarvis()
     spoken: list = []
@@ -97,14 +86,6 @@ def test_set_hud_state_publishes_hud_event():
     assert res.content == "hud updated"
     hud = [e for e in events if e.type == EventType.HUD_STATE]
     assert hud and hud[0].data == {"color": "red", "animation": "glitch"}
-
-
-def test_read_telemetry_returns_live_reading():
-    j = _make_jarvis()
-    res = asyncio.run(
-        j._dispatch_tool(_call("read_telemetry", {"sensor": "cpu"}), "intent", {}, _state())
-    )
-    assert "cpu=" in res.content
 
 
 def test_execute_bash_stops_loop_on_shadow_reject():

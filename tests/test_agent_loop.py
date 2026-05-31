@@ -69,7 +69,7 @@ def test_agent_defaults_to_required_tool_choice():
 
 def test_agent_feeds_tool_result_back_to_model():
     responses = [
-        ChatResponse("", (_tc("read_telemetry", {"sensor": "cpu"}),), "tool_calls"),
+        ChatResponse("", (_tc("run_skill", {"skill_id": "report_cpu", "reply": "гляну"}),), "tool_calls"),
         ChatResponse("", (), "stop"),
     ]
     client = FakeClient(responses)
@@ -100,7 +100,7 @@ def test_agent_stop_flag_halts_loop():
 
 def test_agent_max_steps_cap():
     loop_resp = [
-        ChatResponse("", (_tc("internal_monologue", {"thought": "loop"}),), "tool_calls")
+        ChatResponse("", (_tc("set_hud_state", {"color": "cyan", "animation": "pulse"}),), "tool_calls")
         for _ in range(10)
     ]
     client = FakeClient(loop_resp)
@@ -176,12 +176,12 @@ def test_parse_completion_plain_text():
 def test_parse_completion_handles_dict_arguments_and_missing_id():
     data = {"choices": [{"finish_reason": "tool_calls", "message": {
         "tool_calls": [{"type": "function", "function": {
-            "name": "read_telemetry", "arguments": {"sensor": "ram"},
+            "name": "run_skill", "arguments": {"skill_id": "report_memory", "reply": "ок"},
         }}],
     }}]}
     resp = _parse_completion(data)
-    assert resp.tool_calls[0].name == "read_telemetry"
-    assert resp.tool_calls[0].arguments == {"sensor": "ram"}
+    assert resp.tool_calls[0].name == "run_skill"
+    assert resp.tool_calls[0].arguments == {"skill_id": "report_memory", "reply": "ок"}
     assert resp.tool_calls[0].id  # сгенерирован фолбэк-id
 
 

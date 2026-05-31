@@ -24,10 +24,7 @@ def test_all_tools_have_valid_openai_shape():
             assert req in params["properties"], f"{fn['name']}: required {req} not in properties"
         json.dumps(s)  # должна быть JSON-сериализуемой
         names.add(fn["name"])
-    assert names == {
-        "internal_monologue", "speak_response", "set_hud_state",
-        "read_telemetry", "execute_bash",
-    }
+    assert names == {"speak_response", "set_hud_state", "execute_bash"}
 
 
 def test_enum_constraints_match_python_enums():
@@ -35,8 +32,6 @@ def test_enum_constraints_match_python_enums():
     assert set(speak["enum"]) == {m.value for m in t.SpeakMood}
     hud = t.TOOLS_BY_NAME["set_hud_state"]["function"]["parameters"]["properties"]["animation"]
     assert set(hud["enum"]) == {a.value for a in t.HudAnimation}
-    tel = t.TOOLS_BY_NAME["read_telemetry"]["function"]["parameters"]["properties"]["sensor"]
-    assert set(tel["enum"]) == {s.value for s in t.TelemetrySensor}
 
 
 def test_conversation_category_cannot_execute_bash():
@@ -44,15 +39,6 @@ def test_conversation_category_cannot_execute_bash():
     convo = {s["function"]["name"] for s in t.tools_for_category("CONVERSATION")}
     assert "execute_bash" not in convo
     assert {"speak_response", "set_hud_state"} <= convo
-
-
-def test_internal_monologue_excluded_from_hot_path():
-    """На слабом железе internal_monologue не в боевых подмножествах (лишний
-    раунд диалога при декоде ~1 т/с), хотя схема инструмента сохранена."""
-    assert "internal_monologue" in t.TOOLS_BY_NAME
-    for cat in ("SYSTEM_OPS", "UI_CONTROL", "PENTEST_RECON", "CONVERSATION"):
-        names = {s["function"]["name"] for s in t.tools_for_category(cat)}
-        assert "internal_monologue" not in names, f"{cat} всё ещё тянет internal_monologue"
 
 
 def test_action_categories_offer_run_skill_and_bash():
@@ -124,12 +110,6 @@ def test_hud_args_defaults_and_normalisation():
     assert a.animation == t.HudAnimation.PULSE
     b = t.HudArgs.from_dict({"color": "amber", "animation": "GLITCH"})
     assert b.animation == t.HudAnimation.GLITCH
-
-
-def test_telemetry_args_fallback():
-    assert t.TelemetryArgs.from_dict({"sensor": "cpu"}).sensor == t.TelemetrySensor.CPU
-    assert t.TelemetryArgs.from_dict({"sensor": "weird"}).sensor == t.TelemetrySensor.CPU
-    assert t.TelemetryArgs.from_dict({"sensor": "pixel_phone"}).sensor == t.TelemetrySensor.PIXEL_PHONE
 
 
 def test_run_skill_args_coercion():

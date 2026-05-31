@@ -4,12 +4,9 @@ import re
 import shlex
 import shutil
 import subprocess
-from typing import NamedTuple
 
-THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.DOTALL | re.IGNORECASE)
-SAY_RE = re.compile(r"<say>(.*?)</say>", re.DOTALL | re.IGNORECASE)
-SANDBOX_RE = re.compile(r"<sandbox>\s*(true|1|yes|on)\s*</sandbox>", re.IGNORECASE)
-KWIN_RE = re.compile(r"<kwin>\s*([\w.\-]+)\s*</kwin>", re.IGNORECASE)
+# Чистка markdown-ограждений в bash-командах из LLM-heal (единственный
+# оставшийся потребитель этого модуля после перехода на Native Function Calling).
 FENCE_RE = re.compile(r"```[a-zA-Z]*\n?|```")
 
 SUDO_VERBS = (
@@ -22,36 +19,6 @@ SUDO_VERBS = (
     "nmap", "tcpdump", "tshark", "wireshark", "aircrack-ng", "airmon-ng",
     "useradd", "usermod", "userdel", "groupadd", "passwd", "chown", "chmod",
 )
-
-
-class ParsedResponse(NamedTuple):
-    thought: str
-    say: str
-    bash: str
-    sandbox: bool
-    kwin: str  # KWin script name from <kwin>...</kwin>, empty if none
-
-
-def parse_response(raw: str) -> ParsedResponse:
-    thought = ""
-    say = ""
-    kwin = ""
-    m = THOUGHT_RE.search(raw)
-    if m:
-        thought = m.group(1).strip()
-    m = SAY_RE.search(raw)
-    if m:
-        say = m.group(1).strip()
-    m = KWIN_RE.search(raw)
-    if m:
-        kwin = m.group(1).strip()
-    sandbox = bool(SANDBOX_RE.search(raw))
-    bash = THOUGHT_RE.sub("", raw)
-    bash = SAY_RE.sub("", bash)
-    bash = SANDBOX_RE.sub("", bash)
-    bash = KWIN_RE.sub("", bash)
-    bash = clean_bash(bash)
-    return ParsedResponse(thought, say, bash, sandbox, kwin)
 
 
 def clean_bash(s: str) -> str:

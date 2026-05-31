@@ -19,7 +19,6 @@ except ImportError:
     _HAS_PSUTIL = False
 
 from src.audio.audio_engine import AcousticEngine
-from src.memory.ephemeral import EphemeralRunner
 from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
 from src.ui.window_manager import KWinOrchestrator
 from src.memory.engine import SIG_WARM, ChronoMemory
@@ -77,10 +76,9 @@ LLAMA_MODEL_NAME = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 LLAMA_MODEL_PATH = str(_PROJECT_ROOT / "models" / LLAMA_MODEL_NAME)
 LLM_ENDPOINT = DEFAULT_ENDPOINT
 LLM_MODEL = DEFAULT_MODEL
-# Агентный цикл: максимум раундов tool-calling за один интент. 4 хватает на
-# read_telemetry → internal_monologue → set_hud_state → speak_response/execute_bash,
-# и держит TTFT под контролем на слабом железе.
-# 2 раунда: один tool-вызов + опциональный follow-up (напр. read_telemetry→speak).
+# Агентный цикл: максимум раундов tool-calling за один интент. run_skill и
+# speak_response терминальны (один вызов = и действие, и речь), поэтому обычно
+# хватает 1 раунда; 2-й — на редкий follow-up (напр. execute_bash → озвучка).
 # На N100 декод ~1 т/с — каждый лишний раунд это +десятки секунд, так что 2 < 4.
 AGENT_MAX_STEPS = 2
 # 160 — одного speak_response (+ set_hud_state/execute_bash) хватает. Жёсткий
@@ -206,7 +204,6 @@ class _IntentState:
     fallback-логики."""
     category: IntentCategory
     spoke: bool = False
-    last_thought: str = ""
     last_result: str = ""
     bash_commands: list[str] = field(default_factory=list)
     run: AgentRun | None = None
@@ -303,10 +300,9 @@ class Jarvis(metaclass=Singleton):
         self._state_label: str = "IDLE"
         self._last_error_window_hint: str = ""
 
-        # Shadow Exec — predictive sandbox for LLM-emitted bash, and the
-        # ephemeral Python runner that depends on it.
+        # Shadow Exec — predictive sandbox для gated-fallback bash (длинный хвост,
+        # которого нет в каталоге навыков).
         self._shadow = ShadowExec()
-        self._ephemeral = EphemeralRunner(shadow=self._shadow)
 
         # ── Кинематографический голос (AcousticEngine) ──────────────────────
         # Движок владеет очередью речи, рабочим потоком, SoX-трактом «Bettany
@@ -552,33 +548,6 @@ class Jarvis(metaclass=Singleton):
             {"color": color, "animation": animation.value},
         ))
 
-    def _read_sensor(self, sensor: tooldefs.TelemetrySensor) -> str:
-        """read_telemetry → короткая строка с живыми метриками (уходит в модель).
-
-        Читаем из SystemState (поддерживается Sentinel'ом, без свежего psutil-
-        опроса) — почти мгновенно, что и нужно для горячего пути."""
-        snap = SystemState().snapshot()
-        if sensor == tooldefs.TelemetrySensor.CPU:
-            return (
-                f"cpu={snap.cpu:.0f}% thermal={snap.thermal:.0f}C "
-                f"gpu={snap.gpu:.0f}% load={snap.load.value}"
-            )
-        if sensor == tooldefs.TelemetrySensor.RAM:
-            disk = self._disk_percent("/")
-            disk_part = f" disk={disk:.0f}%" if disk is not None else ""
-            return f"ram={snap.ram:.0f}%{disk_part}"
-        if sensor == tooldefs.TelemetrySensor.NETWORK:
-            for e in reversed(self._recent_os):
-                if e.get("sensor") == "internet":
-                    return f"network: {e.get('value')} ({e.get('level')})"
-            return "network: соединение в норме"
-        if sensor == tooldefs.TelemetrySensor.PIXEL_PHONE:
-            if self._last_battery:
-                tag = "charging" if self._last_battery.get("charging") else "discharging"
-                return f"pixel battery={self._last_battery.get('charge')}% ({tag})"
-            return "pixel: данных нет"
-        return "unknown sensor"
-
     async def _run_background(self, cmd: str) -> int:
         """Detached фоновый запуск (execute_bash background=true). Возвращает PID."""
         proc = await asyncio.create_subprocess_shell(
@@ -653,12 +622,6 @@ class Jarvis(metaclass=Singleton):
     ) -> ToolResult:
         """Связывает абстрактный ToolCall с реальной подсистемой Jarvis."""
         name = call.name
-        if name == tooldefs.ToolName.INTERNAL_MONOLOGUE:
-            thought = tooldefs.MonologueArgs.from_dict(call.arguments).thought
-            log.info("CoT: %s", thought[:300])
-            st.last_thought = thought
-            return ToolResult(call.id, "logged")
-
         if name == tooldefs.ToolName.SPEAK_RESPONSE:
             sp = tooldefs.SpeakArgs.from_dict(call.arguments)
             if sp.text.strip():
@@ -681,11 +644,6 @@ class Jarvis(metaclass=Singleton):
             hud = tooldefs.HudArgs.from_dict(call.arguments)
             await self._apply_hud_state(hud.color, hud.animation)
             return ToolResult(call.id, "hud updated")
-
-        if name == tooldefs.ToolName.READ_TELEMETRY:
-            tel = tooldefs.TelemetryArgs.from_dict(call.arguments)
-            reading = self._read_sensor(tel.sensor)
-            return ToolResult(call.id, reading)
 
         if name == tooldefs.ToolName.RUN_SKILL:
             rs = tooldefs.RunSkillArgs.from_dict(call.arguments)
@@ -1079,7 +1037,8 @@ class Jarvis(metaclass=Singleton):
 
         # Агентный цикл: маршрутизация → микро-промпт + tools → Native Function
         # Calling. Никакого текстового парсинга — модель ДЕЙСТВУЕТ инструментами
-        # (speak_response / execute_bash / set_hud_state / read_telemetry).
+        # (run_skill — готовый навык; execute_bash — gated-fallback; speak_response,
+        # set_hud_state — для разговора).
         try:
             st = await self._run_agent_for_intent(text, past, snap)
         except LlamaServerError as e:
@@ -1101,7 +1060,7 @@ class Jarvis(metaclass=Singleton):
 
         # Память: что просили, что выполнили, чем кончилось.
         bash_joined = " && ".join(c for c in st.bash_commands if c)
-        result = st.last_result or st.last_thought or ("spoken" if st.spoke else "no-op")
+        result = st.last_result or ("spoken" if st.spoke else "no-op")
         await asyncio.to_thread(
             self.memory.remember,
             text, bash_joined, result, f"agent_{st.category.value.lower()}", snap,
