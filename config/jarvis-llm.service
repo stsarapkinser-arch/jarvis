@@ -24,19 +24,24 @@ WorkingDirectory=__JARVIS_HOME__
 #                        сохраняется БЕЗ дорогого save/restore KV-состояний.
 #   --cache-reuse 256    переиспользование KV-чанков при расхождении промпта.
 #   --parallel 1         один слот → стабильный префикс кэшируется максимально.
-#   --jinja              ОБЯЗАТЕЛЬНО для tool-calling Llama-3.2 (парсинг tool_calls
+#   --jinja              ОБЯЗАТЕЛЬНО для tool-calling Qwen2.5 (парсинг tool_calls
 #                        в OpenAI-формат через встроенный chat-template).
 #   --threads 4          N100 = 4 P-core.
-#   __EXTRA_FLAGS__      опц. перф-флаги от оператора: запусти setup_server.sh с
-#                        JARVIS_LLM_EXTRA_FLAGS="--flash-attn on" (ускоряет декод
-#                        и вдвое режет KV) или "--cache-type-k q8_0". Не в дефолте,
-#                        т.к. поведение Vulkan-FA зависит от версии Mesa.
-# setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря.
+#   KV-quant + flash-attn (строка-плейсхолдер ниже): включается setup_server.sh
+#                        при JARVIS_LLM_KV_QUANT=q8_0 (или q4_0) → flash-attn on +
+#                        cache-type-k/-v. Вдвое режет KV-кэш в shared VRAM
+#                        (освобождает RAM под контекст/спекуляцию) и ускоряет
+#                        декод. На своей строке — чтобы strip-safety снял её
+#                        целиком, если сборка/Mesa не тянет Vulkan-FA. По умолч. OFF.
+#   Перф-флаги оператора (последняя строка-плейсхолдер): JARVIS_LLM_EXTRA_FLAGS.
+# setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря, и
+# подставляет/удаляет обе строки-плейсхолдера по env-тумблерам.
 ExecStart=__LLAMA_SERVER_BIN__ \
     --model __JARVIS_HOME__/models/__MODEL_NAME__ \
     --alias __MODEL_ALIAS__ \
     --ctx-size 4096 \
     --n-gpu-layers 99 \
+    __KV_QUANT_FLAGS__ \
     --parallel 1 \
     --threads 4 \
     --cache-ram 0 \

@@ -119,7 +119,19 @@ if [ ! -x "$SERVER_BIN" ]; then
     warn "Бинарь $SERVER_BIN отсутствует (SKIP_BUILD?) — unit будет ссылаться на него; соберите перед стартом."
 fi
 mkdir -p "$USER_UNIT_DIR"
-# Опциональные перф-флаги оператора (напр. JARVIS_LLM_EXTRA_FLAGS="--flash-attn on").
+# Квантизация KV-кэша + flash-attn (Tier0 #3). JARVIS_LLM_KV_QUANT=q8_0 (или
+# q4_0) → вдвое режет KV в shared VRAM и ускоряет декод. На отдельной строке
+# unit'а (__KV_QUANT_FLAGS__), чтобы strip-safety снял её целиком, если сборка/
+# Mesa не тянет Vulkan-FA. По умолчанию пусто (OFF) — строку-плейсхолдер удаляем.
+KV_QUANT="${JARVIS_LLM_KV_QUANT:-}"
+if [ -n "$KV_QUANT" ]; then
+    KV_FLAGS="--flash-attn on --cache-type-k ${KV_QUANT} --cache-type-v ${KV_QUANT}"
+    KV_SED="s|__KV_QUANT_FLAGS__|${KV_FLAGS}|"
+    echo "  → KV-quant + flash-attn: ${KV_FLAGS}"
+else
+    KV_SED="/__KV_QUANT_FLAGS__/d"
+fi
+# Опциональные произвольные перф-флаги оператора (JARVIS_LLM_EXTRA_FLAGS).
 # Пусто → строку-плейсхолдер удаляем; иначе подставляем.
 EXTRA="${JARVIS_LLM_EXTRA_FLAGS:-}"
 if [ -n "$EXTRA" ]; then
@@ -133,14 +145,17 @@ sed \
     -e "s|__LLAMA_SERVER_BIN__|${SERVER_BIN}|g" \
     -e "s|__MODEL_NAME__|${MODEL_NAME}|g" \
     -e "s|__MODEL_ALIAS__|${MODEL_ALIAS}|g" \
+    -e "$KV_SED" \
     -e "$EXTRA_SED" \
     "$UNIT_TEMPLATE" > "$UNIT_TARGET"
 
 # Version-robustness: снять из unit'а флаги, которых нет в этой сборке бинаря
 # (каждый tuning-флаг — на своей continuation-строке, удаляем строку целиком).
+# KV-quant-флаги (--flash-attn/--cache-type-k/-v) живут одной строкой: если хоть
+# один не поддержан — strip убирает всю строку __KV_QUANT_FLAGS__ разом.
 if [ -x "$SERVER_BIN" ]; then
     HELP="$("$SERVER_BIN" --help 2>&1 || true)"
-    for flag in --cache-ram --cache-reuse --jinja; do
+    for flag in --cache-ram --cache-reuse --jinja --flash-attn --cache-type-k --cache-type-v; do
         if ! grep -q -- "$flag" <<<"$HELP"; then
             sed -i "\| ${flag} |d" "$UNIT_TARGET"
             warn "флаг ${flag} не поддержан этой сборкой llama-server — убран из unit"
