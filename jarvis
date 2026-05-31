@@ -82,7 +82,8 @@ net_ip_ok()  { ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; }
 
 # Источники моделей: основной HF и зеркало (на случай блокировки/региона).
 CHAT_MODEL_URL_HF="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=true"
-EMBED_MODEL_URL_HF="https://huggingface.co/ChristianAzinn/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small.fp16.gguf?download=true"
+# Публичное зеркало e5-small (исходный ChristianAzinn стал приватным — 401).
+EMBED_MODEL_URL_HF="https://huggingface.co/tuskbot/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small-f16.gguf?download=true"
 OFFLINE=0  # выставляется ensure_models_reachability при отсутствии источника
 
 # ───────────────── карта внешних инструментов → apt-пакет ─────────────────
@@ -478,7 +479,7 @@ ensure_models_reachability() {
     fi
     printf '\n  %sПодложи модели вручную (любая машина с интернетом) ровно сюда:%s\n' "$C_YELLOW" "$C_RESET"
     [ "$need_chat" -eq 1 ]  && { note "→ $CHAT_MODEL"; note "  из: $CHAT_MODEL_URL_HF"; }
-    [ "$need_embed" -eq 1 ] && { note "→ $EMBED_DIR/multilingual-e5-small.fp16.gguf"; note "  из: $EMBED_MODEL_URL_HF"; }
+    [ "$need_embed" -eq 1 ] && { note "→ $EMBED_DIR/multilingual-e5-small-f16.gguf"; note "  из: $EMBED_MODEL_URL_HF"; }
     note "затем повтори: jarvis setup  (готовые файлы скрипты не перекачивают)"
 }
 

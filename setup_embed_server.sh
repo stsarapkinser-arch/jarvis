@@ -33,7 +33,18 @@ EMBED_DIR="$REPO_ROOT/models/embed"
 
 # Дефолт — multilingual-e5-small (384 dim, ~118M, сильный русский, mean pooling).
 # Любую другую GGUF embedding-модель подставьте через EMBED_MODEL_URL.
-EMBED_MODEL_URL="${EMBED_MODEL_URL:-https://huggingface.co/ChristianAzinn/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small.fp16.gguf?download=true}"
+#
+# ПОЧЕМУ СПИСОК ЗЕРКАЛ: исходный ChristianAzinn/multilingual-e5-small-gguf стал
+# приватным (отдаёт 401). Чтобы один умерший источник не ронял установку, держим
+# несколько публичных зеркал ТОЙ ЖЕ модели (та же размерность 384, mean pooling —
+# базу памяти пересоздавать не нужно). Если оператор задал EMBED_MODEL_URL явно —
+# используем только его и список игнорируем.
+EMBED_MODEL_MIRRORS=(
+    "https://huggingface.co/tuskbot/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small-f16.gguf?download=true"
+    "https://huggingface.co/keisuke-miyako/multilingual-e5-small-gguf-f16/resolve/main/multilingual-e5-small-F16.gguf?download=true"
+    "https://huggingface.co/cstr/multilingual-e5-small-GGUF/resolve/main/multilingual-e5-small-q8_0.gguf?download=true"
+)
+EMBED_MODEL_URL="${EMBED_MODEL_URL:-${EMBED_MODEL_MIRRORS[0]}}"
 # Имя файла: из URL (без query-строки) либо переопределяемо.
 _DEFAULT_FILE="$(basename "${EMBED_MODEL_URL%%\?*}")"
 EMBED_MODEL_FILE="${EMBED_MODEL_FILE:-$_DEFAULT_FILE}"
@@ -61,16 +72,45 @@ mkdir -p "$EMBED_DIR"
 if [ -f "$EMBED_MODEL_PATH" ]; then
     echo "  ✓ модель уже есть: $EMBED_MODEL_PATH ($(du -h "$EMBED_MODEL_PATH" | cut -f1))"
 else
-    echo "  → качаю embedding-модель: $EMBED_MODEL_FILE"
-    echo "    (переопределяемо через EMBED_MODEL_URL / EMBED_MODEL_FILE)"
-    if command -v aria2c >/dev/null 2>&1; then
-        aria2c -x 4 -s 4 --console-log-level=warn -d "$EMBED_DIR" -o "$EMBED_MODEL_FILE" "$EMBED_MODEL_URL"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fL --progress-bar -o "$EMBED_MODEL_PATH.part" "$EMBED_MODEL_URL" && mv "$EMBED_MODEL_PATH.part" "$EMBED_MODEL_PATH"
-    elif command -v wget >/dev/null 2>&1; then
-        wget --show-progress -O "$EMBED_MODEL_PATH.part" "$EMBED_MODEL_URL" && mv "$EMBED_MODEL_PATH.part" "$EMBED_MODEL_PATH"
+    # Кандидаты: явный EMBED_MODEL_URL (если задан) — единственный источник;
+    # иначе перебираем зеркала по порядку, пока один не отдаст файл.
+    if [ "$EMBED_MODEL_URL" != "${EMBED_MODEL_MIRRORS[0]}" ]; then
+        CANDIDATES=("$EMBED_MODEL_URL")   # оператор задал свой URL — только он
     else
-        echo "✗ ни aria2c, ни curl, ни wget — нечем скачать." >&2
+        CANDIDATES=("${EMBED_MODEL_MIRRORS[@]}")
+    fi
+
+    # Качаем один URL во временный .part, проверяем сигнатуру GGUF, затем атомарно
+    # перемещаем. Любой сбой → следующий кандидат.
+    fetch_one() {
+        local url="$1" out="$EMBED_MODEL_PATH.part"
+        rm -f "$out"
+        if command -v aria2c >/dev/null 2>&1; then
+            aria2c -x 4 -s 4 --console-log-level=warn -d "$EMBED_DIR" -o "$(basename "$out")" "$url" || return 1
+        elif command -v curl >/dev/null 2>&1; then
+            curl -fL --progress-bar -o "$out" "$url" || return 1
+        elif command -v wget >/dev/null 2>&1; then
+            wget --show-progress -O "$out" "$url" || return 1
+        else
+            echo "✗ ни aria2c, ни curl, ни wget — нечем скачать." >&2
+            exit 3
+        fi
+        # Валидация: первые 4 байта должны быть магией GGUF (иначе это HTML 401/404).
+        if [ "$(head -c4 "$out" 2>/dev/null)" != "GGUF" ]; then
+            echo "  ⚠ источник вернул не-GGUF (вероятно 401/404), пробую следующий" >&2
+            rm -f "$out"; return 1
+        fi
+        mv "$out" "$EMBED_MODEL_PATH"
+    }
+
+    DOWNLOADED=0
+    for url in "${CANDIDATES[@]}"; do
+        echo "  → качаю embedding-модель из: ${url%%\?*}"
+        if fetch_one "$url"; then DOWNLOADED=1; break; fi
+    done
+    if [ "$DOWNLOADED" != "1" ]; then
+        echo "✗ не удалось скачать embedding-модель ни с одного зеркала." >&2
+        echo "  Проверьте сеть/DNS или задайте свой EMBED_MODEL_URL=... (публичный GGUF e5-small)." >&2
         exit 3
     fi
     echo "  ✓ загружено: $(du -h "$EMBED_MODEL_PATH" | cut -f1)"
