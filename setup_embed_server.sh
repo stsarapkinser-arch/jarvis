@@ -39,10 +39,14 @@ EMBED_DIR="$REPO_ROOT/models/embed"
 # несколько публичных зеркал ТОЙ ЖЕ модели (та же размерность 384, mean pooling —
 # базу памяти пересоздавать не нужно). Если оператор задал EMBED_MODEL_URL явно —
 # используем только его и список игнорируем.
+# Порядок важен: проверено по метаданным GGUF, что context_length в заголовке
+# совпадает с реальной формой position_embd (иначе llama.cpp падает с
+# "tensor 'position_embd.weight' has wrong shape; expected 384,511 got 384,512").
+# tuskbot конвертирован с context_length=511 при тензоре 512 → НЕ грузится, выкинут.
 EMBED_MODEL_MIRRORS=(
-    "https://huggingface.co/tuskbot/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small-f16.gguf?download=true"
     "https://huggingface.co/keisuke-miyako/multilingual-e5-small-gguf-f16/resolve/main/multilingual-e5-small-F16.gguf?download=true"
     "https://huggingface.co/cstr/multilingual-e5-small-GGUF/resolve/main/multilingual-e5-small-q8_0.gguf?download=true"
+    "https://huggingface.co/cstr/multilingual-e5-small-GGUF/resolve/main/multilingual-e5-small.gguf?download=true"
 )
 EMBED_MODEL_URL="${EMBED_MODEL_URL:-${EMBED_MODEL_MIRRORS[0]}}"
 # Имя файла: из URL (без query-строки) либо переопределяемо.
