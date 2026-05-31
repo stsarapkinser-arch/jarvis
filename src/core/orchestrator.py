@@ -45,6 +45,7 @@ from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
 from src.skills.learning import Candidate, SkillLearner
+from src.skills.healing import SkillHealer, first_binary
 from src.core.volition import ProactiveGate
 from src.memory import reflection
 
@@ -235,7 +236,9 @@ class _SkillCtx:
         return await self._jarvis._run_background(cmd)
 
     async def run(self, cmd: str) -> tuple[int | None, str, str]:
-        return await self._jarvis._run(cmd)
+        # Самолечение: применяем выученную замену и чиним падение детерминированно
+        # (варианты бинаря qdbus). Прозрачно для навыков — сигнатура та же.
+        return await self._jarvis._run_skill_command(cmd)
 
 
 class _LlamaCompletionAdapter:
@@ -320,6 +323,10 @@ class Jarvis(metaclass=Singleton):
             min_interval_sec=self.PROACTIVE_INTERVAL,
             silence_before_sec=self.PROACTIVE_INTERVAL,
         )
+        # Самолечение команд навыков: выученные замены + детерминированные
+        # кандидаты-починки (варианты бинаря qdbus). Автоматизирует ручной
+        # «# VERIFY on target» — навык чинится один раз и запоминается.
+        self._healer = SkillHealer()
         # Контекст для хендлеров навыков (spawn/run поверх этого оркестратора).
         self._skill_ctx = _SkillCtx(self)
         self._state_label: str = "IDLE"
@@ -869,6 +876,53 @@ class Jarvis(metaclass=Singleton):
             # nmap streams through the HUD port matrix in real time.
             return await stream_nmap(injected, bus=self.bus)
         return await asyncio.to_thread(run_bash, injected)
+
+    async def _run_skill_command(self, cmd: str) -> tuple[int | None, str, str]:
+        """``ctx.run`` с самолечением (вызывается из _SkillCtx.run).
+
+        Поток: выученная замена → если упала, детерминированные кандидаты
+        (варианты бинаря qdbus) → первый rc=0 запоминаем как override. Это и есть
+        автоматический «# VERIFY on target»: исполнение на реальной машине само
+        отбирает рабочий вариант. Никакого LLM на горячем пути — только
+        предсказуемая подмена известного семейства бинарей."""
+        override = self._healer.override_for(cmd)
+        primary = override or cmd
+        rc, out, err = await self._run(primary)
+        # rc=0 — успех; rc=None — неизвестный исход (напр. стрим nmap) → не лечим.
+        if rc == 0 or rc is None:
+            return rc, out, err
+
+        tried = {primary}
+        # Выученная замена внезапно сломалась (обновили Plasma?) — забываем её и
+        # пробуем исходную команду, прежде чем перебирать кандидатов.
+        if override is not None:
+            self._healer.forget(cmd)
+            tried.add(cmd)
+            rc0, out0, err0 = await self._run(cmd)
+            if rc0 == 0:
+                return rc0, out0, err0
+            rc, out, err = rc0, out0, err0
+
+        for cand in self._healer.candidates(cmd, err):
+            if cand in tried:
+                continue
+            tried.add(cand)
+            rc2, out2, err2 = await self._run(cand)
+            if rc2 == 0:
+                self._healer.remember(cmd, cand)
+                self._announce_heal(cmd, cand)
+                return rc2, out2, err2
+        return rc, out, err
+
+    def _announce_heal(self, original: str, healed: str) -> None:
+        """Голосом сообщить о самопочинке (это и есть «подтверждение» оператору:
+        фикс уже проверен rc=0 и закреплён; озвучка делает его наблюдаемым)."""
+        ob, hb = first_binary(original), first_binary(healed)
+        log.info("skill self-heal: %r → %r", original[:80], healed[:80])
+        if ob and hb and ob != hb:
+            self.say(f"Сэр, навык не пошёл через {ob} — переключил на {hb} и закрепил.")
+        else:
+            self.say("Сэр, навык не сработал штатно — нашёл рабочий вариант и закрепил.")
 
     def _is_destructive(self, cmd: str) -> bool:
         return bool(DESTRUCTIVE_RE.search(cmd))

@@ -77,10 +77,20 @@ class LlamaServerEmbedding(EmbeddingFunction):
 
     def __init__(self, endpoint: str | None = None, model: str | None = None) -> None:
         self._client = EmbeddingClient(endpoint=endpoint, model=model)
+        self.endpoint = self._client.endpoint
         self.model = self._client.model
 
     def name(self) -> str:
         return "jarvis-llama-embed"
+
+    # get_config/build_from_config — контракт сериализации Chroma (forward-compat,
+    # глушит deprecation). Коллекция запоминает, чем её эмбеддили.
+    def get_config(self) -> dict[str, Any]:
+        return {"endpoint": self.endpoint, "model": self.model}
+
+    @classmethod
+    def build_from_config(cls, config: dict[str, Any]) -> "LlamaServerEmbedding":
+        return cls(endpoint=config.get("endpoint"), model=config.get("model"))
 
     def __call__(self, input: Documents) -> Embeddings:
         return self._client.embed(list(input))
