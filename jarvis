@@ -71,6 +71,20 @@ http_get() {
     else return 2; fi
 }
 
+# Достижим ли URL (только заголовки, без тела) — для проверки источника моделей.
+reachable() {
+    if have curl; then curl -fsS --max-time "${2:-6}" -o /dev/null -I "$1" 2>/dev/null
+    elif have wget; then wget -q -T "${2:-6}" --spider "$1" 2>/dev/null
+    else return 2; fi
+}
+net_dns_ok() { getent hosts "$1" >/dev/null 2>&1; }
+net_ip_ok()  { ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; }
+
+# Источники моделей: основной HF и зеркало (на случай блокировки/региона).
+CHAT_MODEL_URL_HF="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=true"
+EMBED_MODEL_URL_HF="https://huggingface.co/ChristianAzinn/multilingual-e5-small-gguf/resolve/main/multilingual-e5-small.fp16.gguf?download=true"
+OFFLINE=0  # выставляется ensure_models_reachability при отсутствии источника
+
 # ───────────────── карта внешних инструментов → apt-пакет ─────────────────
 # Формат: "бинарь:apt-пакет:класс". класс = build|core|opt.
 #   build — нужно для сборки llama-server (только setup)
@@ -146,6 +160,8 @@ ${C_BOLD}ПЕРЕМЕННЫЕ${C_RESET} (необязательные)
     JARVIS_EMBED_ENDPOINT   (умолч. http://127.0.0.1:8090)
     JARVIS_EMBED_MODEL      (умолч. multilingual-e5-small)
     JARVIS_SCREEN_WATCH     1=следить за экраном, 0=выключить
+    JARVIS_PROACTIVE_INTERVAL  порог тишины (сек) до проактива и взгляда на
+                            экран; умолч. 1200. Поставь 60 для быстрой проверки.
     SKIP_BUILD=1            пропустить компиляцию сервера в setup
 EOF
 }
@@ -187,6 +203,42 @@ check_artifacts() {
 
     if [ -d "$VOSK_MODEL" ] && [ -n "$(ls -A "$VOSK_MODEL" 2>/dev/null)" ]; then ok "Vosk-модель (слух) на месте"
     else warn "Vosk-модель не найдена в $VOSK_MODEL — распознавание речи не поедет"; fi
+}
+
+check_network() {
+    hdr "[*] Сеть и источник моделей"
+    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    if [ -f "$CHAT_MODEL" ] && [ -n "$embed_gguf" ]; then
+        ok "обе модели на диске — сеть для установки не нужна"
+        return
+    fi
+    if net_dns_ok huggingface.co && reachable https://huggingface.co; then
+        ok "huggingface.co доступен — setup скачает напрямую"
+    elif net_dns_ok hf-mirror.com && reachable https://hf-mirror.com; then
+        warn "HF недоступен, но зеркало hf-mirror.com — да (setup переключится сам)"
+    elif net_ip_ok; then
+        crit "сеть есть, DNS не резолвит (битый /etc/resolv.conf) — модели не скачать"
+        note "фикс: printf 'nameserver 1.1.1.1\\n' | sudo tee /etc/resolv.conf"
+    else
+        crit "нет сети/DNS — подложи модели вручную (jarvis setup подскажет пути)"
+    fi
+}
+
+check_proactive() {
+    hdr "[*] Проактивность и взгляд на экран"
+    local iv; iv="${JARVIS_PROACTIVE_INTERVAL:-1200}"
+    if [ "$iv" = "1200" ] || [ -z "${JARVIS_PROACTIVE_INTERVAL:-}" ]; then
+        ok "порог тишины: 1200с (20 мин) — штатный режим"
+        note "для быстрой проверки взгляда: JARVIS_PROACTIVE_INTERVAL=60 jarvis run"
+    else
+        warn "порог тишины снижен до ${iv}с (JARVIS_PROACTIVE_INTERVAL) — тестовый режим"
+        note "этот же порог гейтит и «взгляд на экран» — удобно для проверки"
+    fi
+    local sw; sw="${JARVIS_SCREEN_WATCH:-1}"
+    case "$sw" in
+        0|false|no|off) note "взгляд на экран ВЫКЛЮЧЕН (JARVIS_SCREEN_WATCH=$sw)";;
+        *) ok "взгляд на экран включён (JARVIS_SCREEN_WATCH=$sw)";;
+    esac
 }
 
 check_voice() {
@@ -310,10 +362,12 @@ cmd_test() {
     printf '%s%s═══ JARVIS · диагностика ═══%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
     check_python
     check_artifacts
+    check_network
     check_voice
     check_chat_server
     check_embed_server
     check_memory
+    check_proactive
     check_tools
     check_units
 
@@ -388,10 +442,52 @@ ensure_venv() {
     fi
 }
 
+# Выбор источника моделей до запуска тяжёлых скриптов: HF → зеркало → офлайн.
+# Экспортирует MODEL_URL / EMBED_MODEL_URL (их читают setup-скрипты) и OFFLINE.
+ensure_models_reachability() {
+    step "Сеть и источник моделей"
+    local need_chat=0 need_embed=0 embed_gguf
+    [ -f "$CHAT_MODEL" ] || need_chat=1
+    embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    [ -n "$embed_gguf" ] || need_embed=1
+    if [ "$need_chat" -eq 0 ] && [ "$need_embed" -eq 0 ]; then
+        ok "обе модели уже на диске — сеть не нужна"
+        return
+    fi
+
+    if net_dns_ok huggingface.co && reachable https://huggingface.co; then
+        ok "huggingface.co доступен — качаю с него"
+        return
+    fi
+    warn "huggingface.co недоступен"
+
+    if net_dns_ok hf-mirror.com && reachable https://hf-mirror.com; then
+        export MODEL_URL="${CHAT_MODEL_URL_HF/huggingface.co/hf-mirror.com}"
+        export EMBED_MODEL_URL="${EMBED_MODEL_URL_HF/huggingface.co/hf-mirror.com}"
+        ok "переключаюсь на зеркало hf-mirror.com"
+        return
+    fi
+
+    OFFLINE=1
+    if net_ip_ok; then
+        crit "сеть есть, но DNS не резолвит имена (битый /etc/resolv.conf?)"
+        note "быстрый фикс DNS:"
+        note "  printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' | sudo tee /etc/resolv.conf"
+    else
+        crit "нет ни интернета, ни DNS — проверь подключение бокса"
+    fi
+    printf '\n  %sПодложи модели вручную (любая машина с интернетом) ровно сюда:%s\n' "$C_YELLOW" "$C_RESET"
+    [ "$need_chat" -eq 1 ]  && { note "→ $CHAT_MODEL"; note "  из: $CHAT_MODEL_URL_HF"; }
+    [ "$need_embed" -eq 1 ] && { note "→ $EMBED_DIR/multilingual-e5-small.fp16.gguf"; note "  из: $EMBED_MODEL_URL_HF"; }
+    note "затем повтори: jarvis setup  (готовые файлы скрипты не перекачивают)"
+}
+
 ensure_servers_built() {
     step "Сервер-мозг и модель (setup_server.sh)"
     if [ -x "$SERVER_BIN" ] && [ -f "$CHAT_MODEL" ] && [ -f "$UNIT_DIR/jarvis-llm.service" ]; then
         ok "бинарь, модель и юнит уже готовы — пропускаю сборку"
+    elif [ "$OFFLINE" -eq 1 ] && [ ! -f "$CHAT_MODEL" ]; then
+        warn "пропускаю setup_server.sh: нет модели и нет сети (см. подкладку выше)"
     else
         note "запускаю ./setup_server.sh (сборка Vulkan + модель + юнит) ..."
         "$REPO_ROOT/setup_server.sh" || warn "setup_server.sh завершился с ошибкой — см. вывод выше"
@@ -401,6 +497,8 @@ ensure_servers_built() {
     local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
     if [ -n "$embed_gguf" ] && [ -f "$UNIT_DIR/jarvis-embed.service" ]; then
         ok "embedding-модель и юнит уже готовы — пропускаю"
+    elif [ "$OFFLINE" -eq 1 ] && [ -z "$embed_gguf" ]; then
+        warn "пропускаю setup_embed_server.sh: нет модели и нет сети (см. подкладку выше)"
     else
         note "запускаю ./setup_embed_server.sh ..."
         "$REPO_ROOT/setup_embed_server.sh" || warn "setup_embed_server.sh завершился с ошибкой"
@@ -427,7 +525,21 @@ install_global_symlink() {
     ok "симлинк: $target → $REPO_ROOT/jarvis"
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ok "~/.local/bin уже в PATH";;
-        *) note "добавь в ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\"";;
+        *)
+            # Дописываем PATH в rc-файл шелла (идемпотентно: только если строки нет).
+            local line='export PATH="$HOME/.local/bin:$PATH"'
+            local rc; local added=0
+            for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+                [ -f "$rc" ] || continue
+                if ! grep -qF "$line" "$rc" 2>/dev/null; then
+                    printf '\n# jarvis CLI\n%s\n' "$line" >> "$rc"
+                    ok "PATH дописан в $(basename "$rc")"
+                    added=1
+                fi
+            done
+            [ "$added" -eq 0 ] && note "добавь вручную в rc:  $line"
+            note "примени сейчас:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
     esac
 }
 
@@ -435,6 +547,7 @@ cmd_setup() {
     printf '%s%s═══ JARVIS · установка ═══%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
     apt_install_missing
     ensure_venv
+    ensure_models_reachability
     ensure_servers_built
     ensure_main_service
     install_global_symlink
@@ -463,12 +576,12 @@ cmd_run() {
     [ -z "$py" ] && { ensure_venv; py="$(venv_python)"; }
     if [ -z "$py" ]; then crit "нет venv и не удалось создать — запусти jarvis setup"; exit 1; fi
 
-    if [ ! -x "$SERVER_BIN" ] || [ ! -f "$CHAT_MODEL" ]; then
-        warn "сервер/модель отсутствуют — добираю через setup"
+    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    if [ ! -x "$SERVER_BIN" ] || [ ! -f "$CHAT_MODEL" ] || [ -z "$embed_gguf" ]; then
+        warn "сервер/модели отсутствуют — добираю (с выбором источника)"
+        ensure_models_reachability
         ensure_servers_built
     fi
-    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
-    [ -z "$embed_gguf" ] && { warn "нет embedding-модели — добираю"; "$REPO_ROOT/setup_embed_server.sh" || true; }
 
     # 2. Поднять оба сервера.
     if have_systemd; then

@@ -1868,7 +1868,14 @@ class Jarvis(metaclass=Singleton):
 
     # ──────────────────── proactive status loop ──────────────────────────────
 
-    PROACTIVE_INTERVAL = 1200  # 20 minutes of silence → volunteer a status
+    # Порог проактивности: по умолчанию 20 минут тишины → ассистент сам подаёт
+    # статус. Переопределяется JARVIS_PROACTIVE_INTERVAL (в секундах) — тот же
+    # порог гейтит «взгляд на экран» (см. _screen_watch_loop), поэтому опустив
+    # его до ~60 можно проверить проактив и взгляд, не выжидая 20 минут простоя.
+    try:
+        PROACTIVE_INTERVAL = max(5, int(float(os.getenv("JARVIS_PROACTIVE_INTERVAL", "1200"))))
+    except (TypeError, ValueError):
+        PROACTIVE_INTERVAL = 1200  # 20 minutes of silence → volunteer a status
 
     async def _proactive_loop(self) -> None:
         """Checks every 60s if Jarvis has been silent for PROACTIVE_INTERVAL.
