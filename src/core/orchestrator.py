@@ -121,6 +121,12 @@ WEAVER_MEMORY_FACTS = 3
 WEAVER_FACT_MAX_CHARS = 120
 WEAVER_INTENT_MAX_CHARS = 300
 WEAVER_BATTERY_FRESH_SEC = 900  # 15 min
+# Буфер диалога: сколько последних реплик (оператор↔Джарвис) держим в контексте.
+# На N100 бюджет ввода 3B жёсткий — 4 короткие реплики дают «связность»
+# («закрой его», «то же для второго») почти без токенов. Recall (RAG) — про
+# давнее и семантическое; этот буфер — про «здесь и сейчас», последние секунды.
+DIALOGUE_TURNS = 4
+DIALOGUE_TURN_MAX_CHARS = 120
 
 # ───────────── Acoustic tract → src/audio/audio_engine.py ─────────────
 # Кинематографический голосовой тракт (когнитивная просодия + SoX «Bettany
@@ -292,6 +298,10 @@ class Jarvis(metaclass=Singleton):
         self._last_battery: dict | None = None
         self._last_battery_ts: float = 0.0
         self._last_say_ts: float = 0.0  # updated by say(); drives proactive loop
+        self._last_spoken: str = ""     # последняя озвученная фраза (для буфера диалога)
+        # Буфер диалога: последние реплики (оператор, Джарвис) для связного
+        # контекста. Кладётся в build_context отдельной секцией перед интентом.
+        self._dialogue: deque[tuple[str, str]] = deque(maxlen=DIALOGUE_TURNS)
 
         self._pending_confirmation: dict | None = None
         self._pending_shadow: dict | None = None
@@ -373,8 +383,31 @@ class Jarvis(metaclass=Singleton):
         if not text:
             return
         self._last_say_ts = time.time()
+        self._last_spoken = text
         chosen = tone or self._tone_for_state()
         self._acoustic.speak(text, chosen, speed=speed, pause=pause)
+
+    def _record_turn(self, user: str, assistant: str) -> None:
+        """Зафиксировать одну реплику диалога (оператор → Джарвис) в буфере.
+
+        Пишем только полные пары: пустой ввод или немой ответ не несут
+        контекста для модели и лишь съели бы бюджет токенов. Синтетические
+        интенты демонов (``[DAEMON_ALERT]``, ``[SYSTEM_EVENT…]`` — речь
+        оператора с «[» не начинается) в диалог не попадают."""
+        user = (user or "").strip()
+        assistant = (assistant or "").strip()
+        if user and assistant and not user.startswith("["):
+            self._dialogue.append((user, assistant))
+
+    def _fmt_dialogue(self) -> str:
+        if not self._dialogue:
+            return "[Dialogue: none]"
+        lines: list[str] = []
+        for user, assistant in self._dialogue:
+            u = user.replace("\n", " ")[:DIALOGUE_TURN_MAX_CHARS]
+            a = assistant.replace("\n", " ")[:DIALOGUE_TURN_MAX_CHARS]
+            lines.append(f" - оператор: {u}\n   ты: {a}")
+        return f"[Dialogue: last {len(self._dialogue)}]\n" + "\n".join(lines)
 
     # ───────────── Context Weaver (Pillar 4) ─────────────
     # Builds the structured short prompt the spec asks for:
@@ -484,14 +517,16 @@ class Jarvis(metaclass=Singleton):
     def build_context(self, user_text: str, past: list[dict]) -> str:
         """Compose the four-section structured prompt for Qwen2.5-Coder:3B.
 
-        Order is fixed (Memory → System → Pixel → User Intent) so the
-        model learns a stable schema; missing slots render as ``none``.
-        Sync + pure (apart from a single psutil disk read), so unit tests
-        can exercise it directly."""
+        Order is fixed (Memory → System → Pixel → Dialogue → User Intent) so
+        the model learns a stable schema; missing slots render as ``none``.
+        Dialogue (последние реплики) идёт вплотную к интенту — максимум свежести
+        для разрешения ссылок («его», «то же», «второй»). Sync + pure (apart
+        from a single psutil disk read), so unit tests can exercise it directly."""
         return (
             self._fmt_memory_facts(past) + "\n"
             + self._fmt_system() + "\n"
             + self._fmt_pixel() + "\n"
+            + self._fmt_dialogue() + "\n"
             + self._fmt_intent(user_text)
         )
 
@@ -736,6 +771,48 @@ class Jarvis(metaclass=Singleton):
         except Exception:
             log.exception("skill %s handler failed", sk.id)
             return "error: навык дал сбой"
+
+    async def _try_alias_fastpath(self, text: str) -> bool:
+        """Точная фраза-алиас → прямой детерминированный вызов навыка, минуя
+        маршрутизатор и 3B. Главный рычаг латентности на N100: бытовые команды
+        («терминал», «тише», «что на экране») отвечают мгновенно, не занимая
+        одно-слотовый llama-server. Возвращает True, если интент поглощён.
+
+        Только ТОЧНОЕ совпадение (см. skills.match_alias): фразы с аргументами
+        («быстрый скан 10.0.0.1») не матчатся и уходят модели — она извлечёт
+        цель. Навыки без аргумента, требующие его (nmap), сами вежливо попросят
+        уточнить — поведение идентично агентному пути."""
+        sk = skills.match_alias(text)
+        if sk is None:
+            return False
+        log.info("alias fast-path: %r → skill=%s", text[:60], sk.id)
+        snap = await asyncio.to_thread(snapshot)
+
+        # Разрушительный навык — то же голосовое подтверждение, что и из
+        # агентного цикла (переиспользуем очередь _pending_skill / _try_resolve_skill).
+        if sk.destructive:
+            self._pending_skill = {
+                "skill": sk, "args": {}, "intent": text,
+                "snap": snap, "ts": time.time(),
+            }
+            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
+            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            return True
+
+        await self._state("THINKING", sk.id)
+        result = await self._invoke_skill(sk, {})
+        # speaks_result → озвучиваем живой результат хендлера (телеметрия);
+        # иначе — короткий ack (контекстную фразу без модели не сочинить).
+        spoken = result if sk.speaks_result else self.ack("ok")
+        if spoken.strip():
+            self.say(spoken.strip())
+            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken.strip()))
+        await asyncio.to_thread(
+            self.memory.remember, text, f"skill:{sk.id}", result, "alias_skill", snap,
+        )
+        self._record_turn(text, spoken)
+        await self._state("IDLE", "")
+        return True
 
     async def _run_agent_for_intent(
         self,
@@ -1102,6 +1179,12 @@ class Jarvis(metaclass=Singleton):
         if await self._try_resolve_learn(text):
             return "[learn_resolved]"
 
+        # Alias fast-path: точная фраза-команда → навык напрямую, без 3B.
+        # Стоит ПОСЛЕ резолв-гейтов (чтобы «да/нет» подтверждения не перехватить)
+        # и ДО snapshot/recall/агента — экономит и латентность, и слот сервера.
+        if await self._try_alias_fastpath(text):
+            return "[alias_fastpath]"
+
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор
         # хотел не только overlay, но и устный отчёт).
@@ -1153,6 +1236,9 @@ class Jarvis(metaclass=Singleton):
             self.memory.remember,
             text, bash_joined, result, f"agent_{st.category.value.lower()}", snap,
         )
+        # Реплика в буфер диалога: что Джарвис реально сказал (для связности
+        # следующего интента — «закрой его», «то же для второго»).
+        self._record_turn(text, self._last_spoken if st.spoke else result)
         # Если за этот интент созрел кандидат в навыки — предложить закрепить.
         await self._maybe_offer_learn()
         await self._state("IDLE", "")

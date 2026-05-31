@@ -119,3 +119,39 @@ def test_nmap_quick_accepts_clean_target():
     sk = skills.get("nmap_quick")
     asyncio.run(sk.handler(ctx, {"target": "10.0.0.1"}))
     assert ctx.ran and "nmap" in ctx.ran[0] and "10.0.0.1" in ctx.ran[0]
+
+
+# ───────────────────────── alias fast-path ─────────────────────────
+def test_match_alias_exact():
+    """Точная фраза-алиас резолвится в свой навык."""
+    sk = skills.match_alias("терминал")
+    assert sk is not None and sk.id == "open_terminal"
+
+
+def test_match_alias_normalizes_case_punct_and_yo():
+    """Регистр, крайняя пунктуация и ё/е игнорируются при матчинге."""
+    assert skills.match_alias("  Терминал!  ").id == "open_terminal"
+    # ночной режим объявлен через «ё» в одном из алиасов — ищем через «е».
+    assert skills.match_alias("теплый экран") is not None
+    assert skills.match_alias("тёплый экран") is not None
+    assert skills.match_alias("Тёплый Экран") is not None
+
+
+def test_match_alias_no_partial_match():
+    """Фраза с аргументом НЕ матчится точным алиасом — уходит модели."""
+    assert skills.match_alias("быстрый скан 192.168.1.1") is None
+    assert skills.match_alias("просто болтаем о погоде") is None
+    assert skills.match_alias("") is None
+
+
+def test_match_alias_points_to_real_skill():
+    """Каждый проиндексированный алиас ведёт к существующему навыку."""
+    from src.skills import registry
+    for alias, sid in registry._ALIAS_INDEX.items():
+        assert skills.get(sid) is not None, f"алиас {alias!r} → несуществующий {sid}"
+
+
+def test_alias_index_has_no_skill_id_collisions_with_real_phrases():
+    """Контроль здравомыслия: парность скан-фраз ведёт в pentest-навыки."""
+    assert skills.match_alias("открытые порты").id == "list_listening_ports"
+    assert skills.match_alias("кто в сети").id == "nmap_ping_sweep"

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -68,6 +69,21 @@ class Skill:
 
 
 _REGISTRY: dict[str, Skill] = {}
+# Обратный индекс: нормализованный алиас → skill_id. Заполняется при
+# register(); основа alias fast-path в оркестраторе (точная фраза минует 3B).
+_ALIAS_INDEX: dict[str, str] = {}
+
+# Нормализация фразы для сопоставления с алиасом: регистр, ё→е, схлопывание
+# пробелов и снятие крайней пунктуации. Vosk пунктуацию не выдаёт, но текст из
+# тестов/тулзов может — приводим обе стороны к одному виду.
+_WS_RE = re.compile(r"\s+")
+_EDGE_PUNCT = " .,!?;:…\"'«»()[]-—–"
+
+
+def _normalize_phrase(text: str) -> str:
+    s = (text or "").strip().lower().replace("ё", "е")
+    s = _WS_RE.sub(" ", s)
+    return s.strip(_EDGE_PUNCT)
 
 
 def register(skill: Skill) -> None:
@@ -75,6 +91,34 @@ def register(skill: Skill) -> None:
     if skill.id in _REGISTRY:
         raise ValueError(f"duplicate skill id: {skill.id!r}")
     _REGISTRY[skill.id] = skill
+    # Индексируем алиасы для fast-path. Коллизия алиаса между навыками — это
+    # смысловая неоднозначность фразы: первый зарегистрировавший выигрывает,
+    # остальные логируем (не падаем — алиас не критичен для работы навыка).
+    for alias in skill.aliases:
+        key = _normalize_phrase(alias)
+        if not key:
+            continue
+        owner = _ALIAS_INDEX.get(key)
+        if owner is not None and owner != skill.id:
+            log.warning(
+                "alias %r уже привязан к %s — игнорирую дубль от %s",
+                key, owner, skill.id,
+            )
+            continue
+        _ALIAS_INDEX.setdefault(key, skill.id)
+
+
+def match_alias(text: str) -> Skill | None:
+    """Точное нормализованное совпадение фразы с алиасом → навык, иначе None.
+
+    Только ТОЧНОЕ совпадение (по нормализованной форме). Параметризованные
+    фразы вроде «быстрый скан 192.168.1.1» сюда НЕ попадают и уходят модели,
+    которая извлечёт аргумент. Это и есть граница fast-path: высокая точность,
+    нулевой риск ложного срабатывания на curated-алиасах оператора."""
+    sid = _ALIAS_INDEX.get(_normalize_phrase(text))
+    if sid is None:
+        return None
+    return _REGISTRY.get(sid)
 
 
 def skill(
@@ -138,6 +182,7 @@ def catalog_for(category: IntentCategory | str) -> str:
 def reset() -> None:
     """Только для тестов: очистить реестр."""
     _REGISTRY.clear()
+    _ALIAS_INDEX.clear()
 
 
 __all__ = [
@@ -147,6 +192,7 @@ __all__ = [
     "register",
     "skill",
     "get",
+    "match_alias",
     "all_skills",
     "skill_ids",
     "skills_for",
