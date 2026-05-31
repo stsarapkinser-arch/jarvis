@@ -180,5 +180,7 @@ cat <<EOF
     Health:   curl http://127.0.0.1:8080/health
     Tools:    curl http://127.0.0.1:8080/v1/models
 
-Дальше — установите основной сервис Jarvis: ./scripts/install_service.sh
+Дальше:
+    1) Embed-сервер памяти (замена Ollama):  ./setup_embed_server.sh
+    2) Основной сервис Jarvis:               ./scripts/install_service.sh
 EOF

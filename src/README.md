@@ -13,7 +13,8 @@ src/
 │   └── bootstrap.py       # Инициализация и запуск системы
 │
 ├── inference/         # Слой инференса (Native Function Calling)
-│   ├── openai_client.py   # Async HTTP-клиент к нативному llama-server
+│   ├── openai_client.py   # Async HTTP-клиент к chat-серверу llama-server (:8080)
+│   ├── embeddings.py      # Sync-клиент к embed-серверу (:8090) — замена Ollama
 │   ├── agent.py           # Обобщённый агентный цикл tool-calling
 │   ├── router.py          # Semantic Router: интент → категория + микро-промпт
 │   └── tools.py           # JSON-схемы инструментов (run_skill, execute_bash, …)
@@ -120,6 +121,24 @@ ShadowExec (песочница) и heal-цикл — редкий резерв, 
 «прочитай ошибку», «какое окно активно». Без VLM — на N100 этого достаточно для
 чтения диалогов, ошибок и содержимого окон.
 
+## Эмбеддинги без Ollama (суверенная память)
+
+Векторы памяти (ChronoMemory) считает не демон Ollama, а **второй лёгкий
+`llama-server --embedding`** на порту 8090 с маленькой **мультиязычной** моделью
+(`src/inference/embeddings.py` → `EmbeddingClient`; Chroma-обёртка
+`LlamaServerEmbedding` в `memory/engine.py`). Это убирает целый рантайм и точку
+отказа: один стек llama.cpp на всё, out-of-process (Python весов не держит),
+эмбеддер крошечный (~120M) и крутится на **CPU** — iGPU остаётся под 3B-мозг.
+Весь батч уходит одним HTTP-запросом в OpenAI-совместимый `/v1/embeddings`. Код
+модель-агностичен; модель/порт настраиваются через `JARVIS_EMBED_MODEL` /
+`JARVIS_EMBED_ENDPOINT`. Поднять: `./setup_embed_server.sh` (юнит
+`jarvis-embed.service`). Sentinel реникает под нагрузкой именно embed-инстанс
+(по cmdline-маркеру `--embedding`), не трогая chat-сервер.
+
+> Смена embedding-модели меняет размерность вектора → старая база
+> `./jarvis_memory` несовместима. При миграции/смене модели:
+> `rm -rf ./jarvis_memory`.
+
 ## Эхо-гейт: Джарвис не слышит сам себя
 
 `entry_point.py` глушит вход микрофона, пока работает голос, иначе Vosk
@@ -173,6 +192,10 @@ from event_bus import EventBus
 ## Как запустить
 
 ```bash
+# Сервер инференса (один раз): chat-мозг + embed-сервер памяти (вместо Ollama)
+./setup_server.sh            # llama-server :8080 (Llama-3.2-3B, Vulkan/iGPU)
+./setup_embed_server.sh      # llama-server :8090 (--embedding, мультиязычный, CPU)
+
 # Бессмертный запуск (рекомендуется): внешний супервизор стережёт Джарвиса
 python -m src.core.supervisor            # демонизируется, переживает закрытие терминала
 python -m src.core.supervisor status     # жив ли супервизор и bootstrap

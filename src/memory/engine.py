@@ -35,11 +35,11 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
 import chromadb
-import ollama
 from chromadb import Documents, EmbeddingFunction, Embeddings
 from chromadb.errors import InternalError as ChromaDBInternalError
 
 from src.common.singleton import Singleton
+from src.inference.embeddings import EmbeddingClient
 
 log = logging.getLogger("jarvis.memory")
 
@@ -68,16 +68,22 @@ SIG_CORE: Final = 2    # identity-level — permanent (promoted to chrono_core)
 CORE_KINDS: Final = frozenset({"identity", "project", "preference", "principle", "contact"})
 
 
-class OllamaEmbedding(EmbeddingFunction):
-    def __init__(self, model: str = "all-minilm") -> None:
-        self.model = model
+class LlamaServerEmbedding(EmbeddingFunction):
+    """Chroma EmbeddingFunction поверх ``llama-server /v1/embeddings`` (без Ollama).
+
+    Весь батч уходит одним HTTP-запросом (см. ``EmbeddingClient``). ``name()``
+    задан явно — иначе свежий Chroma предупреждает о будущем требовании к
+    EmbeddingFunction."""
+
+    def __init__(self, endpoint: str | None = None, model: str | None = None) -> None:
+        self._client = EmbeddingClient(endpoint=endpoint, model=model)
+        self.model = self._client.model
+
+    def name(self) -> str:
+        return "jarvis-llama-embed"
 
     def __call__(self, input: Documents) -> Embeddings:
-        out: Embeddings = []
-        for text in input:
-            res = ollama.embeddings(model=self.model, prompt=text)
-            out.append(res["embedding"])
-        return out
+        return self._client.embed(list(input))
 
 
 def _flatten_snapshot(snap: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -99,10 +105,11 @@ class ChronoMemory(metaclass=Singleton):
     def __init__(
         self,
         path: str = "./jarvis_memory",
-        embed_model: str = "all-minilm",
+        embed_endpoint: str | None = None,
+        embed_model: str | None = None,
     ) -> None:
         self.client = chromadb.PersistentClient(path=path)
-        self.embed_fn = OllamaEmbedding(embed_model)
+        self.embed_fn = LlamaServerEmbedding(endpoint=embed_endpoint, model=embed_model)
         self.lite = self.client.get_or_create_collection(
             name="chrono_lite", embedding_function=self.embed_fn
         )

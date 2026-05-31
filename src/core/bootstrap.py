@@ -10,13 +10,6 @@ import time
 
 import qasync
 
-try:
-    import ollama as _ollama_mod
-    _HAS_OLLAMA = True
-except ImportError:
-    _ollama_mod = None  # type: ignore[assignment]
-    _HAS_OLLAMA = False
-
 from PyQt6.QtWidgets import QApplication
 
 from src.core.orchestrator import (
@@ -36,27 +29,27 @@ from src.memory.storage import Mnemosyne
 from src.ui.pixel_renderer import PixelBridge
 from src.services.recon_daemon import ReconDaemon
 from src.services.sentinel import Sentinel
+from src.inference.embeddings import (
+    DEFAULT_EMBED_ENDPOINT,
+    DEFAULT_EMBED_MODEL,
+    EmbeddingClient,
+)
 
 log = logging.getLogger("jarvis.boot")
 
 HUD_REPOSITION_PERIOD_SEC = 6.0
 
-# Эмбеддинги для ChronoMemory всё ещё на Ollama — миграция all-minilm на
-# llama-cpp требует отдельной GGUF embedding-модели и переработки
-# memory_engine.OllamaEmbedding (следующая фаза). LLM-мозг — уже llama-cpp.
-REQUIRED_OLLAMA_EMBEDDING_MODELS: tuple[str, ...] = ("all-minilm",)
-
 
 async def verify_inference_stack(jarvis: Jarvis) -> None:
     """Двухслойный preflight перед стартом подсистем:
 
-    1. **llama-server (HTTP)** — главный мозг (Llama-3.2-3B-Instruct, Q4_K_M)
-       в ОТДЕЛЬНОМ системном процессе. Если демон не отвечает по /health,
-       Jarvis уходит в degraded-режим: голосовые команды слышим, но думать
-       нечем — оператору внятно говорим, что запустить (./setup_server.sh).
-    2. **Ollama + all-minilm** — эмбеддинги для ChronoMemory. Если ollama
-       лежит, память деградирует до zero-recall, но это не fatal — Sentinel
-       и Pixel-bridge всё равно живы.
+    1. **llama-server (HTTP, :8080)** — главный мозг (Llama-3.2-3B-Instruct,
+       Q4_K_M) в ОТДЕЛЬНОМ системном процессе. Если демон не отвечает по
+       /health, Jarvis уходит в degraded-режим: голосовые команды слышим, но
+       думать нечем — оператору внятно говорим, что запустить (./setup_server.sh).
+    2. **embed-сервер (llama-server --embedding, :8090)** — эмбеддинги для
+       ChronoMemory (вместо Ollama). Если лежит — память деградирует до
+       zero-recall, но это не fatal: Sentinel и Pixel-bridge всё равно живы.
 
     Никакая из проблем не валит boot — все диагностики идут через ``jarvis.say``,
     чтобы оператор услышал ровно один краткий брифинг."""
@@ -69,52 +62,26 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
             "запустите ./setup_server.sh или: systemctl --user start jarvis-llm"
         )
 
-    # — Layer 2: Ollama embeddings (all-minilm).
-    if not _HAS_OLLAMA:
-        issues.append("ollama Python-пакет не установлен (нужен для эмбеддингов памяти): pip install ollama")
-    else:
-        try:
-            client = _ollama_mod.AsyncClient()
-            listing = await client.list()
-        except Exception as exc:
-            log.warning("ollama list() failed: %s", exc)
+    # — Layer 2: embed-сервер (llama-server --embedding). Sync-клиент гоняем в
+    #   треде, чтобы не блокировать event-loop на время сетевой пробы.
+    embed = EmbeddingClient()
+    try:
+        if not await asyncio.to_thread(embed.health):
             issues.append(
-                "Ollama не отвечает (нужна для эмбеддингов памяти): "
-                "systemctl status ollama"
+                f"embed-сервер недоступен на {DEFAULT_EMBED_ENDPOINT} "
+                f"({DEFAULT_EMBED_MODEL}) — память без recall. Запустите "
+                "./setup_embed_server.sh или: systemctl --user start jarvis-embed"
             )
-            listing = None
-
-        if listing is not None:
-            raw_models = getattr(listing, "models", None)
-            if raw_models is None and isinstance(listing, dict):
-                raw_models = listing.get("models", [])
-            raw_models = raw_models or []
-
-            installed: set[str] = set()
-            for m in raw_models:
-                name = (
-                    getattr(m, "model", None)
-                    or getattr(m, "name", None)
-                    or (m.get("model") if isinstance(m, dict) else None)
-                    or (m.get("name") if isinstance(m, dict) else None)
-                    or ""
-                )
-                if name:
-                    installed.add(str(name))
-                    if ":" not in name:
-                        installed.add(f"{name}:latest")
-
-            def _have(model: str) -> bool:
-                if model in installed:
-                    return True
-                return f"{model}:latest" in installed or any(
-                    mi.startswith(f"{model}:") for mi in installed
-                )
-
-            missing = [m for m in REQUIRED_OLLAMA_EMBEDDING_MODELS if not _have(m)]
-            if missing:
-                cmds = ", ".join(f"ollama pull {m}" for m in missing)
-                issues.append(f"эмбеддинги не скачаны — выполните: {cmds}")
+        else:
+            # Жив — но реально ли отдаёт вектор? Быстрая проба одним эмбеддингом.
+            try:
+                vec = await asyncio.to_thread(embed.embed, ["проверка связи"])
+                if not vec or not vec[0]:
+                    issues.append("embed-сервер ответил пустым вектором — проверьте модель")
+            except Exception as exc:
+                issues.append(f"embed-сервер не отдал вектор: {exc}")
+    finally:
+        embed.close()
 
     if issues:
         joined = " | ".join(issues)
@@ -125,8 +92,8 @@ async def verify_inference_stack(jarvis: Jarvis) -> None:
         )
     else:
         log.info(
-            "inference stack OK: llama-server (%s) @ %s, embeddings via ollama all-minilm",
-            LLAMA_MODEL_NAME, LLM_ENDPOINT,
+            "inference stack OK: llama-server (%s) @ %s, embeddings @ %s (%s)",
+            LLAMA_MODEL_NAME, LLM_ENDPOINT, DEFAULT_EMBED_ENDPOINT, DEFAULT_EMBED_MODEL,
         )
 
 
@@ -259,7 +226,7 @@ async def amain() -> None:
     kwin = KWinOrchestrator()
     hud.subscribe_to_bus(bus)
 
-    # Runtime-верификация LLM-стека (inference server + ollama embeddings).
+    # Runtime-верификация LLM-стека (chat-сервер :8080 + embed-сервер :8090).
     # Если чего-то нет — Джарвис скажет голосом и продолжит запуск без падения.
     await verify_inference_stack(jarvis)
 

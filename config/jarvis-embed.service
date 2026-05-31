@@ -1,0 +1,50 @@
+[Unit]
+Description=JARVIS Embeddings — native llama-server (--embedding, multilingual, CPU)
+# Только loopback REST на 127.0.0.1:8090 — графическая сессия не нужна.
+After=network.target
+
+[Service]
+# llama-server работает в foreground → Type=exec, systemd держит сам процесс.
+Type=exec
+WorkingDirectory=__JARVIS_HOME__
+
+# ─────────────────── Запуск embed-сервера (замена Ollama) ───────────────────
+# Это ВТОРОЙ экземпляр того же бинаря llama-server, но в embedding-режиме с
+# маленькой МУЛЬТИЯЗЫЧНОЙ моделью (русский!). Считает векторы для ChronoMemory.
+#
+#   --embedding          включает /v1/embeddings и pooling (без него сервер
+#                        отдаёт только chat). По этому флагу Sentinel отличает
+#                        embed-инстанс от chat-инстанса и реникает ТОЛЬКО его.
+#   --pooling mean       e5/MiniLM-семейство = mean pooling. Для bge-моделей
+#                        смени на cls (setup_embed_server.sh: EMBED_POOLING=cls).
+#   --ctx-size 512       короткие тексты памяти укладываются с запасом; держит
+#                        RAM-след крошечным.
+#   (нет --n-gpu-layers) НАМЕРЕННО на CPU: iGPU (Vulkan) бережём под 3B-мозг,
+#                        иначе два Vulkan-контекста дерутся за общую LPDDR5.
+#                        Модель ~120M — на 4 ядрах N100 эмбеддинг это миллисекунды.
+#   --threads 2          фоновой памяти двух ядер хватает; остальные — мозгу/UI.
+#   --parallel 1         один слот.
+# setup_embed_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря.
+ExecStart=__LLAMA_SERVER_BIN__ \
+    --model __JARVIS_HOME__/models/embed/__EMBED_MODEL_FILE__ \
+    --alias __EMBED_MODEL_ALIAS__ \
+    --embedding \
+    --pooling __EMBED_POOLING__ \
+    --ctx-size 512 \
+    --threads 2 \
+    --parallel 1 \
+    --host 127.0.0.1 \
+    --port 8090
+
+# Бессмертие: краш embed-сервера убивает ТОЛЬКО память-эмбеддер; мозг и весь
+# Jarvis живы. systemd рестартит за 2с.
+Restart=always
+RestartSec=2
+# Фоновой приоритет: эмбеддинги памяти уступают мозгу и UI. Sentinel ещё
+# динамически реникает этот процесс под нагрузкой (HIGH/CRITICAL).
+Nice=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

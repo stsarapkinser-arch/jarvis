@@ -75,7 +75,10 @@ HEAVY_PROCS: Final[frozenset[str]] = frozenset({
     "docker", "dockerd", "containerd",
 })
 
-OLLAMA_PROC_NAMES: Final[tuple[str, ...]] = ("ollama",)
+# Маркер embed-сервера в cmdline: это ВТОРОЙ llama-server, поднятый с --embedding
+# (chat-сервер 3B такого флага не имеет, поэтому матчим только embed-инстанс и
+# НЕ душим мозг). Под нагрузкой реникаем именно фоновую работу памяти.
+EMBED_SERVER_MARKER: Final[str] = "--embedding"
 
 try:
     import psutil  # type: ignore
@@ -88,8 +91,8 @@ except ImportError:
 class Sentinel(metaclass=Singleton):
     """Proactive daemon. Two roles:
     (1) Read thermal/loadavg, publish OS_EVENT with severity.
-    (2) Predictively reprioritize Ollama (nice/ionice) based on heavy GUI processes
-        and current load, so KDE Plasma stays responsive on N100."""
+    (2) Predictively reprioritize the embed-server (nice/ionice) based on heavy
+        GUI processes and current load, so KDE Plasma stays responsive on N100."""
 
     def __init__(self) -> None:
         self.bus = EventBus()
@@ -217,25 +220,29 @@ class Sentinel(metaclass=Singleton):
             return False
 
     @staticmethod
-    def _ollama_pids() -> list[int]:
+    def _embed_server_pids() -> list[int]:
+        """PID'ы embed-сервера (llama-server --embedding), но НЕ chat-сервера.
+
+        Различаем по cmdline-маркеру: chat-инстанс флага --embedding не имеет,
+        так что мозг под throttle не попадёт."""
         if _HAS_PSUTIL:
             try:
-                return [
-                    p.pid for p in psutil.process_iter(["name"])
-                    if (p.info.get("name") or "").lower() in OLLAMA_PROC_NAMES
-                ]
+                pids: list[int] = []
+                for p in psutil.process_iter(["cmdline"]):
+                    cmd = " ".join(p.info.get("cmdline") or [])
+                    if EMBED_SERVER_MARKER in cmd and "llama-server" in cmd:
+                        pids.append(p.pid)
+                return pids
             except Exception:
                 pass
-        pids: list[int] = []
-        for name in OLLAMA_PROC_NAMES:
-            try:
-                out = subprocess.check_output(
-                    ["pgrep", "-x", name], text=True, timeout=1, stderr=subprocess.DEVNULL,
-                )
-                pids.extend(int(s) for s in out.split())
-            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                continue
-        return pids
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", f"llama-server.*{EMBED_SERVER_MARKER}"],
+                text=True, timeout=1, stderr=subprocess.DEVNULL,
+            )
+            return [int(s) for s in out.split()]
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return []
 
     async def _run_quiet(self, *cmd: str) -> int:
         try:
@@ -251,12 +258,12 @@ class Sentinel(metaclass=Singleton):
             log.exception("subprocess %s failed", cmd[0])
             return 1
 
-    async def _throttle_ollama(self, *, low: bool, reason: str) -> None:
+    async def _throttle_embed(self, *, low: bool, reason: str) -> None:
         if low and self._throttled:
             return
         if not low and not self._throttled:
             return
-        pids = self._ollama_pids()
+        pids = self._embed_server_pids()
         if not pids:
             return
         nice_val = "10" if low else "0"
@@ -269,7 +276,7 @@ class Sentinel(metaclass=Singleton):
                 await self._run_quiet(self._ionice, "-c", ionice_class, "-p", str(pid))
         self._throttled = low
         log.info(
-            "ollama %s (reason=%s, pids=%s, nice=%s, ionice=%s)",
+            "embed-server %s (reason=%s, pids=%s, nice=%s, ionice=%s)",
             "throttled" if low else "restored", reason, pids, nice_val, ionice_class,
         )
 
@@ -305,13 +312,13 @@ class Sentinel(metaclass=Singleton):
             ))
         except Exception:
             log.exception("SYSTEM_STATE publish failed")
-        # Cascade: when the organism crosses into HIGH/CRITICAL, renice
-        # Ollama so a heavy compile doesn't get its CPU stolen by an LLM
-        # decode. When we fall back to NORMAL/IDLE, restore.
+        # Cascade: when the organism crosses into HIGH/CRITICAL, renice the
+        # embed-server so a heavy compile (or the 3B decode) doesn't fight the
+        # background memory embeddings for CPU. When we fall back, restore.
         if snap.load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
-            await self._throttle_ollama(low=True, reason=f"symbiote_{snap.load}")
+            await self._throttle_embed(low=True, reason=f"symbiote_{snap.load}")
         else:
-            await self._throttle_ollama(low=False, reason=f"symbiote_{snap.load}")
+            await self._throttle_embed(low=False, reason=f"symbiote_{snap.load}")
 
     async def watch_processes(self) -> None:
         log.info("process watcher started")

@@ -1,7 +1,8 @@
-ollama>=0.3
-# httpx: async-клиент к нативному llama-server (OpenAI REST). Главный мозг
-# теперь ОТДЕЛЬНЫЙ процесс (llama-server из llama.cpp, Vulkan) — собирается и
-# запускается через ./setup_server.sh + jarvis-llm.service. Python весов НЕ грузит.
+# httpx: клиент к нативному llama-server (OpenAI REST) — и chat (:8080), и
+# эмбеддинги памяти (:8090). Главный мозг и эмбеддер — ОТДЕЛЬНЫЕ процессы
+# (llama-server из llama.cpp, Vulkan): ./setup_server.sh + ./setup_embed_server.sh.
+# Ollama УБРАН — эмбеддинги тоже на llama.cpp (один стек, минус демон, минус RAM).
+# Python весов НЕ грузит.
 httpx>=0.27
 # llama-cpp-python больше НЕ нужен в рантайме (in-process инференс убран).
 # Оставлен закомментированным как опциональный fallback для оффлайн-экспериментов.

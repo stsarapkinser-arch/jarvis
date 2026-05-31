@@ -197,7 +197,7 @@ class Mnemosyne(metaclass=Singleton):
         bus: EventBus | None = None,
         memory: Any = None,            # ChronoMemory (Singleton)
         kwin: Any = None,              # KWinOrchestrator
-        llm_client: Any = None,        # ollama.AsyncClient
+        llm_client: Any = None,        # chat-completion адаптер (llama-server)
         llm_model: str = "qwen2.5-coder:3b",
     ) -> None:
         self.bus = bus or EventBus()
@@ -232,9 +232,9 @@ class Mnemosyne(metaclass=Singleton):
     async def _harvest_loop(self) -> None:
         while not self._stopping:
             try:
-                # Под HIGH/CRITICAL пропускаем тик: персист слайса = эмбеддинг в
-                # ollama (CPU + память), а это душит iGPU-декод llama-server на
-                # общей шине LPDDR5. Память подождёт — отзывчивость мозга важнее.
+                # Под HIGH/CRITICAL пропускаем тик: персист слайса = эмбеддинг на
+                # embed-сервере (CPU + память), а это душит iGPU-декод chat-сервера
+                # на общей шине LPDDR5. Память подождёт — отзывчивость мозга важнее.
                 if SystemState().load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
                     await asyncio.sleep(HARVEST_INTERVAL)
                     continue

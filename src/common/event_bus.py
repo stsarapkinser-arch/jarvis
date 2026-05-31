@@ -43,7 +43,7 @@ class EventType(StrEnum):
 class SystemLoad(StrEnum):
     """Symbiote load tier. Computed by Sentinel from cpu/ram/thermal/heavy
     processes. The whole organism reacts to a tier change: HUD drops FPS,
-    Ollama is reniced, Piper speaks faster."""
+    the embed-server is reniced, Piper speaks faster."""
     IDLE = "idle"
     NORMAL = "normal"
     HIGH = "high"
@@ -142,7 +142,7 @@ class SystemState(metaclass=Singleton):
     """Single source of truth for the organism's load tier.
 
     Sentinel ``update()``s this from its existing watchers; consumers
-    (HUD's CoreSphereGL, ``core.say()``, Ollama renicer) read the latest
+    (HUD's CoreSphereGL, ``core.say()``, embed-server renicer) read the latest
     snapshot via :py:meth:`snapshot` / :py:attr:`load`. A change in tier
     is the trigger to publish ``EventType.SYSTEM_STATE`` on the bus."""
 
