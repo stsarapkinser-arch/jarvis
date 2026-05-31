@@ -28,7 +28,7 @@ from src.core.immortal import FileChangeWatcher
 from src.services.daemon_swarm import DaemonSwarm
 from src.services.watch_service import DeepWatch
 from src.common.event_bus import EventBus, EventType
-from src.ui.hud import JarvisHUD
+from src.ui.hud import JarvisHUD, is_wayland, layer_shell_available
 from src.ui.window_manager import KWinOrchestrator
 from src.core.entry_point import JarvisMain
 from src.memory.engine import ChronoMemory
@@ -333,6 +333,20 @@ def main() -> int:
     # 2) Затем QApplication.
     # 3) WA_TranslucentBackground / WA_AlwaysStackOnTop / Tool — внутри
     #    JarvisHUD.__init__, ДО создания GL-дочек.
+
+    # Wayland-родной HUD: если сессия Wayland И плагин layer-shell реально
+    # установлен — включаем QtWayland shell-integration ДО QApplication. Проверка
+    # наличия плагина обязательна: без неё Qt не найдёт интеграцию и HUD не
+    # стартует. Не на Wayland / нет плагина → молча идём прежним путём.
+    if (
+        is_wayland()
+        and layer_shell_available()
+        and not os.environ.get("QT_WAYLAND_SHELL_INTEGRATION")
+    ):
+        os.environ["QT_WAYLAND_SHELL_INTEGRATION"] = "layer-shell"
+        logging.getLogger("jarvis.bootstrap").info(
+            "layer-shell integration enabled (Wayland-native HUD)"
+        )
 
     app = QApplication(sys.argv)
     # KWin script ищет HUD по caption ("JarvisHUD") и resourceClass

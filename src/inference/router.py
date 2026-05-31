@@ -58,25 +58,23 @@ SYSTEM_CORE: str = (
 
 _CATEGORY_RULES: dict[IntentCategory, str] = {
     IntentCategory.SYSTEM_OPS: (
-        "Режим: системные операции — файлы, процессы, пакеты, диск, память. "
-        "Нужны живые цифры — сперва read_telemetry, не выдумывай их. Команды "
-        "выполняй через execute_bash (requires_sudo для apt/systemctl/mount). "
-        "Отрази работу на визоре set_hud_state(cyan, pulse). Разрушительные "
-        "команды ядро подтвердит голосом само — не дублируй гейтинг прозой."
+        "Режим: системные операции — диагностика, процессы, диск, память. "
+        "СПЕРВА ищи подходящий навык: run_skill(skill_id, reply) — он и говорит, "
+        "и действует за один вызов. Если в каталоге нужного действия НЕТ — только "
+        "тогда execute_bash (requires_sudo для apt/systemctl/mount). Разрушительные "
+        "команды ядро подтвердит голосом само."
     ),
     IntentCategory.UI_CONTROL: (
         "Режим: управление средой KDE Plasma 6 / Wayland — окна, яркость, звук, "
-        "рабочие столы. Действуй через execute_bash и Wayland-native тулы: qdbus6, "
-        "kdotool, brightnessctl, wpctl, kscreen-doctor. X11-only (xdotool, wmctrl) — "
-        "только fallback. Отрази действие set_hud_state и коротко доложи "
-        "speak_response."
+        "приложения, рабочие столы. ВСЕГДА предпочитай готовый навык: "
+        "run_skill(skill_id, reply). Угадывать синтаксис qdbus/kdotool ЗАПРЕЩЕНО — "
+        "для этого есть навыки. execute_bash — лишь если действия нет в каталоге."
     ),
     IntentCategory.PENTEST_RECON: (
-        "Режим: разведка и пентест — nmap, wireshark, tshark, tcpdump, логи, CVE. "
-        "Железо слабое: предлагай разумные флаги (-sV, --max-retries). nmap "
-        "выводится на матрицу портов визора в реальном времени. Подозрительное — "
-        "set_hud_state(amber или red, glitch). Команды через execute_bash. "
-        "Не повторяй один скан без причины — комментируй иронией."
+        "Режим: разведка и пентест — nmap, трафик, логи, CVE. Предпочитай навыки "
+        "run_skill(skill_id, reply, args) — для nmap передай args.target. nmap "
+        "выводится на матрицу портов визора. Нестандартное — execute_bash с "
+        "разумными флагами. Не повторяй один скан без причины."
     ),
     IntentCategory.CONVERSATION: (
         "Режим: разговор — вопросы, шутки, философия, объяснения. Инструментов на "

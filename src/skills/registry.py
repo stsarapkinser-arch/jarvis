@@ -1,0 +1,155 @@
+"""Skill Registry — смерть «нейросеть пишет bash на лету».
+
+Архитектурный переворот (ТЗ оператора): LLM больше НЕ придумывает команды.
+Она лишь переводит человеческую речь в строгий ``skill_id`` из заранее
+написанного, протестированного, 100% рабочего каталога навыков. Python ловит
+``skill_id`` и запускает заведомо рабочую функцию (выверенный qdbus6/wpctl/…).
+
+Почему это надёжнее текущего ``execute_bash``:
+  * нет dry-run в песочнице на каждую команду (ShadowExec) — навык уже проверен;
+  * нет heal-цикла (модель не ошибается в синтаксисе — синтаксис захардкожен);
+  * нет эвристики DESTRUCTIVE_RE — автор навыка САМ помечает ``destructive``;
+  * один раунд диалога: ``run_skill(skill_id, reply)`` и говорит, и действует.
+
+``execute_bash`` НЕ удалён — он понижен в ранге до gated-fallback для длинного
+хвоста (см. ``tools.tools_for_category`` и orchestrator). Известный интент →
+детерминированный навык; неизвестный → песочница + подтверждение.
+
+Реестр — чистые данные (каталог) + протокол контекста. Никакого знания о
+конкретных подсистемах Jarvis здесь нет: хендлер получает ``SkillContext``
+(замыкание оркестратора над spawn/run), что держит слой навыков тестируемым.
+"""
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from src.inference.router import IntentCategory
+
+log = logging.getLogger("jarvis.skills")
+
+
+@runtime_checkable
+class SkillContext(Protocol):
+    """Минимальный контракт, который оркестратор даёт хендлеру навыка.
+
+    ``spawn`` — detached-запуск GUI-приложения (konsole/chrome/dolphin): не
+    ждём завершения, возвращаем PID. ``run`` — короткая команда с ожиданием
+    результата (wpctl/brightnessctl/qdbus6): возвращает (rc, stdout, stderr)."""
+
+    async def spawn(self, cmd: str) -> int: ...
+    async def run(self, cmd: str) -> tuple[int | None, str, str]: ...
+
+
+# Хендлер навыка: (контекст, аргументы) -> короткая строка-результат.
+# Для большинства навыков args пуст; строку результата мы пишем в память и
+# (если speaks_result) озвучиваем.
+SkillHandler = Callable[[SkillContext, dict[str, Any]], Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class Skill:
+    """Один навык каталога.
+
+    ``destructive`` — навык требует голосового подтверждения перед запуском
+    (как разрушительный bash). ``speaks_result`` — озвучиваем СТРОКУ-результат
+    хендлера, а не ``reply`` модели (для телеметрии: живые цифры знает только
+    хендлер, модель их выдумала бы)."""
+    id: str
+    category: IntentCategory
+    description: str
+    handler: SkillHandler
+    params: dict[str, Any] = field(default_factory=dict)   # JSON-schema свойств args
+    destructive: bool = False
+    speaks_result: bool = False
+    aliases: tuple[str, ...] = ()
+
+
+_REGISTRY: dict[str, Skill] = {}
+
+
+def register(skill: Skill) -> None:
+    """Зарегистрировать навык. Дубль id — ошибка конфигурации (падаем рано)."""
+    if skill.id in _REGISTRY:
+        raise ValueError(f"duplicate skill id: {skill.id!r}")
+    _REGISTRY[skill.id] = skill
+
+
+def skill(
+    *,
+    id: str,
+    category: IntentCategory,
+    description: str,
+    params: dict[str, Any] | None = None,
+    destructive: bool = False,
+    speaks_result: bool = False,
+    aliases: Sequence[str] = (),
+) -> Callable[[SkillHandler], SkillHandler]:
+    """Декоратор регистрации навыка прямо над его async-хендлером."""
+    def deco(fn: SkillHandler) -> SkillHandler:
+        register(Skill(
+            id=id, category=category, description=description, handler=fn,
+            params=dict(params or {}), destructive=destructive,
+            speaks_result=speaks_result, aliases=tuple(aliases),
+        ))
+        return fn
+    return deco
+
+
+def get(skill_id: str) -> Skill | None:
+    return _REGISTRY.get((skill_id or "").strip())
+
+
+def all_skills() -> tuple[Skill, ...]:
+    return tuple(_REGISTRY.values())
+
+
+def skill_ids() -> list[str]:
+    """Все id в порядке регистрации (стабильно → KV-префикс run_skill не плывёт).
+
+    Порядок детерминирован порядком импорта модулей навыков в ``skills/__init__``
+    и порядком декораторов внутри них."""
+    return list(_REGISTRY.keys())
+
+
+def skills_for(category: IntentCategory | str) -> tuple[Skill, ...]:
+    try:
+        cat = IntentCategory(str(category))
+    except ValueError:
+        return ()
+    return tuple(s for s in _REGISTRY.values() if s.category == cat)
+
+
+def catalog_for(category: IntentCategory | str) -> str:
+    """Человекочитаемый список навыков категории для МИКРО-промпта.
+
+    Грамматика run_skill (enum по ВСЕМ навыкам) гарантирует валидный id; этот
+    каталог даёт модели семантику — какой id под какую фразу. Кладётся в
+    меняющийся хвост системного промпта (не в кэшируемый префикс)."""
+    items = skills_for(category)
+    if not items:
+        return ""
+    lines = [f"  • {s.id}: {s.description}" for s in items]
+    return "Доступные навыки (skill_id):\n" + "\n".join(lines)
+
+
+def reset() -> None:
+    """Только для тестов: очистить реестр."""
+    _REGISTRY.clear()
+
+
+__all__ = [
+    "SkillContext",
+    "SkillHandler",
+    "Skill",
+    "register",
+    "skill",
+    "get",
+    "all_skills",
+    "skill_ids",
+    "skills_for",
+    "catalog_for",
+    "reset",
+]

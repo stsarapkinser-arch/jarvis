@@ -21,3 +21,8 @@ numpy>=1.26
 #   bubblewrap (apt: bubblewrap) → primary sandbox for shadow_exec
 #   podman                       → fallback container sandbox
 #   qdbus / wl-paste / xclip     → clipboard read for Mnemosyne
+#   layer-shell-qt (apt: layer-shell-qt) → Wayland-native HUD (layer-shell).
+#       Если установлен, bootstrap включает QT_WAYLAND_SHELL_INTEGRATION=layer-shell
+#       автоматически; без него HUD стартует прежним путём (без override-redirect).
+#   konsole / dolphin / spectacle / wpctl / brightnessctl / qdbus6 → UI-навыки
+#       (src/skills/ui_control.py). Отсутствующие просто вернут ненулевой rc.

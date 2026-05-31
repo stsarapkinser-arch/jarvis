@@ -55,23 +55,38 @@ def test_internal_monologue_excluded_from_hot_path():
         assert "internal_monologue" not in names, f"{cat} всё ещё тянет internal_monologue"
 
 
-def test_system_ops_has_full_toolset():
-    ops = {s["function"]["name"] for s in t.tools_for_category("SYSTEM_OPS")}
-    assert {"execute_bash", "read_telemetry", "speak_response", "set_hud_state"} <= ops
+def test_action_categories_offer_run_skill_and_bash():
+    """Архитектурный переворот: action-категории дают run_skill (готовые навыки,
+    предпочтительно) + execute_bash (gated-fallback для длинного хвоста)."""
+    ops = [s["function"]["name"] for s in t.tools_for_category("SYSTEM_OPS")]
+    assert ops == ["run_skill", "execute_bash"]
 
 
 def test_action_categories_share_identical_toolset():
-    """Кэш-стабильность: три action-категории дают ИДЕНТИЧНЫЙ набор и порядок
-    инструментов → сервер переиспользует KV-префикс (prefill не пересчитывает
-    tool-схемы на переключении категории)."""
-    ops = [s["function"]["name"] for s in t.tools_for_category("SYSTEM_OPS")]
-    ui = [s["function"]["name"] for s in t.tools_for_category("UI_CONTROL")]
-    pen = [s["function"]["name"] for s in t.tools_for_category("PENTEST_RECON")]
+    """Кэш-стабильность: три action-категории дают ИДЕНТИЧНЫЙ набор инструментов
+    (run_skill с ГЛОБАЛЬНЫМ enum + execute_bash) → сервер переиспользует
+    KV-префикс tool-блока на переключении категории."""
+    ops = t.tools_for_category("SYSTEM_OPS")
+    ui = t.tools_for_category("UI_CONTROL")
+    pen = t.tools_for_category("PENTEST_RECON")
     assert ops == ui == pen, "action-категории должны делить идентичный tool-набор"
 
 
-def test_unknown_category_returns_all_tools():
-    assert len(t.tools_for_category("???")) == len(t.TOOL_SCHEMAS)
+def test_unknown_category_falls_back_to_action_set():
+    names = [s["function"]["name"] for s in t.tools_for_category("???")]
+    assert names == ["run_skill", "execute_bash"]
+
+
+def test_run_skill_enum_matches_registry():
+    """skill_id enum в run_skill = все зарегистрированные навыки."""
+    from src import skills
+    tool = t.tools_for_category("UI_CONTROL")[0]
+    assert tool["function"]["name"] == "run_skill"
+    enum = tool["function"]["parameters"]["properties"]["skill_id"]["enum"]
+    assert set(enum) == set(skills.skill_ids())
+    assert "enable_night_mode" in enum  # пример из ТЗ оператора
+    # required: skill_id + reply (модель обязана и выбрать навык, и ответить).
+    assert set(tool["function"]["parameters"]["required"]) == {"skill_id", "reply"}
 
 
 def test_parse_arguments_robust():
@@ -115,3 +130,19 @@ def test_telemetry_args_fallback():
     assert t.TelemetryArgs.from_dict({"sensor": "cpu"}).sensor == t.TelemetrySensor.CPU
     assert t.TelemetryArgs.from_dict({"sensor": "weird"}).sensor == t.TelemetrySensor.CPU
     assert t.TelemetryArgs.from_dict({"sensor": "pixel_phone"}).sensor == t.TelemetrySensor.PIXEL_PHONE
+
+
+def test_run_skill_args_coercion():
+    a = t.RunSkillArgs.from_dict(
+        {"skill_id": "  open_files  ", "reply": " открываю ", "mood": "IRONIC",
+         "args": {"percent": 30}}
+    )
+    assert a.skill_id == "open_files"
+    assert a.reply == "открываю"
+    assert a.mood == t.SpeakMood.IRONIC
+    assert a.args == {"percent": 30}
+    # мусорные/пропущенные поля → дефолты, args не-объект → пустой dict
+    b = t.RunSkillArgs.from_dict({"skill_id": "x", "mood": "banana", "args": "nope"})
+    assert b.mood == t.SpeakMood.PROFESSIONAL
+    assert b.args == {}
+    assert b.reply == ""

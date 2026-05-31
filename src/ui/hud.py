@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import deque
@@ -48,6 +49,41 @@ from PyQt6.QtWidgets import QApplication, QMainWindow
 log = logging.getLogger("jarvis.hud")
 
 HUD_WINDOW_TITLE = "JarvisHUD"
+
+
+# ───────── Wayland / layer-shell детект ─────────
+# Корень боли HUD на Wayland — флаг BypassWindowManagerHint (X11 override-redirect):
+# композитор Wayland/XWayland обрабатывает его криво (топмост/прозрачность пляшут).
+# Wayland-родной путь — протокол wlr-layer-shell через QtWayland shell-integration
+# плагин `layer-shell` (пакет layer-shell-qt), включаемый переменной
+# QT_WAYLAND_SHELL_INTEGRATION=layer-shell ДО QApplication. Здесь — детекторы;
+# включение делает bootstrap (только если плагин реально на диске — иначе старт
+# HUD не ломаем). Полная настройка слоя (anchors/exclusive zone/overlay) —
+# следующая итерация (B0-спайк на машине оператора).
+def is_wayland() -> bool:
+    """Сессия Wayland? (по XDG_SESSION_TYPE или наличию WAYLAND_DISPLAY)."""
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def layer_shell_available() -> bool:
+    """Установлен ли QtWayland shell-integration плагин layer-shell?
+
+    Проверяем наличие .so в каталоге плагинов Qt. Без этого выставлять
+    QT_WAYLAND_SHELL_INTEGRATION=layer-shell опасно — Qt не найдёт интеграцию и
+    HUD не стартует. Поэтому включаем layer-shell только при подтверждённом плагине."""
+    try:
+        from PyQt6.QtCore import QLibraryInfo
+        base = QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    except Exception:
+        return False
+    plugin_dir = os.path.join(base, "wayland-shell-integration")
+    try:
+        return any("layer" in name.lower() for name in os.listdir(plugin_dir))
+    except OSError:
+        return False
 
 # ───────── Frame palette (цвет состояний рамки/сферы) ─────────
 # Мягкая, ненасильственная палитра — без агрессивного красного.
@@ -123,14 +159,20 @@ class JarvisHUD(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAutoFillBackground(False)
 
-        self.setWindowFlags(
+        flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
             | Qt.WindowType.WindowTransparentForInput
-            | Qt.WindowType.BypassWindowManagerHint
         )
+        # BypassWindowManagerHint (X11 override-redirect) — ТОЛЬКО под X11.
+        # Под Wayland он и есть корень плясок с топмостом/прозрачностью; там
+        # стекинг обеспечивает layer-shell (если плагин включён в bootstrap) или
+        # обычный WindowStaysOnTopHint как мягкий fallback.
+        if not is_wayland():
+            flags |= Qt.WindowType.BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setWindowTitle(HUD_WINDOW_TITLE)
 
         # ─── Сигналы → главный Qt-тред (все Cross-thread издатели делают .emit) ───

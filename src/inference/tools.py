@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
 
@@ -55,6 +55,7 @@ class ToolName(StrEnum):
     SET_HUD_STATE = "set_hud_state"
     READ_TELEMETRY = "read_telemetry"
     EXECUTE_BASH = "execute_bash"
+    RUN_SKILL = "run_skill"
 
 
 # ─────────────────────────── JSON Schemas (OpenAI Tool-Use) ───────────────────
@@ -203,44 +204,82 @@ TOOLS_BY_NAME: Final[dict[str, dict[str, Any]]] = {
 }
 
 
+# ─────────────────────────── run_skill (Skill Registry) ───────────────────────
+# Архитектурный переворот: модель НЕ пишет bash на лету. Она выбирает skill_id
+# из заранее написанного каталога (см. src/skills) — grammar-enum физически не
+# даёт выдумать несуществующий навык. reply встроен в тот же вызов → модель и
+# говорит, и действует за ОДИН раунд (критично на N100, декод ~1 т/с). execute_bash
+# остаётся как gated-fallback для длинного хвоста (того, чего нет в каталоге).
+def build_run_skill_schema(skill_ids: list[str]) -> dict[str, Any]:
+    """Собрать схему run_skill с enum по ПЕРЕДАННЫМ id навыков.
+
+    enum — по ВСЕМ навыкам (а не по категории), поэтому схема инструмента
+    идентична между action-категориями → llama-server переиспользует KV-префикс
+    tool-блока. Семантику (какой id под какую фразу) даёт каталог в микро-промпте."""
+    return {
+        "type": "function",
+        "function": {
+            "name": ToolName.RUN_SKILL.value,
+            "description": (
+                "Выполнить ГОТОВЫЙ навык по skill_id (предпочтительный путь). "
+                "Выбери skill_id из списка навыков в промпте; заполни reply — "
+                "короткую фразу вслух оператору. args обычно пуст."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "enum": list(skill_ids),
+                        "description": "Идентификатор навыка из каталога.",
+                    },
+                    "reply": {
+                        "type": "string",
+                        "description": "Короткая фраза вслух, без markdown. «сэр».",
+                    },
+                    "mood": {
+                        "type": "string",
+                        "enum": [m.value for m in SpeakMood],
+                        "description": "professional / alert / ironic (опц.).",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": "Параметры навыка, если требуются (обычно пусто).",
+                    },
+                },
+                "required": ["skill_id", "reply"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 # ─────────────────────────── Tool-subset на категорию ─────────────────────────
 # Семантический маршрутизатор отдаёт модели ТОЛЬКО релевантные инструменты.
-# CONVERSATION намеренно лишён execute_bash — чистый разговор не должен иметь
-# возможности случайно тронуть систему (это бесплатное свойство безопасности).
 #
-# internal_monologue НЕ входит в боевые подмножества: на N100 (декод ~1 т/с)
-# отдельный tool-вызов «подумать» — это лишний раунд диалога (модель думает →
-# мы логируем → модель продолжает), удваивающий латентность. Модель прекрасно
-# рассуждает «про себя» и без отдельного инструмента. Схема сохранена (на случай
-# мощного железа), но в горячий путь не попадает.
-_COMMON = (
-    ToolName.SPEAK_RESPONSE.value,
-    ToolName.SET_HUD_STATE.value,
-)
-# Три action-категории делят ИДЕНТИЧНЫЙ набор (и порядок) инструментов. Это
-# даёт серверу стабильный KV-префикс [tools + core] между запросами → prefill
-# не пересчитывает ~500 токенов tool-схем на каждом переключении категории
-# (в логах было sim_best=0.18 → полный prefill ~40с; теперь меняется только
-# короткий хвост правил категории). CONVERSATION держим отдельно и БЕЗ
-# execute_bash — чистый разговор не должен иметь доступа к системе.
-_ACTION = _COMMON + (ToolName.READ_TELEMETRY.value, ToolName.EXECUTE_BASH.value)
-_CATEGORY_TOOLS: Final[dict[str, tuple[str, ...]]] = {
-    "SYSTEM_OPS": _ACTION,
-    "UI_CONTROL": _ACTION,
-    "PENTEST_RECON": _ACTION,
-    "CONVERSATION": _COMMON,
-}
-
-
+# Action-категории (SYSTEM_OPS/UI_CONTROL/PENTEST_RECON) получают [run_skill,
+# execute_bash]: сперва пытаемся попасть в готовый навык, иначе — bash под
+# гейтом (ShadowExec + подтверждение). Набор ИДЕНТИЧЕН между ними (run_skill
+# с глобальным enum + execute_bash) → стабильный KV-префикс tool-блока.
+#
+# CONVERSATION намеренно БЕЗ системного доступа — только речь и визор (это
+# бесплатное свойство безопасности: чистый разговор не тронет систему).
+#
+# internal_monologue НЕ входит в боевые подмножества: на N100 отдельный
+# tool-вызов «подумать» — лишний раунд диалога. Схема сохранена, в горячий путь
+# не попадает.
 def tools_for_category(category: str) -> list[dict[str, Any]]:
     """Вернуть подмножество JSON-схем для категории интента.
 
-    Принимает как строку, так и StrEnum (router.IntentCategory) — у StrEnum
-    ``str(value)`` совпадает со значением. Неизвестная категория → полный набор."""
-    names = _CATEGORY_TOOLS.get(str(category))
-    if names is None:
-        return list(TOOL_SCHEMAS)
-    return [TOOLS_BY_NAME[n] for n in names]
+    Принимает строку или StrEnum (router.IntentCategory). CONVERSATION →
+    речь+визор. Любая другая (включая неизвестную) → run_skill + execute_bash."""
+    # Ленивый импорт реестра: tools импортируется очень рано (openai_client),
+    # а skills тянет router/event_bus — держим зависимость на отложенном пути.
+    from src.skills import skill_ids
+
+    if str(category) == "CONVERSATION":
+        return [_SPEAK_RESPONSE_SCHEMA, _SET_HUD_STATE_SCHEMA]
+    return [build_run_skill_schema(skill_ids()), _EXECUTE_BASH_SCHEMA]
 
 
 # ─────────────────────────── Типизированные аргументы ─────────────────────────
@@ -361,6 +400,29 @@ class ExecuteBashArgs:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RunSkillArgs:
+    skill_id: str
+    reply: str = ""
+    mood: SpeakMood = SpeakMood.PROFESSIONAL
+    args: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RunSkillArgs:
+        raw_mood = _coerce_str(d.get("mood"), SpeakMood.PROFESSIONAL.value).lower()
+        try:
+            mood = SpeakMood(raw_mood)
+        except ValueError:
+            mood = SpeakMood.PROFESSIONAL
+        inner = d.get("args")
+        return cls(
+            skill_id=_coerce_str(d.get("skill_id")).strip(),
+            reply=_coerce_str(d.get("reply")).strip(),
+            mood=mood,
+            args=inner if isinstance(inner, dict) else {},
+        )
+
+
 __all__ = [
     "SpeakMood",
     "HudAnimation",
@@ -369,10 +431,12 @@ __all__ = [
     "TOOL_SCHEMAS",
     "TOOLS_BY_NAME",
     "tools_for_category",
+    "build_run_skill_schema",
     "parse_arguments",
     "MonologueArgs",
     "SpeakArgs",
     "HudArgs",
     "TelemetryArgs",
     "ExecuteBashArgs",
+    "RunSkillArgs",
 ]

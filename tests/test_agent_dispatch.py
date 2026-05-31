@@ -140,6 +140,131 @@ def test_unknown_tool_is_handled_gracefully():
     assert "unknown tool" in res.content
 
 
+# ───────────────────────── run_skill (Skill Registry) ─────────────────────────
+def _fake_skill(**kw):
+    from src.skills.registry import Skill
+    defaults = dict(
+        id="open_files", category=IntentCategory.UI_CONTROL,
+        description="открыть файлы", handler=None,
+    )
+    defaults.update(kw)
+    return Skill(**defaults)
+
+
+def test_run_skill_speaks_reply_and_executes():
+    """run_skill: говорит reply модели И зовёт хендлер за один терминальный вызов."""
+    j = _make_jarvis()
+    spoken: list = []
+    j.say = lambda text, tone=None, *a, **kw: spoken.append((text, tone))
+
+    async def _noop(ev):
+        return None
+
+    j.bus.publish = _noop  # type: ignore[assignment]
+    ran: list = []
+
+    async def handler(ctx, args):
+        ran.append(args)
+        return "executed"
+
+    fake = _fake_skill(handler=handler)
+    st = _state()
+    with patch("src.core.orchestrator.skills.get", return_value=fake):
+        res = asyncio.run(j._dispatch_tool(
+            _call("run_skill", {"skill_id": "open_files", "reply": "Открываю, сэр",
+                                "mood": "professional"}),
+            "открой файлы", {}, st,
+        ))
+    assert ("Открываю, сэр", "normal") in spoken
+    assert ran == [{}]
+    assert st.spoke is True
+    assert res.stop is True
+
+
+def test_run_skill_speaks_result_for_telemetry():
+    """speaks_result навык озвучивает СВОЙ результат (живые цифры), а не reply."""
+    j = _make_jarvis()
+    spoken: list = []
+    j.say = lambda text, tone=None, *a, **kw: spoken.append(text)
+
+    async def _noop(ev):
+        return None
+
+    j.bus.publish = _noop  # type: ignore[assignment]
+
+    async def handler(ctx, args):
+        return "Процессор загружен на 50 процентов."
+
+    fake = _fake_skill(id="report_cpu", category=IntentCategory.SYSTEM_OPS,
+                       handler=handler, speaks_result=True)
+    st = _state()
+    with patch("src.core.orchestrator.skills.get", return_value=fake):
+        asyncio.run(j._dispatch_tool(
+            _call("run_skill", {"skill_id": "report_cpu", "reply": "сейчас гляну"}),
+            "нагрузка", {}, st,
+        ))
+    assert any("50 процентов" in s for s in spoken)
+    assert "сейчас гляну" not in spoken  # reply модели проигнорирован — данные у хендлера
+
+
+def test_run_skill_destructive_queues_confirmation():
+    """Разрушительный навык не исполняется сразу — уходит на подтверждение."""
+    j = _make_jarvis()
+    j.say = lambda *a, **kw: None
+    ran: list = []
+
+    async def handler(ctx, args):
+        ran.append(args)
+        return "ran"
+
+    fake = _fake_skill(id="wipe", category=IntentCategory.SYSTEM_OPS,
+                       handler=handler, destructive=True)
+    st = _state()
+    with patch("src.core.orchestrator.skills.get", return_value=fake):
+        res = asyncio.run(j._dispatch_tool(
+            _call("run_skill", {"skill_id": "wipe", "reply": "r"}), "intent", {}, st,
+        ))
+    assert res.stop is True
+    assert ran == [], "разрушительный навык не должен исполниться до подтверждения"
+    assert j._pending_skill is not None
+    assert j._pending_skill["skill"].id == "wipe"
+
+
+def test_run_skill_unknown_is_graceful():
+    j = _make_jarvis()
+    spoken: list = []
+    j.say = lambda text, tone=None, *a, **kw: spoken.append(text)
+    st = _state()
+    with patch("src.core.orchestrator.skills.get", return_value=None):
+        res = asyncio.run(j._dispatch_tool(
+            _call("run_skill", {"skill_id": "nope", "reply": "ладно"}), "intent", {}, st,
+        ))
+    assert res.stop is True
+    assert "unknown skill" in res.content
+    assert spoken == ["ладно"]  # озвучили reply модели как graceful-degrade
+
+
+def test_skill_confirmation_runs_handler_on_yes():
+    """Подтверждение разрушительного навыка («да») переисполняет хендлер."""
+    j = _make_jarvis()
+    j.say = lambda *a, **kw: None
+    ran: list = []
+
+    async def handler(ctx, args):
+        ran.append(args)
+        return "done"
+
+    fake = _fake_skill(id="wipe", category=IntentCategory.SYSTEM_OPS,
+                       handler=handler, destructive=True)
+    j._pending_skill = {
+        "skill": fake, "args": {"a": 1}, "intent": "intent", "snap": {}, "ts": 9e18,
+    }
+    handled = asyncio.run(j._try_resolve_skill("да, подтверждаю"))
+    assert handled is True
+    assert ran == [{"a": 1}]
+    assert j._pending_skill is None
+
+
 def test_warmup_sends_tiny_request_with_tools():
     """Прогрев должен слать один крошечный запрос С tools (греет реальный
     префикс + компилирует Vulkan-шейдеры), max_tokens мал."""

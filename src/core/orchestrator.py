@@ -44,6 +44,7 @@ from src.inference.openai_client import (
 from src.inference.router import IntentCategory, IntentRouter
 from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
+from src import skills
 
 log = logging.getLogger("jarvis.core")
 
@@ -211,6 +212,26 @@ class _IntentState:
     run: AgentRun | None = None
 
 
+class _SkillCtx:
+    """SkillContext-реализация: даёт хендлерам навыков доступ к запуску команд.
+
+    ``spawn`` — detached GUI-приложение (не ждём), ``run`` — короткая команда с
+    ожиданием результата (через тот же конвейер ``_run``, что маршрутизирует
+    nmap на матрицу портов визора). Навыки остаются развязаны с остальным
+    оркестратором — только эти два метода."""
+
+    __slots__ = ("_jarvis",)
+
+    def __init__(self, jarvis: Jarvis) -> None:
+        self._jarvis = jarvis
+
+    async def spawn(self, cmd: str) -> int:
+        return await self._jarvis._run_background(cmd)
+
+    async def run(self, cmd: str) -> tuple[int | None, str, str]:
+        return await self._jarvis._run(cmd)
+
+
 class _LlamaCompletionAdapter:
     """Совместимый shim под ollama.AsyncClient API surface.
 
@@ -274,6 +295,11 @@ class Jarvis(metaclass=Singleton):
 
         self._pending_confirmation: dict | None = None
         self._pending_shadow: dict | None = None
+        # Подтверждение разрушительного НАВЫКА (destructive skill) — отдельная
+        # очередь от bash-подтверждения: на «да» переисполняем хендлер, а не bash.
+        self._pending_skill: dict | None = None
+        # Контекст для хендлеров навыков (spawn/run поверх этого оркестратора).
+        self._skill_ctx = _SkillCtx(self)
         self._state_label: str = "IDLE"
         self._last_error_window_hint: str = ""
 
@@ -661,6 +687,10 @@ class Jarvis(metaclass=Singleton):
             reading = self._read_sensor(tel.sensor)
             return ToolResult(call.id, reading)
 
+        if name == tooldefs.ToolName.RUN_SKILL:
+            rs = tooldefs.RunSkillArgs.from_dict(call.arguments)
+            return await self._run_skill(call.id, rs, intent, snap, st)
+
         if name == tooldefs.ToolName.EXECUTE_BASH:
             ba = tooldefs.ExecuteBashArgs.from_dict(call.arguments)
             st.bash_commands.append(ba.command)
@@ -671,6 +701,64 @@ class Jarvis(metaclass=Singleton):
         log.warning("unknown tool call: %s", name)
         return ToolResult(call.id, f"unknown tool {name}")
 
+    async def _run_skill(
+        self,
+        call_id: str,
+        rs: tooldefs.RunSkillArgs,
+        intent: str,
+        snap: StateSnapshot | dict | None,
+        st: _IntentState,
+    ) -> ToolResult:
+        """Исполнить готовый навык из каталога (run_skill).
+
+        Терминален: навык — это «одно действие + одна фраза», продолжать диалог
+        в этом интенте незачем. Разрушительный навык уходит на голосовое
+        подтверждение (как разрушительный bash), исполнение откладывается."""
+        sk = skills.get(rs.skill_id)
+        tone = self._tone_for_mood(rs.mood)
+        if sk is None:
+            log.warning("unknown skill_id: %r", rs.skill_id)
+            self.say(rs.reply or "Не нашёл такого навыка, сэр.", tone=tone)
+            st.spoke = True
+            return ToolResult(call_id, f"unknown skill {rs.skill_id}", stop=True)
+
+        # Разрушительный навык: автор пометил destructive=True → подтверждение.
+        # Не дублируем эвристику DESTRUCTIVE_RE — доверяем декларации навыка.
+        if sk.destructive:
+            self._pending_skill = {
+                "skill": sk, "args": rs.args, "intent": intent,
+                "snap": snap, "ts": time.time(),
+            }
+            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
+            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            return ToolResult(call_id, "awaiting confirmation", stop=True)
+
+        result = await self._invoke_skill(sk, rs.args)
+
+        # Речь: телеметрия озвучивает СВОЙ результат (живые цифры), остальные —
+        # reply модели. reply играем ДО действия (фраза параллельна команде),
+        # speaks_result — ПОСЛЕ (нужны данные хендлера). Здесь хендлер уже
+        # отработал, поэтому говорим по факту.
+        spoken_text = result if sk.speaks_result else rs.reply
+        if spoken_text.strip():
+            self.say(spoken_text.strip(), tone=tone)
+            st.spoke = True
+            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken_text.strip()))
+
+        st.last_result = result
+        await asyncio.to_thread(
+            self.memory.remember, intent, f"skill:{sk.id}", result, "agent_skill", snap,
+        )
+        return ToolResult(call_id, result or "ok", stop=True)
+
+    async def _invoke_skill(self, sk: skills.Skill, args: dict[str, Any]) -> str:
+        """Вызвать хендлер навыка, проглотив исключение в короткий результат."""
+        try:
+            return await sk.handler(self._skill_ctx, args)
+        except Exception:
+            log.exception("skill %s handler failed", sk.id)
+            return "error: навык дал сбой"
+
     async def _run_agent_for_intent(
         self,
         user_text: str,
@@ -680,6 +768,11 @@ class Jarvis(metaclass=Singleton):
         """Маршрутизация → микро-промпт + tools → агентный цикл с tool-dispatch."""
         decision = self.router.route(user_text)
         system_prompt = self.router.system_prompt_for(decision.category)
+        # Каталог навыков категории кладём в МЕНЯЮЩИЙСЯ хвост промпта (не в
+        # кэшируемый core-префикс): даёт модели семантику skill_id под фразу.
+        catalog = skills.catalog_for(decision.category)
+        if catalog:
+            system_prompt = f"{system_prompt}\n\n{catalog}"
         tools = tooldefs.tools_for_category(decision.category)
         temperature = _CATEGORY_TEMPERATURE.get(decision.category, 0.2)
         log.info(
@@ -816,6 +909,42 @@ class Jarvis(metaclass=Singleton):
 
         return False
 
+    async def _try_resolve_skill(self, text: str) -> bool:
+        """Если ожидается подтверждение разрушительного навыка и ``text`` —
+        да/нет, разрешить его. Возвращает True, когда ветка поглотила интент."""
+        pending = self._pending_skill
+        if not pending:
+            return False
+        if time.time() - pending["ts"] > CONFIRMATION_TIMEOUT_SEC:
+            self._pending_skill = None
+            self.say("Окно подтверждения истекло.", tone="alert")
+            return False
+
+        if NEGATIVE_RE.search(text):
+            self._pending_skill = None
+            await self._state("IDLE", "")
+            self.say(self.ack("cancel"))
+            return True
+
+        if AFFIRMATIVE_RE.search(text):
+            sk = pending["skill"]
+            args = pending["args"]
+            snap = pending["snap"]
+            intent = pending["intent"]
+            self._pending_skill = None
+            await self._state("THINKING", f"skill {sk.id}")
+            self.say(self.ack("confirm"))
+            result = await self._invoke_skill(sk, args)
+            if sk.speaks_result and result.strip():
+                self.say(result.strip())
+            await asyncio.to_thread(
+                self.memory.remember, intent, f"skill:{sk.id}", result, "skill_confirmed", snap,
+            )
+            await self._state("IDLE", "")
+            return True
+
+        return False
+
     async def _execute_with_healing(
         self,
         bash: str,
@@ -924,6 +1053,8 @@ class Jarvis(metaclass=Singleton):
             return "[shadow_resolved]"
         if await self._try_resolve_confirmation(text):
             return "[confirmation_handled]"
+        if await self._try_resolve_skill(text):
+            return "[skill_resolved]"
 
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор
