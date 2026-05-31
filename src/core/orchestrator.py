@@ -930,6 +930,47 @@ class Jarvis(metaclass=Singleton):
             return await self._run_fastpath_skill(sk, text, {}, source="fuzzy")
         return False
 
+    @staticmethod
+    def _init_semantic_matcher():
+        """Создать SemanticSkillMatcher, если включён JARVIS_SEMANTIC_MATCH=1.
+
+        Возвращает None при выключенном флаге или сбое (нет httpx и т.п.) —
+        матчер строго опционален. EmbeddingClient ленив (сети при создании нет),
+        так что конструктор безопасен даже при лежащем embed-сервере."""
+        if os.getenv("JARVIS_SEMANTIC_MATCH", "0") != "1":
+            return None
+        try:
+            from src.inference.embeddings import EmbeddingClient
+            from src.inference.semantic import SemanticSkillMatcher
+            matcher = SemanticSkillMatcher(EmbeddingClient().embed)
+            log.info("L2 semantic matcher включён (порог %.2f)", matcher.threshold)
+            return matcher
+        except Exception:
+            log.exception("L2 semantic matcher: инициализация не удалась — выключен")
+            return None
+
+    async def _try_semantic_fastpath(self, text: str) -> bool:
+        """L2: семантический матч навыка через эмбеддинги, минуя 3B. Последняя
+        ступень перед агентом: ловит парафраз без строкового сходства («запусти
+        браузер» → open_browser). Дороже строковых слоёв (HTTP+CPU на embed), но
+        на порядки дешевле 3B — поэтому только когда L0/L1/L1a/L1b промахнулись.
+
+        Выключен (matcher=None) → no-op. Эмбеддинг синхронный → в тред, чтобы не
+        морозить event-loop. Гарды (порог/зазор, исключение разрушительных и
+        параметрических) живут в матчере; здесь только диспетчеризация."""
+        if self._semantic is None:
+            return False
+        sid = await asyncio.to_thread(self._semantic.match, text)
+        if not sid:
+            return False
+        sk = skills.get(sid)
+        if sk is None or sk.destructive or sk.params:
+            # Матчер не должен такое отдавать (в индексе их нет), но страхуемся:
+            # семантическая догадка не запускает разрушительное/слот-зависимое.
+            return False
+        log.info("semantic fast-path: %r → skill=%s", text[:60], sk.id)
+        return await self._run_fastpath_skill(sk, text, {}, source="semantic")
+
     async def _run_agent_for_intent(
         self,
         user_text: str,
@@ -1366,6 +1407,12 @@ class Jarvis(metaclass=Singleton):
         # 3B перед дорогим агентным циклом.
         if await self._try_fuzzy_fastpath(text):
             return "[fuzzy_fastpath]"
+
+        # Semantic fast-path (L2): парафраз без строкового сходства спасается
+        # ближайшим по смыслу навыком через эмбеддинги (если включён и
+        # откалиброван). Последняя ступень перед дорогим агентным циклом.
+        if await self._try_semantic_fastpath(text):
+            return "[semantic_fastpath]"
 
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор
