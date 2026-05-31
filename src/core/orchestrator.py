@@ -44,6 +44,7 @@ from src.inference.router import IntentCategory, IntentRouter
 from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
+from src.skills import macros
 from src.skills.learning import Candidate, SkillLearner
 from src.skills.healing import SkillHealer, first_binary
 from src.core.volition import ProactiveGate
@@ -779,6 +780,46 @@ class Jarvis(metaclass=Singleton):
             log.exception("skill %s handler failed", sk.id)
             return "error: навык дал сбой"
 
+    async def _try_macro(self, text: str) -> bool:
+        """Точная фраза-сценарий → последовательность навыков, минуя 3B.
+
+        Композиция уже выверенных навыков под одну команду («рабочее место
+        пентеста», «режим фокуса»). Детерминирована; разрушительные шаги
+        пропускаются (двойная защита — макросы их и так не содержат)."""
+        macro = macros.match_macro(text)
+        if macro is None:
+            return False
+        log.info("macro: %r → %s (%d шагов)", text[:60], macro.id, len(macro.steps))
+        snap = await asyncio.to_thread(snapshot)
+        await self._state("THINKING", macro.id)
+        if macro.reply.strip():
+            self.say(macro.reply.strip())
+
+        spoken_results: list[str] = []
+        for skill_id, args in macro.steps:
+            sk = skills.get(skill_id)
+            if sk is None:
+                log.warning("macro %s: неизвестный навык %s — пропуск", macro.id, skill_id)
+                continue
+            if sk.destructive:
+                log.warning("macro %s: разрушительный навык %s — пропуск", macro.id, skill_id)
+                continue
+            result = await self._invoke_skill(sk, dict(args))
+            if sk.speaks_result and result.strip():
+                spoken_results.append(result.strip())
+
+        # Телеметрию шагов (speaks_result) собираем в один краткий брифинг.
+        summary = " ".join(spoken_results)
+        if summary:
+            self.say(summary)
+            await self.bus.publish(Event(EventType.TOKEN_STREAM, summary))
+        await asyncio.to_thread(
+            self.memory.remember, text, f"macro:{macro.id}", summary or "ok", "macro", snap,
+        )
+        self._record_turn(text, summary or macro.reply or self.ack("ok"))
+        await self._state("IDLE", "")
+        return True
+
     async def _try_alias_fastpath(self, text: str) -> bool:
         """Точная фраза-алиас → прямой детерминированный вызов навыка, минуя
         маршрутизатор и 3B. Главный рычаг латентности на N100: бытовые команды
@@ -1232,6 +1273,11 @@ class Jarvis(metaclass=Singleton):
             return "[skill_resolved]"
         if await self._try_resolve_learn(text):
             return "[learn_resolved]"
+
+        # Макрос-сценарий: точная фраза → последовательность навыков (выше
+        # alias fast-path — это композиция, а не одиночный навык).
+        if await self._try_macro(text):
+            return "[macro]"
 
         # Alias fast-path: точная фраза-команда → навык напрямую, без 3B.
         # Стоит ПОСЛЕ резолв-гейтов (чтобы «да/нет» подтверждения не перехватить)

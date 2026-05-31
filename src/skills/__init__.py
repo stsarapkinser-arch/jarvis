@@ -34,6 +34,9 @@ from src.skills import screen as _screen          # noqa: E402,F401
 # Импорт последним — id выученных навыков идут в хвост enum, не сдвигая
 # стабильный префикс встроенного каталога (KV-кэш run_skill не плывёт).
 from src.skills import learned as _learned        # noqa: E402,F401
+# Макросы/сценарии (композиция навыков). Импорт последним — ссылаются на
+# skill_id, уже зарегистрированные выше.
+from src.skills import macros as _macros           # noqa: E402,F401
 
 __all__ = [
     "Skill",

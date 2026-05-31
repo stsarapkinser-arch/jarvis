@@ -80,10 +80,16 @@ _WS_RE = re.compile(r"\s+")
 _EDGE_PUNCT = " .,!?;:…\"'«»()[]-—–"
 
 
-def _normalize_phrase(text: str) -> str:
+def normalize_phrase(text: str) -> str:
+    """Нормализация фразы для матчинга алиасов/макросов: регистр, ё→е, пробелы,
+    крайняя пунктуация. Публична — переиспользуется реестром макросов."""
     s = (text or "").strip().lower().replace("ё", "е")
     s = _WS_RE.sub(" ", s)
     return s.strip(_EDGE_PUNCT)
+
+
+# Внутренний алиас для краткости в этом модуле.
+_normalize_phrase = normalize_phrase
 
 
 def register(skill: Skill) -> None:
@@ -193,6 +199,7 @@ __all__ = [
     "skill",
     "get",
     "match_alias",
+    "normalize_phrase",
     "all_skills",
     "skill_ids",
     "skills_for",

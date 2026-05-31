@@ -80,7 +80,10 @@ class LlamaServerEmbedding(EmbeddingFunction):
         self.endpoint = self._client.endpoint
         self.model = self._client.model
 
-    def name(self) -> str:
+    @staticmethod
+    def name() -> str:
+        # staticmethod: chroma зовёт name() и на инстансе, и на классе (legacy
+        # config-путь) — так работают оба без предупреждений.
         return "jarvis-llama-embed"
 
     # get_config/build_from_config — контракт сериализации Chroma (forward-compat,
