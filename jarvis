@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# jarvis — единая точка входа. Одной командой проверить, починить и запустить.
+#
+#   jarvis run        поднять серверы и запустить ассистента (с авто-починкой)
+#   jarvis test       полная диагностика: компоненты, серверы, память (read-only)
+#   jarvis setup      установить/докачать всё, чего не хватает
+#   jarvis help       список всех команд (на русском)
+#
+# Скрипт — диспетчер: тяжёлую работу делегирует идемпотентным
+# setup_server.sh / setup_embed_server.sh / scripts/install_service.sh,
+# а сам отвечает за единый UX, локализацию и сквозную проверку.
+#
+# Намеренно НЕ используем `set -e`: диагностика должна пройти до конца и
+# собрать все проблемы, а не падать на первой. Критичные сбои в run/setup
+# обрабатываются явными проверками и кодами возврата.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# ───────────────────────── палитра и примитивы ─────────────────────────
+if [ -t 1 ]; then
+    C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+    C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[1;33m'
+    C_CYAN=$'\033[1;36m'; C_BLUE=$'\033[0;34m'
+else
+    C_RESET=''; C_DIM=''; C_BOLD=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''; C_BLUE=''
+fi
+
+# Счётчики для итогового вердикта диагностики.
+N_OK=0; N_WARN=0; N_CRIT=0
+
+hdr()  { printf '\n%s%s%s\n' "$C_CYAN$C_BOLD" "$*" "$C_RESET"; }
+ok()   { N_OK=$((N_OK+1));   printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { N_WARN=$((N_WARN+1)); printf '  %s⚠%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+crit() { N_CRIT=$((N_CRIT+1)); printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; }
+note() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+step() { printf '\n%s→ %s%s\n' "$C_BLUE$C_BOLD" "$*" "$C_RESET"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ───────────────────────── константы окружения ─────────────────────────
+SERVER_BIN="$REPO_ROOT/llama.cpp/build/bin/llama-server"
+CHAT_MODEL="$REPO_ROOT/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+EMBED_DIR="$REPO_ROOT/models/embed"
+VOSK_MODEL="$REPO_ROOT/model"
+PIPER_BIN="$REPO_ROOT/piper/piper"
+PIPER_VOICE="$REPO_ROOT/piper/ru_RU-dmitry-medium.onnx"
+PIPER_CFG="$REPO_ROOT/piper/ru_RU-dmitry-medium.json"
+MEMORY_DIR="$REPO_ROOT/jarvis_memory"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+CHAT_ENDPOINT="${JARVIS_LLM_ENDPOINT:-http://127.0.0.1:8080}"
+EMBED_ENDPOINT="${JARVIS_EMBED_ENDPOINT:-http://127.0.0.1:8090}"
+EMBED_MODEL_ALIAS="${JARVIS_EMBED_MODEL:-multilingual-e5-small}"
+
+# venv: тот же поиск, что в start_jarvis.sh (без realpath — иначе venv не активен).
+venv_python() {
+    if [ -f "$REPO_ROOT/.venv/bin/python" ]; then echo "$REPO_ROOT/.venv/bin/python"
+    elif [ -f "$REPO_ROOT/venv/bin/python" ]; then echo "$REPO_ROOT/venv/bin/python"
+    else echo ""; fi
+}
+
+# systemctl --user доступен? (на dev-машине/без user-сессии — нет; деградируем).
+have_systemd() { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
+
+# curl/wget с молчаливым GET.
+http_get() {
+    if have curl; then curl -fsS --max-time "${2:-4}" "$1" 2>/dev/null
+    elif have wget; then wget -q -T "${2:-4}" -O - "$1" 2>/dev/null
+    else return 2; fi
+}
+
+# ───────────────── карта внешних инструментов → apt-пакет ─────────────────
+# Формат: "бинарь:apt-пакет:класс". класс = build|core|opt.
+#   build — нужно для сборки llama-server (только setup)
+#   core  — без него заметно деградирует ядро
+#   opt   — навык изящно отключается, не критично
+TOOLS=(
+    "git:git:build"
+    "cmake:cmake:build"
+    "cc:build-essential:build"
+    "glslc:glslc:build"
+    "vulkaninfo:vulkan-tools:build"
+    "python3:python3:core"
+    "sox:sox:core"
+    "aplay:alsa-utils:core"
+    "tesseract:tesseract-ocr:opt"
+    "grim:grim:opt"
+    "wmctrl:wmctrl:opt"
+    "notify-send:libnotify-bin:opt"
+    "playerctl:playerctl:opt"
+    "wpctl:wireplumber:opt"
+    "brightnessctl:brightnessctl:opt"
+    "nmap:nmap:opt"
+    "firejail:firejail:opt"
+    "bwrap:bubblewrap:opt"
+    "aria2c:aria2:opt"
+    "curl:curl:core"
+)
+
+# Python-зависимости (импорт → пакет для сообщения).
+PYDEPS=(
+    "httpx" "chromadb" "vosk" "sounddevice" "PyQt6" "qasync"
+    "psutil" "dbus_next" "numpy"
+)
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis help
+# ════════════════════════════════════════════════════════════════════════
+cmd_help() {
+    cat <<EOF
+${C_CYAN}${C_BOLD}JARVIS — управление одной командой${C_RESET}
+
+${C_BOLD}ИСПОЛЬЗОВАНИЕ${C_RESET}
+    jarvis <команда>
+
+${C_BOLD}ОСНОВНОЕ${C_RESET}
+    ${C_GREEN}run${C_RESET}            Запустить ассистента: поднять оба сервера,
+                   при нехватке компонентов — авто-починка, затем foreground.
+    ${C_GREEN}test${C_RESET}           Полная диагностика без изменений: компоненты,
+                   серверы, GPU-оффлоад, память, голос, инструменты.
+    ${C_GREEN}setup${C_RESET}          Установить/докачать ВСЁ, чего нет: venv и
+                   зависимости, пакеты системы, сборка сервера, модели,
+                   systemd-юниты, глобальный симлинк \`jarvis\`.
+
+${C_BOLD}УПРАВЛЕНИЕ${C_RESET}
+    status         Состояние трёх сервисов (мозг / память / ассистент).
+    stop           Остановить ассистента и оба сервера.
+    restart        Перезапустить ассистента.
+    logs [имя]     Логи в реальном времени (jarvis | llm | embed).
+
+${C_BOLD}ОБСЛУЖИВАНИЕ${C_RESET}
+    wipe-memory    Стереть базу памяти (нужно при смене embedding-модели:
+                   меняется размерность вектора → старая база несовместима).
+    help           Эта справка.
+
+${C_BOLD}ПРИМЕРЫ${C_RESET}
+    jarvis setup        ${C_DIM}# первый раз на чистой машине${C_RESET}
+    jarvis test         ${C_DIM}# убедиться, что всё на месте${C_RESET}
+    jarvis run          ${C_DIM}# рабочий запуск${C_RESET}
+    jarvis logs llm     ${C_DIM}# смотреть лог мозга${C_RESET}
+
+${C_BOLD}ПЕРЕМЕННЫЕ${C_RESET} (необязательные)
+    JARVIS_LLM_ENDPOINT     (умолч. http://127.0.0.1:8080)
+    JARVIS_EMBED_ENDPOINT   (умолч. http://127.0.0.1:8090)
+    JARVIS_EMBED_MODEL      (умолч. multilingual-e5-small)
+    JARVIS_SCREEN_WATCH     1=следить за экраном, 0=выключить
+    SKIP_BUILD=1            пропустить компиляцию сервера в setup
+EOF
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis test — read-only диагностика
+# ════════════════════════════════════════════════════════════════════════
+check_python() {
+    hdr "[1] Python-окружение"
+    local py; py="$(venv_python)"
+    if [ -z "$py" ]; then
+        crit "venv не найден (.venv/ или venv/) — \`jarvis setup\` создаст"
+        return
+    fi
+    ok "venv: $py"
+    local missing=()
+    for mod in "${PYDEPS[@]}"; do
+        "$py" -c "import $mod" >/dev/null 2>&1 || missing+=("$mod")
+    done
+    if [ "${#missing[@]}" -eq 0 ]; then
+        ok "зависимости установлены (${#PYDEPS[@]} модулей)"
+    else
+        crit "не импортируются: ${missing[*]}"
+        note "почини: jarvis setup  (pip install -r config/requirements.txt)"
+    fi
+}
+
+check_artifacts() {
+    hdr "[2] Бинарь сервера и модели"
+    if [ -x "$SERVER_BIN" ]; then ok "llama-server собран"
+    else crit "llama-server не собран — \`jarvis setup\` (или ./setup_server.sh)"; fi
+
+    if [ -f "$CHAT_MODEL" ]; then ok "модель мозга: $(du -h "$CHAT_MODEL" 2>/dev/null | cut -f1)  Llama-3.2-3B"
+    else crit "нет GGUF мозга: $CHAT_MODEL"; fi
+
+    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    if [ -n "$embed_gguf" ]; then ok "embedding-модель: $(basename "$embed_gguf")"
+    else crit "нет embedding-модели в $EMBED_DIR"; fi
+
+    if [ -d "$VOSK_MODEL" ] && [ -n "$(ls -A "$VOSK_MODEL" 2>/dev/null)" ]; then ok "Vosk-модель (слух) на месте"
+    else warn "Vosk-модель не найдена в $VOSK_MODEL — распознавание речи не поедет"; fi
+}
+
+check_voice() {
+    hdr "[3] Голос (Piper TTS)"
+    [ -x "$PIPER_BIN" ] && ok "piper-бинарь" || warn "нет piper-бинаря: $PIPER_BIN"
+    [ -f "$PIPER_VOICE" ] && ok "русский голос ru_RU-dmitry" || warn "нет голоса: $PIPER_VOICE"
+    [ -f "$PIPER_CFG" ] && ok "конфиг голоса" || warn "нет конфига голоса: $PIPER_CFG"
+}
+
+check_chat_server() {
+    hdr "[4] Сервер-мозг (:8080)"
+    local h; h="$(http_get "$CHAT_ENDPOINT/health" 4)"
+    if [ -z "$h" ]; then
+        crit "недоступен на $CHAT_ENDPOINT — \`jarvis run\` поднимет"
+        return
+    fi
+    if grep -q '"ok"' <<<"$h"; then ok "/health отвечает"
+    else warn "ответил, но не 'ok': $h"; fi
+    # tool-calling доступен?
+    local models; models="$(http_get "$CHAT_ENDPOINT/v1/models" 4)"
+    grep -q '"id"' <<<"$models" && ok "модель отдаётся через /v1/models" \
+        || warn "/v1/models не вернул модель"
+    # GPU-оффлоад (по логам systemd, если доступны).
+    if have_systemd; then
+        local glog; glog="$(journalctl --user -u jarvis-llm --no-pager -n 400 2>/dev/null)"
+        if grep -qiE "offloaded [0-9]+/[0-9]+ layers|Vulkan0|using Vulkan|ggml_vulkan" <<<"$glog"; then
+            ok "iGPU-оффлоад активен (Vulkan)"
+        else
+            warn "не вижу следов Vulkan в логах — возможно инференс на CPU (медленно)"
+        fi
+    fi
+}
+
+check_embed_server() {
+    hdr "[5] Сервер-память / эмбеддинги (:8090)"
+    local h; h="$(http_get "$EMBED_ENDPOINT/health" 4)"
+    if [ -z "$h" ]; then
+        crit "недоступен на $EMBED_ENDPOINT — память не вспомнит; \`jarvis run\` поднимет"
+        return
+    fi
+    ok "/health отвечает"
+    # Реальная проба: непустой вектор на русскую фразу + размерность.
+    local resp=""
+    if have curl; then
+        resp="$(curl -fsS --max-time 8 "$EMBED_ENDPOINT/v1/embeddings" \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$EMBED_MODEL_ALIAS\",\"input\":\"проверка связи\"}" 2>/dev/null)"
+    fi
+    if grep -q '"embedding"' <<<"$resp"; then
+        local dim; dim="$(grep -o '"embedding":\[[^]]*' <<<"$resp" | tr ',' '\n' | grep -c '.')"
+        ok "эмбеддинг получен (размерность ~${dim})"
+        echo "$dim" > /tmp/jarvis-live-embed-dim 2>/dev/null || true
+    else
+        warn "сервер жив, но /v1/embeddings не вернул вектор — проверь модель/флаг --embedding"
+    fi
+}
+
+check_memory() {
+    hdr "[6] Память (ChronoMemory / Chroma)"
+    local db="$MEMORY_DIR/chroma.sqlite3"
+    if [ ! -d "$MEMORY_DIR" ]; then
+        warn "база ещё не создана — появится при первом запуске (это норма)"
+        return
+    fi
+    if [ -f "$db" ]; then
+        ok "база на месте: $db"
+        if have sqlite3; then
+            local rows; rows="$(sqlite3 "$db" "select count(*) from embeddings;" 2>/dev/null)"
+            [ -n "$rows" ] && note "записей в памяти: $rows"
+        fi
+        note "ВАЖНО: при смене embedding-модели меняется размерность → база"
+        note "становится несовместимой. Лечится: jarvis wipe-memory"
+    else
+        warn "каталог есть, но chroma.sqlite3 нет — будет создан при старте"
+    fi
+    [ -f "$MEMORY_DIR/skill_overrides.json" ] && ok "skill_overrides.json (самолечение навыков)" \
+        || note "skill_overrides.json пока нет (появится после первой самопочинки навыка)"
+}
+
+check_tools() {
+    hdr "[7] Внешние инструменты"
+    # qdbus6/qdbus отдельно — ключ к самолечению навыков.
+    if have qdbus6; then ok "qdbus6 (KDE/Plasma)"
+    elif have qdbus; then warn "qdbus6 нет, есть qdbus — навыки самовылечатся на лету (ожидаемо)"
+    else warn "ни qdbus6, ни qdbus — управление окнами/Plasma деградирует"; fi
+
+    local b pkg cls
+    for entry in "${TOOLS[@]}"; do
+        IFS=':' read -r b pkg cls <<<"$entry"
+        if have "$b"; then
+            ok "$b"
+        else
+            case "$cls" in
+                build) warn "$b — нужен для сборки сервера (пакет: $pkg)";;
+                core)  warn "$b — ядро деградирует (пакет: $pkg)";;
+                *)     note "нет $b — соответствующий навык отключится (пакет: $pkg)";;
+            esac
+        fi
+    done
+}
+
+check_units() {
+    hdr "[8] systemd --user юниты"
+    if ! have_systemd; then
+        note "systemd --user недоступен в этой сессии — пропускаю (норма для dev-машины)"
+        return
+    fi
+    local u
+    for u in jarvis-llm jarvis-embed jarvis; do
+        if [ -f "$UNIT_DIR/$u.service" ]; then
+            local st; st="$(systemctl --user is-active "$u" 2>/dev/null)"
+            if [ "$st" = "active" ]; then ok "$u.service — активен"
+            else warn "$u.service установлен, но $st"; fi
+        else
+            warn "$u.service не установлен — \`jarvis setup\` поставит"
+        fi
+    done
+}
+
+cmd_test() {
+    printf '%s%s═══ JARVIS · диагностика ═══%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+    check_python
+    check_artifacts
+    check_voice
+    check_chat_server
+    check_embed_server
+    check_memory
+    check_tools
+    check_units
+
+    hdr "ИТОГ"
+    printf '  %s✓ ок: %d%s   %s⚠ предупреждений: %d%s   %s✗ критично: %d%s\n' \
+        "$C_GREEN" "$N_OK" "$C_RESET" \
+        "$C_YELLOW" "$N_WARN" "$C_RESET" \
+        "$C_RED" "$N_CRIT" "$C_RESET"
+    echo
+    if [ "$N_CRIT" -gt 0 ]; then
+        printf '  %sЕсть критичные пробелы. Запусти:%s jarvis setup\n' "$C_RED" "$C_RESET"
+        return 1
+    elif [ "$N_WARN" -gt 0 ]; then
+        printf '  %sГотов к запуску. Часть навыков деградирует — см. ⚠ выше.%s\n' "$C_YELLOW" "$C_RESET"
+        return 0
+    else
+        printf '  %sВсё на месте. jarvis run.%s\n' "$C_GREEN" "$C_RESET"
+        return 0
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis setup — поставить всё, чего нет
+# ════════════════════════════════════════════════════════════════════════
+apt_install_missing() {
+    step "Системные пакеты"
+    if ! have apt-get; then
+        note "apt-get не найден — пропускаю авто-установку пакетов (не Debian/Kali?)"
+        return
+    fi
+    local need=() b pkg cls seen=" "
+    for entry in "${TOOLS[@]}"; do
+        IFS=':' read -r b pkg cls <<<"$entry"
+        if ! have "$b"; then
+            case "$seen" in *" $pkg "*) ;; *) need+=("$pkg"); seen="$seen$pkg ";; esac
+        fi
+    done
+    # venv/pip всегда полезны.
+    have python3 && ! python3 -c 'import venv' >/dev/null 2>&1 && need+=("python3-venv")
+    if [ "${#need[@]}" -eq 0 ]; then
+        ok "все системные пакеты уже стоят"
+        return
+    fi
+    printf '  ставлю: %s\n' "${need[*]}"
+    if sudo -n true 2>/dev/null || [ -t 0 ]; then
+        sudo apt-get update -qq && sudo apt-get install -y "${need[@]}" \
+            && ok "пакеты установлены" \
+            || warn "apt не справился со всем — поставь вручную: sudo apt-get install ${need[*]}"
+    else
+        warn "нет прав sudo в неинтерактивном режиме. Выполни вручную:"
+        note "sudo apt-get install -y ${need[*]}"
+    fi
+}
+
+ensure_venv() {
+    step "Python venv и зависимости"
+    local py; py="$(venv_python)"
+    if [ -z "$py" ]; then
+        note "создаю .venv ..."
+        python3 -m venv "$REPO_ROOT/.venv" || { crit "не создать venv"; return 1; }
+        py="$REPO_ROOT/.venv/bin/python"
+    fi
+    # Ставим зависимости, только если чего-то не хватает (быстрый путь).
+    local missing=0 mod
+    for mod in "${PYDEPS[@]}"; do "$py" -c "import $mod" >/dev/null 2>&1 || missing=1; done
+    if [ "$missing" -eq 1 ]; then
+        note "pip install -r config/requirements.txt ..."
+        "$py" -m pip install -q -r "$REPO_ROOT/config/requirements.txt" \
+            && ok "зависимости установлены" || warn "часть зависимостей не встала — см. вывод pip"
+    else
+        ok "зависимости уже на месте"
+    fi
+}
+
+ensure_servers_built() {
+    step "Сервер-мозг и модель (setup_server.sh)"
+    if [ -x "$SERVER_BIN" ] && [ -f "$CHAT_MODEL" ] && [ -f "$UNIT_DIR/jarvis-llm.service" ]; then
+        ok "бинарь, модель и юнит уже готовы — пропускаю сборку"
+    else
+        note "запускаю ./setup_server.sh (сборка Vulkan + модель + юнит) ..."
+        "$REPO_ROOT/setup_server.sh" || warn "setup_server.sh завершился с ошибкой — см. вывод выше"
+    fi
+
+    step "Сервер-память (setup_embed_server.sh)"
+    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    if [ -n "$embed_gguf" ] && [ -f "$UNIT_DIR/jarvis-embed.service" ]; then
+        ok "embedding-модель и юнит уже готовы — пропускаю"
+    else
+        note "запускаю ./setup_embed_server.sh ..."
+        "$REPO_ROOT/setup_embed_server.sh" || warn "setup_embed_server.sh завершился с ошибкой"
+    fi
+}
+
+ensure_main_service() {
+    step "Основной сервис ассистента"
+    if [ -f "$UNIT_DIR/jarvis.service" ]; then
+        ok "jarvis.service уже установлен"
+    else
+        note "ставлю через ./scripts/install_service.sh ..."
+        "$REPO_ROOT/scripts/install_service.sh" 2>/dev/null \
+            || "$REPO_ROOT/start_jarvis.sh" install \
+            || warn "не удалось установить jarvis.service"
+    fi
+}
+
+install_global_symlink() {
+    step "Глобальная команда \`jarvis\`"
+    local target="$HOME/.local/bin/jarvis"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$REPO_ROOT/jarvis" "$target"
+    ok "симлинк: $target → $REPO_ROOT/jarvis"
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ok "~/.local/bin уже в PATH";;
+        *) note "добавь в ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\"";;
+    esac
+}
+
+cmd_setup() {
+    printf '%s%s═══ JARVIS · установка ═══%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+    apt_install_missing
+    ensure_venv
+    ensure_servers_built
+    ensure_main_service
+    install_global_symlink
+    printf '\n%s✓ Установка завершена.%s Проверь: %sjarvis test%s, запусти: %sjarvis run%s\n' \
+        "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis run — авто-починка + запуск
+# ════════════════════════════════════════════════════════════════════════
+wait_health() {
+    local url="$1" label="$2" tries="${3:-90}" i
+    printf '  ожидаю %s' "$label"
+    for ((i=0; i<tries; i++)); do
+        if http_get "$url" 2 | grep -q '"ok"'; then echo "  ✓"; return 0; fi
+        printf '.'; sleep 1
+    done
+    echo "  ✗"; return 1
+}
+
+cmd_run() {
+    printf '%s%s═══ JARVIS · запуск ═══%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+
+    # 1. Лёгкая авто-починка отсутствующего (без принудительной пересборки).
+    local py; py="$(venv_python)"
+    [ -z "$py" ] && { ensure_venv; py="$(venv_python)"; }
+    if [ -z "$py" ]; then crit "нет venv и не удалось создать — запусти jarvis setup"; exit 1; fi
+
+    if [ ! -x "$SERVER_BIN" ] || [ ! -f "$CHAT_MODEL" ]; then
+        warn "сервер/модель отсутствуют — добираю через setup"
+        ensure_servers_built
+    fi
+    local embed_gguf; embed_gguf="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    [ -z "$embed_gguf" ] && { warn "нет embedding-модели — добираю"; "$REPO_ROOT/setup_embed_server.sh" || true; }
+
+    # 2. Поднять оба сервера.
+    if have_systemd; then
+        step "Поднимаю серверы (systemd --user)"
+        [ -f "$UNIT_DIR/jarvis-llm.service" ] && systemctl --user start jarvis-llm.service 2>/dev/null
+        [ -f "$UNIT_DIR/jarvis-embed.service" ] && systemctl --user start jarvis-embed.service 2>/dev/null
+    else
+        note "systemd --user недоступен — серверы должны быть запущены отдельно"
+    fi
+    wait_health "$CHAT_ENDPOINT/health"  "мозг (:8080)"   120 || warn "мозг не ответил — логи: jarvis logs llm"
+    wait_health "$EMBED_ENDPOINT/health" "память (:8090)" 60  || warn "память не ответила — логи: jarvis logs embed"
+
+    # 3. Запустить ассистента в foreground (Ctrl+C — стоп).
+    step "Запускаю ассистента (Ctrl+C — остановить)"
+    exec "$py" -m src.core.supervisor foreground
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  управление
+# ════════════════════════════════════════════════════════════════════════
+cmd_status() {
+    hdr "Состояние"
+    local map=( "jarvis-llm:мозг (:8080)" "jarvis-embed:память (:8090)" "jarvis:ассистент" )
+    for pair in "${map[@]}"; do
+        IFS=':' read -r unit label <<<"$pair"
+        if have_systemd && [ -f "$UNIT_DIR/$unit.service" ]; then
+            local st; st="$(systemctl --user is-active "$unit" 2>/dev/null)"
+            [ "$st" = "active" ] && ok "$label — active" || warn "$label — $st"
+        else
+            note "$label — юнит не установлен / нет systemd"
+        fi
+    done
+    http_get "$CHAT_ENDPOINT/health" 3  | grep -q '"ok"' && ok "мозг отвечает на $CHAT_ENDPOINT"  || warn "мозг молчит"
+    http_get "$EMBED_ENDPOINT/health" 3 | grep -q '"ok"' && ok "память отвечает на $EMBED_ENDPOINT" || warn "память молчит"
+}
+
+cmd_stop() {
+    step "Остановка"
+    if have_systemd; then
+        systemctl --user stop jarvis 2>/dev/null && ok "ассистент остановлен" || true
+        systemctl --user stop jarvis-embed 2>/dev/null && ok "память остановлена" || true
+        systemctl --user stop jarvis-llm 2>/dev/null && ok "мозг остановлен" || true
+    fi
+    local py; py="$(venv_python)"
+    [ -n "$py" ] && "$py" -m src.core.supervisor stop 2>/dev/null || true
+}
+
+cmd_restart() {
+    if have_systemd && systemctl --user is-active --quiet jarvis 2>/dev/null; then
+        systemctl --user restart jarvis && ok "ассистент перезапущен"
+    else
+        local py; py="$(venv_python)"
+        [ -n "$py" ] && exec "$py" -m src.core.supervisor restart
+    fi
+}
+
+cmd_logs() {
+    local which="${1:-jarvis}" unit
+    case "$which" in
+        llm|brain|мозг)    unit="jarvis-llm";;
+        embed|mem|память)  unit="jarvis-embed";;
+        *)                 unit="jarvis";;
+    esac
+    if have_systemd; then
+        printf '%s📋 Логи %s (Ctrl+C — выход)%s\n' "$C_YELLOW" "$unit" "$C_RESET"
+        journalctl --user -u "$unit" -f
+    else
+        warn "systemd --user недоступен; в foreground-режиме логи идут прямо в консоль"
+    fi
+}
+
+cmd_wipe_memory() {
+    printf '%s⚠ Стираю базу памяти %s%s\n' "$C_YELLOW" "$MEMORY_DIR" "$C_RESET"
+    note "нужно при смене embedding-модели (изменилась размерность вектора)."
+    if [ ! -d "$MEMORY_DIR" ]; then ok "база и так пуста — нечего стирать"; return; fi
+    printf 'Подтверди удаление (введи %syes%s): ' "$C_BOLD" "$C_RESET"
+    read -r ans
+    if [ "$ans" = "yes" ]; then
+        rm -rf "$MEMORY_DIR" && ok "память стёрта — пересоздастся при следующем запуске"
+    else
+        note "отменено"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  диспетчер
+# ════════════════════════════════════════════════════════════════════════
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        run|up|start)          cmd_run "$@";;
+        test|doctor|check|диагностика) cmd_test "$@";;
+        setup|install|heal|fix) cmd_setup "$@";;
+        status|стат)           cmd_status "$@";;
+        stop|стоп)             cmd_stop "$@";;
+        restart|рестарт)       cmd_restart "$@";;
+        logs|логи)             cmd_logs "$@";;
+        wipe-memory|wipe|clean-memory) cmd_wipe_memory "$@";;
+        help|--help|-h|"")     cmd_help;;
+        *)
+            printf '%s✗ неизвестная команда: %s%s\n\n' "$C_RED" "$cmd" "$C_RESET"
+            cmd_help
+            exit 1;;
+    esac
+}
+
+main "$@"
