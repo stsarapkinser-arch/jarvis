@@ -35,6 +35,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from src.skills import apps
 from src.skills.registry import normalize_phrase
 
 log = logging.getLogger("jarvis.patterns")
@@ -154,12 +155,47 @@ _PATTERNS: tuple[SkillPattern, ...] = (
 )
 
 
+# ─────────────────────────── L1a: «открой <приложение>» ───────────────────────────
+# Глагол запуска + открытый слот-имя; резолвер (skills/apps.py) превращает имя в
+# выверенную команду каталога. Открытый слот нельзя покрыть фиксированной фразой,
+# поэтому это отдельная ступень: regex ловит ГЛАГОЛ, apps.resolve — СУЩНОСТЬ.
+_OPEN_RE = re.compile(
+    r"(?:ну |давай |а )?"
+    r"(?:открой|открыть|запусти|запустить|запускай|вруби|врубай|включи|включить|стартуй)(?:-ка)?"
+    r"(?: мне)?"
+    r"(?: приложение| программу| прогу| прилу)?"
+    r" (?P<app>.+?)"
+    r"(?:\s+(?:пожалуйста|сэр|прошу|ка))?",
+    re.IGNORECASE,
+)
+
+
+def _match_open(norm: str) -> PatternMatch | None:
+    """L1a: «открой/запусти <имя>» → open_app(app=ключ), иначе None.
+
+    Резолвер сам решает, узнал ли он приложение; None → интент уходит 3B (а не
+    открывает наугад не то)."""
+    m = _OPEN_RE.fullmatch(norm)
+    if m is None:
+        return None
+    entry = apps.resolve(m.group("app"))
+    if entry is None:
+        return None
+    log.info("pattern L1a: %r → open_app(%s)", norm[:60], entry.key)
+    return PatternMatch(
+        skill_id="open_app",
+        args={"app": entry.key},
+        reply=f"Открываю {entry.label}, сэр.",
+    )
+
+
 def match(text: str) -> PatternMatch | None:
     """Параметрический шаблон → (навык, извлечённые слоты, реплика), иначе None.
 
     Только ``fullmatch`` по нормализованной фразе — высокая точность, никаких
     ложных срабатываний на середине реплики. Числовые шаблоны матчатся по тексту
-    с числительными-цифрами (digitize); текстовые — по «сырой» нормализации."""
+    с числительными-цифрами (digitize); текстовые — по «сырой» нормализации.
+    Последней ступенью идёт L1a-резолвер приложений («открой X»)."""
     norm = normalize_phrase(text)
     if not norm:
         return None
@@ -176,7 +212,8 @@ def match(text: str) -> PatternMatch | None:
             reply = pat.reply
         log.info("pattern L1: %r → skill=%s args=%s", text[:60], pat.skill_id, args)
         return PatternMatch(skill_id=pat.skill_id, args=args, reply=reply)
-    return None
+    # L1a: открытый слот-приложение (резолвер синонимов + fuzzy).
+    return _match_open(norm)
 
 
 def all_patterns() -> tuple[SkillPattern, ...]:

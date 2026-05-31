@@ -30,6 +30,8 @@ from src.skills import ui_control as _ui_control  # noqa: E402,F401
 from src.skills import system_ops as _system_ops  # noqa: E402,F401
 from src.skills import pentest as _pentest        # noqa: E402,F401
 from src.skills import screen as _screen          # noqa: E402,F401
+# Резолвер приложений (L1a): регистрирует обобщённый навык open_app («открой X»).
+from src.skills import apps as _apps              # noqa: E402,F401
 # Выученные навыки (self-authoring): подхватываются из config/learned_skills.json.
 # Импорт последним — id выученных навыков идут в хвост enum, не сдвигая
 # стабильный префикс встроенного каталога (KV-кэш run_skill не плывёт).
