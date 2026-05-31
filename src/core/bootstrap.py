@@ -174,8 +174,13 @@ async def initial_hud_pin(kwin: KWinOrchestrator) -> None:
     его ещё не видит."""
     await asyncio.sleep(1.0)
     try:
+        if kwin._qdbus is None:
+            log.info("initial HUD pin: skipped (нет qdbus6/qdbus)")
+            return
         ok = await kwin.pin_jarvis_hud()
-        log.info("initial HUD pin: %s", "OK" if ok else "skipped (qdbus unavailable)")
+        # False при наличии qdbus — окно ещё не зарегистрировано или плагин
+        # залип; периодический HUD layout watcher до-пинит позже. Не врём про qdbus.
+        log.info("initial HUD pin: %s", "OK" if ok else "отложено (окно ещё не готово)")
     except Exception:
         log.exception("initial HUD pin failed")
 

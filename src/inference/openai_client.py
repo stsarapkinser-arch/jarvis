@@ -57,6 +57,14 @@ def _env_float(name: str, default: float) -> float:
 # подстроить через JARVIS_LLM_TIMEOUT.
 DEFAULT_REQUEST_TIMEOUT = _env_float("JARVIS_LLM_TIMEOUT", 180.0)
 
+# Сервер — отдельный systemd-юнит с Restart=always (см. jarvis-llm.service):
+# нативный краш бэкенда (Vulkan device-lost / GGML_ASSERT на 8 ГБ iGPU) убивает
+# ТОЛЬКО демон, и systemd поднимает его за ~2с (+ холодная загрузка весов). До
+# этого фикса единичный краш посреди запроса сразу всплывал как «мозг
+# недоступен», хотя сервер уже возвращался. Здесь — один повтор после дисконнекта
+# с ограниченным ожиданием /health. Окно ожидания настраивается; 0 — отключить.
+RECONNECT_WAIT = _env_float("JARVIS_LLM_RECONNECT_WAIT", 25.0)
+
 
 class LlamaServerError(RuntimeError):
     """Сервер инференса недоступен или вернул ошибку. Оркестратор ловит это и
@@ -152,13 +160,8 @@ class LlamaServerClient:
         async with self._request_lock:
             try:
                 resp = await client.post("/v1/chat/completions", json=body)
-            except Exception as exc:  # httpx.ConnectError/ReadTimeout/...
-                # У httpx.ReadTimeout пустой str(), поэтому добавляем имя типа —
-                # иначе в логе было голое «llama-server недоступен: ».
-                detail = str(exc) or "превышен таймаут ответа (модель слишком долго думает?)"
-                raise LlamaServerError(
-                    f"llama-server недоступен: {type(exc).__name__}: {detail}"
-                ) from exc
+            except Exception as exc:  # httpx.ConnectError/ReadTimeout/RemoteProtocol...
+                resp = await self._retry_after_disconnect(client, body, exc)
 
         if resp.status_code != 200:
             raise LlamaServerError(
@@ -171,6 +174,52 @@ class LlamaServerClient:
             raise LlamaServerError(f"невалидный JSON от сервера: {exc}") from exc
 
         return _parse_completion(data)
+
+    # Сетевые ошибки, означающие «сервер умер/рестартует», а не «модель долго
+    # думает». Только их имеет смысл переждать и повторить — таймаут чтения
+    # (модель реально считает) повторять бессмысленно и дорого.
+    _DISCONNECT_ERRORS = (
+        "RemoteProtocolError",  # сервер закрыл соединение без ответа (краш)
+        "ConnectError",         # порт ещё/уже не слушает (рестарт)
+        "ConnectTimeout",
+        "ReadError",            # соединение оборвалось во время чтения
+    )
+
+    async def _retry_after_disconnect(
+        self, client: Any, body: dict[str, Any], exc: Exception
+    ) -> Any:
+        """Один повтор запроса, если сервер отвалился посреди него.
+
+        llama-server под systemd Restart=always возвращается за ~2с + загрузка.
+        Ждём готовности /health до RECONNECT_WAIT и повторяем РОВНО раз. Любой
+        иной класс ошибки (или исчерпанное окно) — пробрасываем как раньше."""
+        kind = type(exc).__name__
+        retriable = RECONNECT_WAIT > 0 and kind in self._DISCONNECT_ERRORS
+        if not retriable:
+            detail = str(exc) or "превышен таймаут ответа (модель слишком долго думает?)"
+            raise LlamaServerError(
+                f"llama-server недоступен: {kind}: {detail}"
+            ) from exc
+
+        log.warning(
+            "llama-server отвалился (%s) — жду рестарта до %.0fс и повторю",
+            kind, RECONNECT_WAIT,
+        )
+        deadline = asyncio.get_event_loop().time() + RECONNECT_WAIT
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(1.0)
+            if await self.health():
+                try:
+                    resp = await client.post("/v1/chat/completions", json=body)
+                    log.info("llama-server вернулся — запрос повторён успешно")
+                    return resp
+                except Exception as exc2:  # рестарт ещё не устаканился
+                    log.debug("повтор не удался (%s), продолжаю ждать", type(exc2).__name__)
+                    continue
+        raise LlamaServerError(
+            f"llama-server недоступен: {kind}: не вернулся за {RECONNECT_WAIT:.0f}с "
+            "(краш бэкенда? см. journalctl --user -u jarvis-llm)"
+        ) from exc
 
 
 def _parse_completion(data: dict[str, Any]) -> ChatResponse:
