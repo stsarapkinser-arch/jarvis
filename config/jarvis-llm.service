@@ -33,15 +33,20 @@ WorkingDirectory=__JARVIS_HOME__
 #                        (освобождает RAM под контекст/спекуляцию) и ускоряет
 #                        декод. На своей строке — чтобы strip-safety снял её
 #                        целиком, если сборка/Mesa не тянет Vulkan-FA. По умолч. OFF.
+#   Speculative decoding (строка-плейсхолдер ниже): включается setup_server.sh
+#                        при JARVIS_LLM_DRAFT=1 → --model-draft + --draft-max.
+#                        Draft-модель предсказывает токены за основную; на 8 ГБ
+#                        впритык — мерить tok/s. На своей строке для strip-safety.
 #   Перф-флаги оператора (последняя строка-плейсхолдер): JARVIS_LLM_EXTRA_FLAGS.
 # setup_server.sh снимает флаги, не поддержанные конкретной сборкой бинаря, и
-# подставляет/удаляет обе строки-плейсхолдера по env-тумблерам.
+# подставляет/удаляет строки-плейсхолдера по env-тумблерам.
 ExecStart=__LLAMA_SERVER_BIN__ \
     --model __JARVIS_HOME__/models/__MODEL_NAME__ \
     --alias __MODEL_ALIAS__ \
     --ctx-size 4096 \
     --n-gpu-layers 99 \
     __KV_QUANT_FLAGS__ \
+    __DRAFT_FLAGS__ \
     --parallel 1 \
     --threads 4 \
     --cache-ram 0 \

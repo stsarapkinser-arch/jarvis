@@ -38,6 +38,18 @@ MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGU
 # JARVIS_LLM_MODEL у клиента — иначе запросы уйдут с неизвестным "model" и
 # сервер ответит 404. setup подставит его в unit (--alias) сам.
 MODEL_ALIAS="${MODEL_ALIAS:-qwen2.5-3b-instruct}"
+# Speculative decoding (Tier0 #4, OFF по умолчанию). JARVIS_LLM_DRAFT=1 включает
+# крошечную draft-модель (Qwen2.5-0.5B той же серии — словарь совместим), которая
+# предсказывает токены за 3B; основная их верифицирует. На memory-bound iGPU
+# может ускорить декод, НО на 8 ГБ это впритык по RAM — мерить tok/s и оставлять
+# только при реальном выигрыше. Переопределяемо DRAFT_NAME/DRAFT_URL.
+DRAFT_ENABLE="${JARVIS_LLM_DRAFT:-0}"
+DRAFT_NAME="${DRAFT_NAME:-Qwen2.5-0.5B-Instruct-Q4_K_M.gguf}"
+DRAFT_PATH="$MODELS_DIR/$DRAFT_NAME"
+DRAFT_URL="${DRAFT_URL:-https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf?download=true}"
+# Число draft-токенов за раунд (llama-server --draft-max). Малое — дешевле
+# откат при промахе предсказания.
+DRAFT_MAX="${DRAFT_MAX:-8}"
 LLAMA_CPP_REF="${LLAMA_CPP_REF:-master}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
@@ -93,24 +105,36 @@ else
     echo "  ✓ llama-server: $SERVER_BIN"
 fi
 
+# Скачать GGUF по URL в $MODELS_DIR/<name>, если его ещё нет. Идемпотентно.
+download_gguf() {
+    local name="$1" path="$2" url="$3"
+    if [ -f "$path" ]; then
+        echo "  ✓ уже есть: $path ($(du -h "$path" | cut -f1))"
+        return 0
+    fi
+    echo "  → качаю $name из HuggingFace..."
+    if command -v aria2c >/dev/null 2>&1; then
+        aria2c -x 4 -s 4 --console-log-level=warn -d "$MODELS_DIR" -o "$name" "$url"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -fL --progress-bar -o "$path.part" "$url" && mv "$path.part" "$path"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --show-progress -O "$path.part" "$url" && mv "$path.part" "$path"
+    else
+        echo "✗ ни aria2c, ни curl, ни wget — нечем скачать." >&2
+        return 3
+    fi
+    echo "  ✓ загружено: $(du -h "$path" | cut -f1)"
+}
+
 # ───────────── [2/4] Загрузка GGUF мозга (Qwen2.5-3B по умолчанию) ─────────────
 say "[2/4] Модель $MODEL_NAME..."
 mkdir -p "$MODELS_DIR"
-if [ -f "$MODEL_PATH" ]; then
-    echo "  ✓ уже есть: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
-else
-    echo "  → качаю из HuggingFace (можно переопределить MODEL_URL)..."
-    if command -v aria2c >/dev/null 2>&1; then
-        aria2c -x 4 -s 4 --console-log-level=warn -d "$MODELS_DIR" -o "$MODEL_NAME" "$MODEL_URL"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fL --progress-bar -o "$MODEL_PATH.part" "$MODEL_URL" && mv "$MODEL_PATH.part" "$MODEL_PATH"
-    elif command -v wget >/dev/null 2>&1; then
-        wget --show-progress -O "$MODEL_PATH.part" "$MODEL_URL" && mv "$MODEL_PATH.part" "$MODEL_PATH"
-    else
-        echo "✗ ни aria2c, ни curl, ни wget — нечем скачать." >&2
-        exit 3
-    fi
-    echo "  ✓ загружено: $(du -h "$MODEL_PATH" | cut -f1)"
+download_gguf "$MODEL_NAME" "$MODEL_PATH" "$MODEL_URL" || exit 3
+
+# Draft-модель для speculative decoding — только если включён тумблер.
+if [ "$DRAFT_ENABLE" = "1" ]; then
+    echo "  → speculative decoding включён — нужна draft-модель $DRAFT_NAME"
+    download_gguf "$DRAFT_NAME" "$DRAFT_PATH" "$DRAFT_URL" || warn "draft не скачан — спекуляция будет отключена"
 fi
 
 # ───────────── [3/4] systemd --user unit ─────────────
@@ -131,6 +155,16 @@ if [ -n "$KV_QUANT" ]; then
 else
     KV_SED="/__KV_QUANT_FLAGS__/d"
 fi
+# Speculative decoding (Tier0 #4): подставляем --model-draft, только если
+# тумблер включён И draft-файл реально скачался (иначе сервер упал бы на старте).
+if [ "$DRAFT_ENABLE" = "1" ] && [ -f "$DRAFT_PATH" ]; then
+    DRAFT_FLAGS="--model-draft ${REPO_ROOT}/models/${DRAFT_NAME} --draft-max ${DRAFT_MAX} --gpu-layers-draft 99"
+    DRAFT_SED="s|__DRAFT_FLAGS__|${DRAFT_FLAGS}|"
+    echo "  → speculative decoding: ${DRAFT_FLAGS}"
+else
+    DRAFT_SED="/__DRAFT_FLAGS__/d"
+    [ "$DRAFT_ENABLE" = "1" ] && warn "draft-файл отсутствует — спекуляция отключена в unit"
+fi
 # Опциональные произвольные перф-флаги оператора (JARVIS_LLM_EXTRA_FLAGS).
 # Пусто → строку-плейсхолдер удаляем; иначе подставляем.
 EXTRA="${JARVIS_LLM_EXTRA_FLAGS:-}"
@@ -146,6 +180,7 @@ sed \
     -e "s|__MODEL_NAME__|${MODEL_NAME}|g" \
     -e "s|__MODEL_ALIAS__|${MODEL_ALIAS}|g" \
     -e "$KV_SED" \
+    -e "$DRAFT_SED" \
     -e "$EXTRA_SED" \
     "$UNIT_TEMPLATE" > "$UNIT_TARGET"
 
@@ -155,7 +190,7 @@ sed \
 # один не поддержан — strip убирает всю строку __KV_QUANT_FLAGS__ разом.
 if [ -x "$SERVER_BIN" ]; then
     HELP="$("$SERVER_BIN" --help 2>&1 || true)"
-    for flag in --cache-ram --cache-reuse --jinja --flash-attn --cache-type-k --cache-type-v; do
+    for flag in --cache-ram --cache-reuse --jinja --flash-attn --cache-type-k --cache-type-v --model-draft --draft-max --gpu-layers-draft; do
         if ! grep -q -- "$flag" <<<"$HELP"; then
             sed -i "\| ${flag} |d" "$UNIT_TARGET"
             warn "флаг ${flag} не поддержан этой сборкой llama-server — убран из unit"
