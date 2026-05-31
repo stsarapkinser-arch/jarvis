@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Final
 
-import sounddevice as sd
-from vosk import KaldiRecognizer, Model
+# Аудио-стек (sounddevice/vosk) — опционален на уровне импорта: без него модуль
+# всё равно импортируется (чистая логика гейта/дедупа тестируема), а слушатель
+# уходит в standby. На целевой машине (N100) обе библиотеки установлены.
+try:
+    import sounddevice as sd
+except Exception:  # noqa: BLE001 — ALSA/портаудио могут падать по-разному
+    sd = None  # type: ignore[assignment]
+try:
+    from vosk import KaldiRecognizer, Model
+except Exception:  # noqa: BLE001
+    KaldiRecognizer = None  # type: ignore[assignment,misc]
+    Model = None  # type: ignore[assignment,misc]
 
 from src.common.event_bus import Event, EventBus, EventType
 from src.common.singleton import Singleton
@@ -20,6 +31,14 @@ READ_FRAMES: Final = 8000
 # Окно дедупликации: одинаковый интент в пределах N секунд считаем
 # одним (partial → final одной фразы). 6 с покрывает паузу распознавания.
 INTENT_DEDUP_SEC: Final = 6.0
+# Эхо-гейт: пока Джарвис говорит, глушим вход микрофона, иначе он слышит сам
+# себя и само-триггерится. Закрываем гейт по STATE_CHANGE=SPEAKING и продлеваем
+# «хвост» на каждый звуковой AUDIO_FFT-фрейм (~раз в 23 мс). Открываем не по
+# IDLE (его шлёт и оркестратор — гонка порядка событий), а по истечении хвоста
+# после последнего звукового фрейма. Хвост покрывает паузы между словами и
+# затухание/буфер aplay.
+ECHO_GATE_TAIL_SEC: Final = 0.5
+_FFT_GATE_LEVEL: Final = 1e-3
 
 # Папка с весами Vosk относительно корня проекта.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -38,6 +57,15 @@ class JarvisMain(metaclass=Singleton):
         self.model: Model | None = None
         self.rec: KaldiRecognizer | None = None
         self.wake_words = WAKE_WORDS
+        # Эхо-гейт: monotonic-таймштамп, до которого вход заглушён. Пишется из
+        # event-loop (обработчики шины), читается из треда слушателя — для
+        # float это атомарно в CPython, блокировка не нужна.
+        self._gate_until: float = 0.0
+        # Аудио-стек не установлен — тихо в standby (модуль импортируем, но
+        # слушать нечем). На N100 сюда не попадаем.
+        if Model is None or KaldiRecognizer is None:
+            log.warning("vosk/sounddevice недоступны — voice disabled")
+            return
         # Ленивая загрузка: если папки нет, не падаем — переходим в режим
         # ожидания. Vosk.Model() при отсутствии бросает Exception('Failed to
         # create a model') и без try-блока валит весь сервис.
@@ -58,12 +86,38 @@ class JarvisMain(metaclass=Singleton):
                 return text.replace(ww, "").strip()
         return None
 
+    async def _on_acoustic_state(self, event: Event) -> None:
+        """STATE_CHANGE: на SPEAKING мгновенно закрываем гейт. IDLE намеренно
+        НЕ открывает гейт (его шлёт и оркестратор из process_intent — порядок
+        с SPEAKING не гарантирован); открытие — по истечении хвоста."""
+        data = event.data
+        state = data[0] if isinstance(data, (tuple, list)) and data else data
+        if state == "SPEAKING":
+            self._gate_until = time.monotonic() + ECHO_GATE_TAIL_SEC
+
+    async def _on_audio_fft(self, event: Event) -> None:
+        """Пока сфера реально звучит (level>0), держим вход закрытым: продлеваем
+        хвост на каждый фрейм. Финальный нулевой фрейм хвост не трогает → гейт
+        сам открывается через ECHO_GATE_TAIL_SEC после конца речи."""
+        data = event.data
+        level = 0.0
+        if isinstance(data, dict):
+            try:
+                level = float(data.get("level", 0.0))
+            except (TypeError, ValueError):
+                level = 0.0
+        if level > _FFT_GATE_LEVEL:
+            self._gate_until = time.monotonic() + ECHO_GATE_TAIL_SEC
+
+    def _gated(self) -> bool:
+        return time.monotonic() < self._gate_until
+
     def run(self, bus: EventBus | None = None) -> None:
         bus = bus or EventBus()
         # Режим ожидания: модели нет — извещаем HUD и тихо выходим из треда.
         # Сервис при этом остаётся живой, оператор подкладывает веса и
         # перезапускает unit.
-        if self.model is None or self.rec is None:
+        if self.model is None or self.rec is None or sd is None:
             log.warning("voice loop standby: %s", VOSK_MISSING_MSG)
             try:
                 bus.publish_threadsafe(
@@ -74,6 +128,12 @@ class JarvisMain(metaclass=Singleton):
             print(f"⚠ {VOSK_MISSING_MSG}")
             return
 
+        # Эхо-гейт: слушаем состояние голоса и спектр, чтобы глушить вход, пока
+        # Джарвис говорит. Подписки безвредны при отсутствии loop (в standby мы
+        # сюда не доходим — выходим раньше).
+        bus.subscribe(EventType.STATE_CHANGE, self._on_acoustic_state)
+        bus.subscribe(EventType.AUDIO_FFT, self._on_audio_fft)
+
         log.info("voice listener ready")
         print("🎙 Джарвис слушает...")
         # Дедуп: храним последний ОПУБЛИКОВАННЫЙ интент и его время. Без этого
@@ -82,11 +142,10 @@ class JarvisMain(metaclass=Singleton):
         # Джарвис отвечал на одно и то же два раза.
         _last_published: str = ""
         _last_published_ts: float = 0.0
-        import time as _time
 
         def _publish_intent(intent: str) -> None:
             nonlocal _last_published, _last_published_ts
-            now = _time.monotonic()
+            now = time.monotonic()
             # Тот же интент в пределах окна — это partial→final дубль, глушим.
             if intent == _last_published and (now - _last_published_ts) < INTENT_DEDUP_SEC:
                 return
@@ -102,8 +161,20 @@ class JarvisMain(metaclass=Singleton):
                     dtype="int16",
                     channels=1,
                 ) as stream:
+                    _was_gated = False
                     while True:
                         data, _ = stream.read(READ_FRAMES)
+                        # Эхо-гейт: Джарвис говорит — дренируем поток (иначе
+                        # переполнится буфер), но в распознаватель НЕ отдаём.
+                        if self._gated():
+                            _was_gated = True
+                            continue
+                        if _was_gated:
+                            # Сбрасываем накопленные на границе гейта огрызки
+                            # (хвост собственной речи/тишины), чтобы не выдать
+                            # мусорный partial первым же кадром после гейта.
+                            self.rec.Reset()
+                            _was_gated = False
                         if self.rec.AcceptWaveform(bytes(data)):
                             # Финальный результат после паузы
                             try:
@@ -137,8 +208,7 @@ class JarvisMain(metaclass=Singleton):
                             _publish_intent(intent)
             except Exception:
                 log.exception("voice loop crashed — restarting in 3s")
-                import time as _time
-                _time.sleep(3.0)
+                time.sleep(3.0)
                 # Пересоздаём рекогнайзер после краша
                 try:
                     if self.model is not None:
