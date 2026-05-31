@@ -83,8 +83,11 @@ QUADRANT_TO_RATIO: Final[dict[str, tuple[float, float]]] = {
 class KWinOrchestrator(metaclass=Singleton):
     """Drives KDE Plasma 6 KWin via org.kde.KWin.Scripting + kdotool/wmctrl helpers."""
 
-    SCRIPT_DIR: Path = Path(__file__).resolve().parent / "scripts"
-    INLINE_DIR: Path = Path(__file__).resolve().parent / "scripts" / "_inline"
+    # KWin .js-скрипты и каталог временных inline-скриптов лежат в корневом
+    # scripts/ репозитория (не рядом с этим модулем). window_manager.py — это
+    # src/ui/window_manager.py, поэтому корень = parents[2].
+    SCRIPT_DIR: Path = Path(__file__).resolve().parents[2] / "scripts"
+    INLINE_DIR: Path = Path(__file__).resolve().parents[2] / "scripts" / "_inline"
 
     def __init__(self) -> None:
         self._qdbus: str | None = shutil.which("qdbus6") or shutil.which("qdbus")
@@ -93,7 +96,8 @@ class KWinOrchestrator(metaclass=Singleton):
         self._kdotool: str | None = shutil.which("kdotool")
         self._wmctrl: str | None = shutil.which("wmctrl")
         try:
-            self.INLINE_DIR.mkdir(exist_ok=True)
+            # parents=True: scripts/ может отсутствовать в свежем клоне.
+            self.INLINE_DIR.mkdir(parents=True, exist_ok=True)
         except OSError:
             log.exception("cannot create inline scripts dir")
 

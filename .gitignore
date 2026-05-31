@@ -24,3 +24,7 @@ jarvis_memory/
 
 # Локальные хуки/настройки агента — не часть репозитория
 .claude/
+
+# Временные inline KWin-скрипты (создаются в рантайме); сам каталог сохраняем
+scripts/_inline/*
+!scripts/_inline/.gitkeep

@@ -250,6 +250,20 @@ check_voice() {
     [ -f "$PIPER_CFG" ] && ok "конфиг голоса" || warn "нет конфига голоса: $PIPER_CFG"
 }
 
+check_kwin_scripts() {
+    hdr "[*] KWin-скрипты (управление окнами HUD)"
+    local sd="$REPO_ROOT/scripts" missing=0 js
+    for js in highlight_window.js prepare_workspace.js enumerate_windows.js; do
+        [ -f "$sd/$js" ] || { warn "нет $js"; missing=1; }
+    done
+    [ "$missing" -eq 0 ] && ok "named-скрипты на месте (scripts/)"
+    if mkdir -p "$sd/_inline" 2>/dev/null && [ -w "$sd/_inline" ]; then
+        ok "scripts/_inline/ доступен для записи (inline KWin)"
+    else
+        warn "scripts/_inline/ не создать/не записать — пин HUD будет спамить ошибками"
+    fi
+}
+
 check_chat_server() {
     hdr "[4] Сервер-мозг (:8080)"
     local h; h="$(http_get "$CHAT_ENDPOINT/health" 4)"
@@ -370,6 +384,7 @@ cmd_test() {
     check_embed_server
     check_memory
     check_proactive
+    check_kwin_scripts
     check_tools
     check_units
 
