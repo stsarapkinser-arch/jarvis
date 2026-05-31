@@ -46,6 +46,7 @@ from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
 from src.skills import macros
+from src.skills import patterns
 from src.skills import screen as screen_skills
 from src.skills.learning import Candidate, SkillLearner
 from src.skills.healing import SkillHealer, first_binary
@@ -864,6 +865,57 @@ class Jarvis(metaclass=Singleton):
         await self._state("IDLE", "")
         return True
 
+    async def _try_pattern_fastpath(self, text: str) -> bool:
+        """Параметрическая фраза-ШАБЛОН → навык с извлечённым слотом, минуя 3B (L1).
+
+        Ступень между alias fast-path (точная фраза) и агентным циклом: ловит
+        КЛАСС команд с аргументом — «громкость 30», «яркость на 70», «быстрый
+        скан 10.0.0.1». Раньше всё это уходило на 3B (медленно, и модель путалась
+        в извлечении слота); теперь regex с именованными группами достаёт слот
+        детерминированно и зовёт выверенный навык. Возвращает True, если поглощено.
+
+        Структурно повторяет _try_alias_fastpath (то же подтверждение
+        разрушительных, та же запись в память/диалог); отличие — навык зовётся с
+        извлечёнными args, а озвучивается шаблонная reply (модели тут нет, фразу
+        не сочинить)."""
+        pm = patterns.match(text)
+        if pm is None:
+            return False
+        sk = skills.get(pm.skill_id)
+        if sk is None:
+            # Дрейф каталога: шаблон ссылается на снятый навык. Не падаем —
+            # отдаём интент 3B (тест-инвариант ловит это в CI, а не в проде).
+            log.warning("pattern fast-path: навык %r не зарегистрирован — отдаю агенту", pm.skill_id)
+            return False
+        log.info("pattern fast-path: %r → skill=%s args=%s", text[:60], sk.id, pm.args)
+        snap = await asyncio.to_thread(snapshot)
+
+        # Разрушительный навык — то же голосовое подтверждение (с извлечёнными
+        # args), что и из alias fast-path / агентного цикла.
+        if sk.destructive:
+            self._pending_skill = {
+                "skill": sk, "args": dict(pm.args), "intent": text,
+                "snap": snap, "ts": time.time(),
+            }
+            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
+            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            return True
+
+        await self._state("THINKING", sk.id)
+        result = await self._invoke_skill(sk, dict(pm.args))
+        # speaks_result → живой результат хендлера (телеметрия); иначе —
+        # подтверждающая шаблонная фраза со слотом (parallel to action).
+        spoken = result if sk.speaks_result else pm.reply
+        if spoken.strip():
+            self.say(spoken.strip())
+            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken.strip()))
+        await asyncio.to_thread(
+            self.memory.remember, text, f"skill:{sk.id}", result, "pattern_skill", snap,
+        )
+        self._record_turn(text, spoken)
+        await self._state("IDLE", "")
+        return True
+
     async def _run_agent_for_intent(
         self,
         user_text: str,
@@ -1286,6 +1338,13 @@ class Jarvis(metaclass=Singleton):
         # и ДО snapshot/recall/агента — экономит и латентность, и слот сервера.
         if await self._try_alias_fastpath(text):
             return "[alias_fastpath]"
+
+        # Pattern fast-path (L1): параметрическая фраза-шаблон → навык с
+        # извлечённым слотом, тоже минуя 3B. Стоит ПОСЛЕ точного алиаса (он
+        # быстрее и строже) и ДО агента — снимает с 3B весь класс команд с
+        # аргументом («громкость 30», «быстрый скан 10.0.0.1»).
+        if await self._try_pattern_fastpath(text):
+            return "[pattern_fastpath]"
 
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор

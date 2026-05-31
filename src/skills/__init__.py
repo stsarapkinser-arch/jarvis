@@ -37,6 +37,9 @@ from src.skills import learned as _learned        # noqa: E402,F401
 # Макросы/сценарии (композиция навыков). Импорт последним — ссылаются на
 # skill_id, уже зарегистрированные выше.
 from src.skills import macros as _macros           # noqa: E402,F401
+# Шаблоны со слотами (L1): параметрические команды → навык + слот, минуя 3B.
+# Ссылаются на skill_id выше (валидируется тестом), сами навыков не регистрируют.
+from src.skills import patterns as _patterns        # noqa: E402,F401
 
 __all__ = [
     "Skill",
