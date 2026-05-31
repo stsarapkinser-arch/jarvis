@@ -44,6 +44,9 @@ from src.inference.router import IntentCategory, IntentRouter
 from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
+from src.skills.learning import Candidate, SkillLearner
+from src.core.volition import ProactiveGate
+from src.memory import reflection
 
 log = logging.getLogger("jarvis.core")
 
@@ -295,6 +298,18 @@ class Jarvis(metaclass=Singleton):
         # Подтверждение разрушительного НАВЫКА (destructive skill) — отдельная
         # очередь от bash-подтверждения: на «да» переисполняем хендлер, а не bash.
         self._pending_skill: dict | None = None
+        # Self-authoring: предложение закрепить часто повторяемую fallback-команду
+        # как постоянный навык. На «да» — promote() пишет config/learned_skills.json,
+        # горячая перезагрузка регистрирует навык.
+        self._pending_learn: dict | None = None
+        # Учитель навыков: считает успешные fallback-команды; на пороге предлагает
+        # закрепить (см. _maybe_offer_learn / _try_resolve_learn).
+        self._learner = SkillLearner()
+        # Такт проактивной речи: тихие часы, анти-спам, подавление повторов.
+        self._proactive_gate = ProactiveGate(
+            min_interval_sec=self.PROACTIVE_INTERVAL,
+            silence_before_sec=self.PROACTIVE_INTERVAL,
+        )
         # Контекст для хендлеров навыков (spawn/run поверх этого оркестратора).
         self._skill_ctx = _SkillCtx(self)
         self._state_label: str = "IDLE"
@@ -592,6 +607,7 @@ class Jarvis(metaclass=Singleton):
             await asyncio.to_thread(
                 self.memory.remember, intent, cmd, f"background pid={pid}", "agent_bg", snap,
             )
+            self._note_learnable(intent, cmd, kind="spawn")
             return f"запущено в фоне, pid {pid}", False
 
         # Shadow Exec dry-run → реальное исполнение (тот же путь, что был).
@@ -611,6 +627,10 @@ class Jarvis(metaclass=Singleton):
             f"rc={rc}" if rc is not None else "detached"
         )
         await asyncio.to_thread(self.memory.remember, intent, cmd, result, "agent_bash", snap)
+        # Self-authoring: успешная не-разрушительная команда — кандидат на навык.
+        # Учитель сам решает (порог повторов); кандидат предлагается голосом позже.
+        if rc == 0:
+            self._note_learnable(intent, cmd, kind="run")
         return f"rc={rc}; {result[:400]}", False
 
     async def _dispatch_tool(
@@ -903,6 +923,72 @@ class Jarvis(metaclass=Singleton):
 
         return False
 
+    # ─────────────────── self-authoring (learned skills) ────────────────────
+    def _note_learnable(self, intent: str, cmd: str, kind: str) -> None:
+        """Отдать успешную fallback-команду учителю; стащить кандидата на потом.
+
+        Не перебиваем текущий интент — если команда дозрела до навыка,
+        предложение озвучится в конце process_intent (_maybe_offer_learn),
+        и только когда нет других ожидающих подтверждений."""
+        try:
+            cand = self._learner.observe(
+                intent, cmd, destructive=self._is_destructive(cmd), kind=kind,
+            )
+        except Exception:
+            log.exception("skill learner observe failed")
+            return
+        if cand is not None and self._pending_learn is None:
+            self._pending_learn = {"candidate": cand, "ts": time.time(), "offered": False}
+
+    async def _maybe_offer_learn(self) -> None:
+        """Озвучить предложение закрепить команду навыком, если кандидат созрел.
+
+        Вызывается в хвосте process_intent. Не предлагаем, если заняты другие
+        очереди подтверждений (чтобы «да/нет» не перепутались)."""
+        pending = self._pending_learn
+        if not pending or pending.get("offered"):
+            return
+        if self._pending_confirmation or self._pending_shadow or self._pending_skill:
+            return
+        cand: Candidate = pending["candidate"]
+        pending["offered"] = True
+        pending["ts"] = time.time()
+        self.say(
+            f"Сэр, вы просили это уже {cand.count} раза. "
+            f"Закрепить как постоянный навык? Скажите да или нет.",
+        )
+
+    async def _try_resolve_learn(self, text: str) -> bool:
+        """Обработать «да/нет» на предложение выучить навык.
+
+        На «да» — promote(): запись в config/learned_skills.json триггерит
+        горячую перезагрузку, на которой навык регистрируется. Возвращает True,
+        когда ветка поглотила интент."""
+        pending = self._pending_learn
+        if not pending or not pending.get("offered"):
+            return False
+        if time.time() - pending["ts"] > CONFIRMATION_TIMEOUT_SEC:
+            self._pending_learn = None
+            return False
+        if NEGATIVE_RE.search(text):
+            self._pending_learn = None
+            self.say(self.ack("cancel"))
+            return True
+        if AFFIRMATIVE_RE.search(text):
+            cand: Candidate = pending["candidate"]
+            self._pending_learn = None
+            # Говорим ДО записи: запись в config/ запустит os.execv-перезагрузку.
+            self.say(f"Запоминаю как навык: {cand.description}.")
+            try:
+                ok = await asyncio.to_thread(self._learner.promote, cand)
+            except Exception:
+                log.exception("skill promote failed")
+                ok = False
+            if not ok:
+                self.say("Не удалось закрепить навык, сэр.", tone="alert")
+            return True
+        return False
+
     async def _execute_with_healing(
         self,
         bash: str,
@@ -1013,6 +1099,8 @@ class Jarvis(metaclass=Singleton):
             return "[confirmation_handled]"
         if await self._try_resolve_skill(text):
             return "[skill_resolved]"
+        if await self._try_resolve_learn(text):
+            return "[learn_resolved]"
 
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор
@@ -1065,6 +1153,8 @@ class Jarvis(metaclass=Singleton):
             self.memory.remember,
             text, bash_joined, result, f"agent_{st.category.value.lower()}", snap,
         )
+        # Если за этот интент созрел кандидат в навыки — предложить закрепить.
+        await self._maybe_offer_learn()
         await self._state("IDLE", "")
         return "[agent_done]"
 
@@ -1604,14 +1694,16 @@ class Jarvis(metaclass=Singleton):
             try:
                 await asyncio.sleep(60)
                 now = time.time()
-                if now - self._last_say_ts < self.PROACTIVE_INTERVAL:
-                    continue
-                # Не проактивничаем чаще чем раз в PROACTIVE_INTERVAL
-                if now - _last_proactive_ts < self.PROACTIVE_INTERVAL:
-                    continue
                 state = SystemState()
-                if state.load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
-                    continue  # system busy — don't add speech load now
+                # Такт инициативы — единый гейт: тихие часы, анти-спам, простой.
+                if not self._proactive_gate.should_speak(
+                    now=now,
+                    last_say_ts=self._last_say_ts,
+                    last_proactive_ts=_last_proactive_ts,
+                    load_busy=state.load in (SystemLoad.HIGH, SystemLoad.CRITICAL),
+                    hour=time.localtime(now).tm_hour,
+                ):
+                    continue
 
                 snap = state.snapshot
 
@@ -1654,8 +1746,10 @@ class Jarvis(metaclass=Singleton):
                     log.exception("proactive phrase generation failed")
                     phrase = ""
 
-                if phrase:
+                # Не повторяем недавно сказанную тему (гейт ведёт окно дедупа).
+                if phrase and not self._proactive_gate.is_repeat(phrase):
                     _last_proactive_ts = time.time()
+                    self._proactive_gate.record(phrase)
                     self.say(phrase, tone="idle")
             except asyncio.CancelledError:
                 raise
@@ -1664,4 +1758,70 @@ class Jarvis(metaclass=Singleton):
 
     def start_proactive_loop(self) -> asyncio.Task:
         return asyncio.create_task(self._proactive_loop(), name="jarvis-proactive")
+
+    # ──────────────────── nightly memory reflection ──────────────────────────
+
+    REFLECTION_CHECK_SEC = 3600          # проверяем раз в час
+    REFLECTION_INTERVAL_SEC = 20 * 3600  # консолидируем не чаще раза в ~сутки
+
+    def _recent_memory_docs(self, hours: int = 24, limit: int = 24) -> list[str]:
+        """Собрать документы памяти за последние ``hours`` из warm+lite слоёв.
+
+        Синхронно (Chroma .get блокирующий) — вызывать через ``to_thread``."""
+        cutoff = time.time() - hours * 3600
+        docs: list[str] = []
+        for col in (self.memory.warm, self.memory.lite):
+            try:
+                data = col.get(where={"ts": {"$gte": cutoff}})
+                docs.extend(data.get("documents") or [])
+            except Exception:
+                log.debug("reflection: tier read failed", exc_info=True)
+        return docs[-limit:]
+
+    async def _reflection_loop(self) -> None:
+        """Раз в сутки в простое: перечитать недавнюю память, извлечь устойчивые
+        факты об операторе и записать их в core-слой (постоянная память)."""
+        await asyncio.sleep(120)  # дать системе подняться
+        last_run = 0.0
+        while True:
+            try:
+                await asyncio.sleep(self.REFLECTION_CHECK_SEC)
+                now = time.time()
+                if now - last_run < self.REFLECTION_INTERVAL_SEC:
+                    continue
+                if SystemState().load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
+                    continue  # не грузим мозг рефлексией под нагрузкой
+                if not await self._llm.health():
+                    continue
+                last_run = now
+                docs = await asyncio.to_thread(self._recent_memory_docs)
+                if not docs:
+                    continue
+                existing = await asyncio.to_thread(
+                    lambda: [d["document"] for d in self.memory.list_core()]
+                )
+
+                async def _reflect_llm(prompt: str) -> str:
+                    return await self._llama_complete(
+                        prompt,
+                        system=self.router.system_prompt_for(IntentCategory.CONVERSATION),
+                        max_tokens=200,
+                        temperature=0.3,
+                    )
+
+                written = await reflection.consolidate(
+                    docs=docs,
+                    existing_core_docs=existing,
+                    llm_complete=_reflect_llm,
+                    remember_core=self.memory.remember_core,
+                )
+                if written:
+                    log.info("reflection consolidated %d core facts", len(written))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("reflection loop error")
+
+    def start_reflection_loop(self) -> asyncio.Task:
+        return asyncio.create_task(self._reflection_loop(), name="jarvis-reflection")
 

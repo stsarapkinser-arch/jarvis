@@ -94,7 +94,7 @@ _LEXICON: dict[IntentCategory, tuple[str, ...]] = {
         r"файл", r"директор", r"папк", r"процесс", r"пакет", r"apt\b", r"dpkg",
         r"snap\b", r"pip\b", r"установ", r"удали", r"обнов", r"запуст", r"останов",
         r"перезапуст", r"kill\b", r"убей", r"systemctl", r"journal", r"сервис",
-        r"демон", r"диск", r"память", r"\bram\b", r"\bcpu\b", r"нагрузк", r"\bdf\b",
+        r"демон", r"диск", r"памят", r"\bram\b", r"\bcpu\b", r"нагрузк", r"\bdf\b",
         r"\bdu\b", r"\bps\b", r"\btop\b", r"chmod", r"chown", r"права\b", r"mount",
         r"смонтир", r"лог[аи]?\b", r"бэкап", r"backup", r"скрипт", r"cron",
         r"переменн", r"environment",
@@ -111,7 +111,7 @@ _LEXICON: dict[IntentCategory, tuple[str, ...]] = {
     ),
     IntentCategory.PENTEST_RECON: (
         r"\bnmap\b", r"скан", r"\bпорт", r"wireshark", r"tshark", r"tcpdump",
-        r"\bтрафик", r"перехват", r"\bснифф", r"sniff", r"разведк", r"\brecon\b",
+        r"\bтрафик", r"перехват", r"\bсниф", r"sniff", r"разведк", r"\brecon\b",
         r"уязвим", r"\bcve\b", r"эксплойт", r"exploit", r"\bхост", r"\barp\b",
         r"\bdns\b", r"nikto", r"masscan", r"aircrack", r"\bwifi\b", r"вай.?фай",
         r"metasploit", r"\bmsf", r"payload", r"\bбрут", r"brute", r"\bpcap\b",

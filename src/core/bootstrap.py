@@ -300,6 +300,7 @@ async def amain() -> None:
     mnemo.start()
 
     jarvis.start_proactive_loop()
+    jarvis.start_reflection_loop()   # nightly memory consolidation → core facts
     asyncio.create_task(_boot_greeting(jarvis), name="boot-greeting")
     asyncio.create_task(_prewarm_inference(jarvis), name="llm-prewarm")
 
