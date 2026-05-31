@@ -7,9 +7,21 @@
 ```
 src/
 ├── core/              # Основная орхестрация и точка входа
-│   ├── orchestrator.py    # Главный движок Jarvis (обработка команд, LLM)
+│   ├── orchestrator.py    # Главный движок Jarvis (диспетчеризация tool-вызовов)
 │   ├── entry_point.py     # Vosk слушатель и голосовой ввод
 │   └── bootstrap.py       # Инициализация и запуск системы
+│
+├── inference/         # Слой инференса (Native Function Calling)
+│   ├── openai_client.py   # Async HTTP-клиент к нативному llama-server
+│   ├── agent.py           # Обобщённый агентный цикл tool-calling
+│   ├── router.py          # Semantic Router: интент → категория + микро-промпт
+│   └── tools.py           # JSON-схемы инструментов (run_skill, execute_bash, …)
+│
+├── skills/            # Каталог навыков (Skill Registry) — run_skill
+│   ├── registry.py        # Ядро реестра: Skill, декоратор, enum для грамматики
+│   ├── ui_control.py      # KDE Plasma: приложения, звук, яркость, окна, медиа
+│   ├── system_ops.py      # Диагностика: cpu/ram/disk/battery/network/…
+│   └── pentest.py         # Разведка: nmap-пресеты, порты, ARP
 │
 ├── services/          # Фоновые сервисы и демоны
 │   ├── daemon_swarm.py    # Наблюдатели системных событий
@@ -18,31 +30,49 @@ src/
 │   └── watch_service.py   # Глубокое наблюдение за событиями
 │
 ├── memory/            # Управление памятью и состоянием
-│   ├── engine.py          # Хранилище дол Kronosгосрочной памяти
+│   ├── engine.py          # Хранилище долгосрочной памяти (ChronoMemory)
 │   ├── storage.py         # Векторная база данных (Mnemosyne)
-│   ├── ephemeral.py       # Временные данные и выполнение кода
+│   ├── ephemeral.py       # Эфемерный запуск кода в песочнице
 │   └── snapshot.py        # Снимки состояния системы
 │
 ├── ui/                # Пользовательский интерфейс
-│   ├── hud.py             # HUD и визуализация (PyQt6)
+│   ├── hud.py             # HUD и визуализация (PyQt6; Wayland layer-shell)
 │   ├── window_manager.py   # Управление окнами KWin
 │   └── pixel_renderer.py   # Рендеринг пикселей для дисплея
 │
 ├── audio/             # Обработка аудио
-│   └── fft_analyzer.py    # FFT анализ и Piper TTS
+│   ├── audio_engine.py    # Кинематографический голосовой тракт (Piper + SoX)
+│   └── fft_analyzer.py    # FFT анализ PCM для сферы HUD
 │
 ├── network/           # Сетевые утилиты
-│   └── scanner.py         # Сканирование сети (nmap)
+│   └── scanner.py         # Сканирование сети (nmap-стриминг на визор)
 │
 ├── security/          # Безопасность и выполнение
 │   └── execution.py       # Shadow execution и sandboxing
 │
 └── common/            # Общие утилиты
     ├── event_bus.py       # Шина событий
-    ├── parser.py          # Парсинг ответов и bash
+    ├── parser.py          # Очистка/санитизация bash для gated-fallback
     ├── singleton.py       # Singleton паттерн
-    └── repair.py          # Быстрое исправление ошибок
+    └── repair.py          # Быстрое исправление ошибок (QuickPatcher)
 ```
+
+## Архитектура команд: Skill Registry (`src/skills/`)
+
+Нейросеть **не пишет bash на лету**. Она переводит речь оператора в строгий
+`skill_id` из заранее написанного, протестированного каталога навыков, а Python
+исполняет заведомо рабочую функцию:
+
+1. `IntentRouter` (regex/embedding) классифицирует интент в категорию и отдаёт
+   короткий микро-промпт + каталог навыков категории.
+2. Модель вызывает `run_skill(skill_id, reply, …)` — `skill_id` ограничен
+   grammar-enum по каталогу, так что несуществующий навык невозможен.
+3. Оркестратор озвучивает `reply` и запускает хендлер навыка (выверенный
+   `qdbus6`/`wpctl`/`brightnessctl`/…). Разрушительные навыки (`destructive=True`)
+   проходят голосовое подтверждение.
+
+`execute_bash` остаётся **gated-fallback** для длинного хвоста: уходит в
+ShadowExec (песочница) и heal-цикл — редкий резерв, а не горячий путь.
 
 ## Соглашения по именованию
 
@@ -53,7 +83,7 @@ src/
 
 ## Импорты
 
-После реоргнизации все импорты используют полные пути:
+После реорганизации все импорты используют полные пути:
 
 ```python
 # Правильно ✓
@@ -135,8 +165,9 @@ backoff (1→2→4→…→30с), плановая перезагрузка ко
 ## Голос Джарвиса (TTS post-processing)
 
 Синтез речи: **Piper** (`piper/ru_RU-dmitry-medium.onnx`) → raw PCM →
-цепочка эффектов **sox** → `aplay`. Цепочки заданы в
-`src/core/orchestrator.py::SOX_PROFILES`.
+цепочка эффектов **sox** → `aplay`. Тракт вынесен в
+`src/audio/audio_engine.py` (`AcousticEngine`); DSP-цепочки по состоянию —
+в `_DSP_CHAINS`.
 
 Цель DSP — приблизить нейтральный TTS к **кино-Джарвису** (Пол Беттани):
 тёплый гладкий британский баритон, ровная подача, лёгкая «хай-фай»-комната.
