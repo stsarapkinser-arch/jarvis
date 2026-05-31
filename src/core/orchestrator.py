@@ -793,6 +793,15 @@ class Jarvis(metaclass=Singleton):
         if macro is None:
             return False
         log.info("macro: %r → %s (%d шагов)", text[:60], macro.id, len(macro.steps))
+        await self._run_macro(macro, text)
+        return True
+
+    async def _run_macro(self, macro: macros.Macro, text: str) -> None:
+        """Исполнить сценарий: интро-реплика + шаги-навыки + сводный брифинг.
+
+        Общий исполнитель для точного (``_try_macro``) и fuzzy
+        (``_try_fuzzy_fastpath``) путей — поведение идентично, отличается лишь
+        способ, которым макрос найден."""
         snap = await asyncio.to_thread(snapshot)
         await self._state("THINKING", macro.id)
         if macro.reply.strip():
@@ -821,6 +830,49 @@ class Jarvis(metaclass=Singleton):
         )
         self._record_turn(text, summary or macro.reply or self.ack("ok"))
         await self._state("IDLE", "")
+
+    async def _run_fastpath_skill(
+        self,
+        sk: skills.Skill,
+        text: str,
+        args: dict[str, Any],
+        *,
+        source: str,
+        reply: str | None = None,
+    ) -> bool:
+        """Исполнить одиночный навык вне агентного цикла — общий хвост всех
+        fast-path'ов (alias L0, pattern L1, fuzzy L1b).
+
+        ``source`` тегирует память (``{source}_skill``). ``reply`` — фраза для
+        озвучки у не-телеметрийных навыков (шаблонная у L1); None → короткий ack
+        (контекстную фразу без модели не сочинить). Разрушительный навык уходит
+        на голосовое подтверждение с переданными args. Всегда возвращает True."""
+        snap = await asyncio.to_thread(snapshot)
+
+        # Разрушительный навык — голосовое подтверждение (как из агентного цикла);
+        # переиспользуем очередь _pending_skill / _try_resolve_skill.
+        if sk.destructive:
+            self._pending_skill = {
+                "skill": sk, "args": dict(args), "intent": text,
+                "snap": snap, "ts": time.time(),
+            }
+            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
+            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            return True
+
+        await self._state("THINKING", sk.id)
+        result = await self._invoke_skill(sk, dict(args))
+        # speaks_result → живой результат хендлера (телеметрия); иначе — переданная
+        # reply (шаблонная у L1) либо короткий ack.
+        spoken = result if sk.speaks_result else (reply if reply is not None else self.ack("ok"))
+        if spoken.strip():
+            self.say(spoken.strip())
+            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken.strip()))
+        await asyncio.to_thread(
+            self.memory.remember, text, f"skill:{sk.id}", result, f"{source}_skill", snap,
+        )
+        self._record_turn(text, spoken)
+        await self._state("IDLE", "")
         return True
 
     async def _try_alias_fastpath(self, text: str) -> bool:
@@ -837,33 +889,7 @@ class Jarvis(metaclass=Singleton):
         if sk is None:
             return False
         log.info("alias fast-path: %r → skill=%s", text[:60], sk.id)
-        snap = await asyncio.to_thread(snapshot)
-
-        # Разрушительный навык — то же голосовое подтверждение, что и из
-        # агентного цикла (переиспользуем очередь _pending_skill / _try_resolve_skill).
-        if sk.destructive:
-            self._pending_skill = {
-                "skill": sk, "args": {}, "intent": text,
-                "snap": snap, "ts": time.time(),
-            }
-            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
-            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
-            return True
-
-        await self._state("THINKING", sk.id)
-        result = await self._invoke_skill(sk, {})
-        # speaks_result → озвучиваем живой результат хендлера (телеметрия);
-        # иначе — короткий ack (контекстную фразу без модели не сочинить).
-        spoken = result if sk.speaks_result else self.ack("ok")
-        if spoken.strip():
-            self.say(spoken.strip())
-            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken.strip()))
-        await asyncio.to_thread(
-            self.memory.remember, text, f"skill:{sk.id}", result, "alias_skill", snap,
-        )
-        self._record_turn(text, spoken)
-        await self._state("IDLE", "")
-        return True
+        return await self._run_fastpath_skill(sk, text, {}, source="alias")
 
     async def _try_pattern_fastpath(self, text: str) -> bool:
         """Параметрическая фраза-ШАБЛОН → навык с извлечённым слотом, минуя 3B (L1).
@@ -872,12 +898,7 @@ class Jarvis(metaclass=Singleton):
         КЛАСС команд с аргументом — «громкость 30», «яркость на 70», «быстрый
         скан 10.0.0.1». Раньше всё это уходило на 3B (медленно, и модель путалась
         в извлечении слота); теперь regex с именованными группами достаёт слот
-        детерминированно и зовёт выверенный навык. Возвращает True, если поглощено.
-
-        Структурно повторяет _try_alias_fastpath (то же подтверждение
-        разрушительных, та же запись в память/диалог); отличие — навык зовётся с
-        извлечёнными args, а озвучивается шаблонная reply (модели тут нет, фразу
-        не сочинить)."""
+        детерминированно и зовёт выверенный навык. Возвращает True, если поглощено."""
         pm = patterns.match(text)
         if pm is None:
             return False
@@ -888,33 +909,26 @@ class Jarvis(metaclass=Singleton):
             log.warning("pattern fast-path: навык %r не зарегистрирован — отдаю агенту", pm.skill_id)
             return False
         log.info("pattern fast-path: %r → skill=%s args=%s", text[:60], sk.id, pm.args)
-        snap = await asyncio.to_thread(snapshot)
+        return await self._run_fastpath_skill(sk, text, dict(pm.args), source="pattern", reply=pm.reply)
 
-        # Разрушительный навык — то же голосовое подтверждение (с извлечёнными
-        # args), что и из alias fast-path / агентного цикла.
-        if sk.destructive:
-            self._pending_skill = {
-                "skill": sk, "args": dict(pm.args), "intent": text,
-                "snap": snap, "ts": time.time(),
-            }
-            await self._state("ALERT", f"CONFIRM skill: {sk.id}")
-            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+    async def _try_fuzzy_fastpath(self, text: str) -> bool:
+        """L1b: fuzzy-совпадение фразы с алиасом макроса/навыка → исполнить, минуя
+        3B. Спасательная ступень ПОСЛЕ точных L0/L1/L1a и ПЕРЕД агентом: гасит
+        дрейф Vosk («терминэл» → «терминал»), когда точного совпадения нет.
+
+        Сценарий выше одиночного навыка (как и при точном матче). Строгие гарды
+        (длина/порог/зазор, исключение разрушительных) живут в registry.fuzzy_*
+        — здесь только диспетчеризация на общие исполнители."""
+        macro = macros.fuzzy_match_macro(text)
+        if macro is not None:
+            log.info("fuzzy macro: %r → %s", text[:60], macro.id)
+            await self._run_macro(macro, text)
             return True
-
-        await self._state("THINKING", sk.id)
-        result = await self._invoke_skill(sk, dict(pm.args))
-        # speaks_result → живой результат хендлера (телеметрия); иначе —
-        # подтверждающая шаблонная фраза со слотом (parallel to action).
-        spoken = result if sk.speaks_result else pm.reply
-        if spoken.strip():
-            self.say(spoken.strip())
-            await self.bus.publish(Event(EventType.TOKEN_STREAM, spoken.strip()))
-        await asyncio.to_thread(
-            self.memory.remember, text, f"skill:{sk.id}", result, "pattern_skill", snap,
-        )
-        self._record_turn(text, spoken)
-        await self._state("IDLE", "")
-        return True
+        sk = skills.fuzzy_match_alias(text)
+        if sk is not None:
+            log.info("fuzzy alias: %r → skill=%s", text[:60], sk.id)
+            return await self._run_fastpath_skill(sk, text, {}, source="fuzzy")
+        return False
 
     async def _run_agent_for_intent(
         self,
@@ -1345,6 +1359,13 @@ class Jarvis(metaclass=Singleton):
         # аргументом («громкость 30», «быстрый скан 10.0.0.1»).
         if await self._try_pattern_fastpath(text):
             return "[pattern_fastpath]"
+
+        # Fuzzy fast-path (L1b): фраза с дрейфом распознавания Vosk, не давшая
+        # точного совпадения, спасается ближайшим алиасом/макросом (строгие гарды
+        # против ложных срабатываний — в registry.fuzzy_*). Последний шанс минуть
+        # 3B перед дорогим агентным циклом.
+        if await self._try_fuzzy_fastpath(text):
+            return "[fuzzy_fastpath]"
 
         # Голосовой триггер «диагностики» — HUD оверлей с метриками. Не
         # завершаем здесь: LLM/память тоже видят запрос (вдруг оператор

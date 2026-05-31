@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from src.skills.registry import normalize_phrase
+from src.skills.registry import fuzzy_best, normalize_phrase
 
 log = logging.getLogger("jarvis.macros")
 
@@ -59,6 +59,16 @@ def match_macro(text: str) -> Macro | None:
     """Точное нормализованное совпадение фразы с алиасом макроса, иначе None."""
     mid = _ALIAS_INDEX.get(normalize_phrase(text))
     return _MACROS.get(mid) if mid else None
+
+
+def fuzzy_match_macro(text: str) -> Macro | None:
+    """Fuzzy-совпадение фразы с алиасом макроса (L1b), иначе None.
+
+    Те же строгие гарды, что и у навыков (длина/порог/зазор) — общий движок
+    ``fuzzy_best``. Сценарий выше одиночного навыка и при fuzzy: проверяется
+    первым."""
+    gid = fuzzy_best(text, _ALIAS_INDEX.items())
+    return _MACROS.get(gid) if gid else None
 
 
 def all_macros() -> tuple[Macro, ...]:
@@ -132,6 +142,7 @@ __all__ = [
     "Step",
     "register",
     "match_macro",
+    "fuzzy_match_macro",
     "all_macros",
     "reset",
 ]

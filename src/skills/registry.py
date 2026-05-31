@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -127,6 +128,68 @@ def match_alias(text: str) -> Skill | None:
     return _REGISTRY.get(sid)
 
 
+# ─────────────────────────── Fuzzy-матч (L1b) ───────────────────────────
+# Спасательная ступень ПЕРЕД 3B: гасит дрейф распознавания Vosk («терминэл» →
+# «терминал»), когда точного совпадения нет. Строгие гарды против ложных
+# срабатываний: минимальная длина (короткие команды надёжны и так), высокий
+# порог близости и ЗАПАС над вторым кандидатом (неоднозначное — лучше 3B).
+FUZZY_THRESHOLD = 0.86   # difflib ratio: ниже — не уверены, отдаём 3B
+FUZZY_MARGIN = 0.06      # лучший должен опережать второй (иначе неоднозначно)
+FUZZY_MIN_LEN = 6        # и фраза, и алиас короче — только точный матч
+
+
+def fuzzy_best(
+    text: str,
+    items: Iterable[tuple[str, str]],
+    *,
+    threshold: float = FUZZY_THRESHOLD,
+    margin: float = FUZZY_MARGIN,
+    min_len: int = FUZZY_MIN_LEN,
+) -> str | None:
+    """Лучший group_id для фразы среди ``items`` (alias_key → group_id), иначе None.
+
+    Группировка по ``group_id`` (а не по алиасу) важна: синонимы ОДНОЙ цели не
+    создают ложной неоднозначности — сравниваем лучший балл цели с лучшим баллом
+    ДРУГОЙ цели. None при: короткой фразе, балле ниже порога, или зазоре с
+    ближайшей другой целью меньше ``margin``."""
+    key = _normalize_phrase(text)
+    if len(key) < min_len:
+        return None
+    per_group: dict[str, float] = {}
+    for alias, gid in items:
+        if len(alias) < min_len:
+            continue
+        ratio = SequenceMatcher(None, key, alias).ratio()
+        if ratio > per_group.get(gid, 0.0):
+            per_group[gid] = ratio
+    if not per_group:
+        return None
+    best_gid = max(per_group, key=lambda g: per_group[g])
+    best = per_group[best_gid]
+    if best < threshold:
+        return None
+    others = [r for g, r in per_group.items() if g != best_gid]
+    if others and best - max(others) < margin:
+        return None  # неоднозначно — отдаём 3B
+    return best_gid
+
+
+def fuzzy_match_alias(text: str) -> "Skill | None":
+    """Fuzzy-совпадение фразы с алиасом → навык, иначе None.
+
+    Разрушительные навыки в fuzzy-индекс НЕ входят: близкое-по-звучанию никогда
+    не должно тянуть за собой `destructive` (его подтверждают, но даже вопрос
+    «снести всё?» на ослышке недопустим). Их по-прежнему запускает только точный
+    алиас + голосовое подтверждение."""
+    items = (
+        (alias, sid)
+        for alias, sid in _ALIAS_INDEX.items()
+        if (sk := _REGISTRY.get(sid)) is not None and not sk.destructive
+    )
+    gid = fuzzy_best(text, items)
+    return _REGISTRY.get(gid) if gid else None
+
+
 def skill(
     *,
     id: str,
@@ -199,6 +262,8 @@ __all__ = [
     "skill",
     "get",
     "match_alias",
+    "fuzzy_match_alias",
+    "fuzzy_best",
     "normalize_phrase",
     "all_skills",
     "skill_ids",
