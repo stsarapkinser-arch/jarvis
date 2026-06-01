@@ -1,28 +1,40 @@
-"""Shadow Exec — predictive safe-execution layer.
+"""Sandboxing for LLM-emitted bash — ONE module, TWO modes.
 
 Every bash command Jarvis runs is LLM-emitted (there is no static command
-book) — so every command is first dry-run inside a sandbox. We try, in
-order:
+book), so it is always confined. The two modes differ only by *integration
+shape*, not by security philosophy — both are namespace sandboxes that drop
+the network, caps and the real $HOME. Keeping them side by side here (instead
+of scattering one into common/parser.py) makes that shared intent explicit and
+the hardening easy to audit in one place.
 
-1. **bwrap** (Bubblewrap, ``flatpak --version`` shipping it on Kali by
-   default) with ``--unshare-all`` (no network, no user, no IPC, no UTS),
-   ``--die-with-parent`` and a sealed-off home (``--tmpfs /home``,
-   ``--tmpfs /root``). The root filesystem is read-only-bound so the
-   command can still resolve binaries.
-2. **podman run --rm --network none --read-only --userns keep-id** as a
-   second-line container fallback. Slower to spin up but it works on
-   minimal Kali images that ship podman but not bwrap.
-3. A pure-Python fallback that simply *refuses* to run — better to abort
-   than to execute untrusted bash outside a sandbox.
+MODE 1 — :class:`ShadowExec` (isolated dry-run, captures rc/stdout).
+    Used to *simulate* a command before it ever touches the host. We spawn it
+    directly (argv prefix to ``create_subprocess_exec``) so we can capture the
+    real exit code. Engines, in order:
+      1. **bwrap** (Bubblewrap) ``--unshare-all`` (no net/user/IPC/UTS),
+         ``--die-with-parent``, sealed-off home (``--tmpfs /home`` & ``/root``),
+         read-only-bound root so binaries still resolve.
+      2. **podman run --rm --network none --read-only** container fallback for
+         minimal images that ship podman but not bwrap.
+      3. Pure-Python *refuse* — better to abort than run untrusted bash bare.
+    rc==0 → HUD green safe-pulse + the caller asks for voice confirmation.
 
-If the sandboxed run returns ``rc == 0`` the HUD gets a green safe-pulse
-and the operator is asked to confirm by voice (handled by the caller).
+MODE 2 — :func:`wrap_sandbox` (inline jail string for a REAL, caged run).
+    Used for the rare command the model self-flagged risky (e.g. ``curl|bash``):
+    it must actually run on the host but caged. Since that goes through the
+    shell pipeline (``run_bash``), this returns a *command string* prefixing the
+    payload with a jail. Engines, in order: **firejail** (namespaces + seccomp +
+    cap-drop + ``--net=none`` + blacklists) → **systemd-run --user --scope**
+    (cgroup Protect* knobs) → raw bash. The dry-run prefers bwrap (it captures
+    rc cleanly via argv); wrap prefers firejail (it composes as a shell prefix) —
+    same idea, two entry shapes.
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import logging
+import shlex
 import shutil
 from collections.abc import Iterable
 
@@ -188,4 +200,69 @@ def needs_shadow(command: str) -> bool:
     return bool(command.strip())
 
 
-__all__ = ["ShadowExec", "ShadowResult", "needs_shadow", "DESTRUCTIVE_SUBSTRINGS"]
+# ───────────────────── MODE 2: inline jail string (real, caged run) ─────────
+def wrap_sandbox(cmd: str) -> str:
+    """Wrap a potentially-untrusted LLM-generated command in a hardened jail.
+
+    Returns a *command string* (not a result): the caller runs it through the
+    normal shell pipeline, so the command really executes — but caged. Defaults
+    are deliberately aggressive — this is for commands the model flagged risky
+    itself (e.g. ``curl|bash``). Anything that truly needs real $HOME or live
+    network shouldn't be sandboxed at all: it belongs on the unsandboxed path
+    behind the destructive-command voice gate (core.Jarvis._gate_destructive).
+
+    Layer order: firejail (preferred — namespace + seccomp + cap drop) →
+    systemd-run user scope (cgroup + ProtectHome/ProtectSystem) → raw bash.
+
+    Contrast with :class:`ShadowExec`, which *simulates* in full isolation and
+    captures rc; this wraps a real run. Same security intent, different shape."""
+    if not cmd.strip():
+        return cmd
+    if shutil.which("firejail"):
+        flags = [
+            "--quiet",
+            "--noprofile",
+            "--private",              # tmpfs $HOME — no leaking ~/.ssh, ~/.config, ~/jarvis
+            "--private-tmp",
+            "--private-dev",          # minimal /dev — no raw block devices, no /dev/mem
+            "--net=none",             # no outbound packets, no DNS
+            "--caps.drop=all",        # CAP_NET_RAW, CAP_SYS_ADMIN, … all gone
+            "--nonewprivs",           # PR_SET_NO_NEW_PRIVS — defeats setuid escalation
+            "--seccomp",              # default deny-list against ptrace, mount, kexec, etc.
+            "--blacklist=/root",
+            "--blacklist=/etc/shadow",
+            "--blacklist=/etc/sudoers",
+            "--blacklist=/etc/sudoers.d",
+            "--read-only=/etc",
+            "--read-only=/usr",
+        ]
+        return "firejail " + " ".join(flags) + " -- bash -c " + shlex.quote(cmd)
+    if shutil.which("systemd-run"):
+        # systemd-run --user --scope can't do user-namespace tricks, but the
+        # cgroup-level Protect* knobs and RestrictAddressFamilies still give a
+        # serviceable jail when firejail isn't installed.
+        flags = [
+            "--user", "--scope", "--quiet",
+            "-p", "PrivateTmp=yes",
+            "-p", "PrivateDevices=yes",
+            "-p", "ProtectHome=tmpfs",
+            "-p", "ProtectSystem=strict",
+            "-p", "ProtectKernelModules=yes",
+            "-p", "ProtectKernelTunables=yes",
+            "-p", "ProtectControlGroups=yes",
+            "-p", "NoNewPrivileges=yes",
+            "-p", "CapabilityBoundingSet=",
+            "-p", "RestrictNamespaces=yes",
+            "-p", "RestrictAddressFamilies=AF_UNIX",
+        ]
+        return "systemd-run " + " ".join(flags) + " -- bash -c " + shlex.quote(cmd)
+    return cmd
+
+
+__all__ = [
+    "ShadowExec",
+    "ShadowResult",
+    "needs_shadow",
+    "wrap_sandbox",
+    "DESTRUCTIVE_SUBSTRINGS",
+]

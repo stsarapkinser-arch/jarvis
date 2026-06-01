@@ -28,10 +28,9 @@ from src.common.parser import (
     clean_bash,
     inject_sudo,
     run_bash,
-    wrap_sandbox,
 )
 from src.common.repair import QuickPatcher
-from src.security.execution import ShadowExec, needs_shadow
+from src.security.execution import ShadowExec, needs_shadow, wrap_sandbox
 from src.common.singleton import Singleton
 from src.memory.snapshot import StateSnapshot, snapshot
 from src.inference.openai_client import (
