@@ -4,6 +4,8 @@ import asyncio
 import logging
 import re
 import shutil
+import time
+from collections import deque
 
 from src.common.event_bus import Event, EventBus, EventType
 from src.common.singleton import Singleton
@@ -15,6 +17,25 @@ ALERT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Строки журнала о САМОМ Jarvis (его юниты, мозг/эмбеддер, голосовой стек) НЕ
+# должны влетать обратно как внешние алерты — иначе «jarvis.service: Failed…» →
+# DAEMON_ALERT → process_intent → 3B логирует/падает → новая строка журнала →
+# петля обратной связи (именно она затопила и уронила llama-server в логе
+# оператора). Отбрасываем их ещё до публикации события.
+_SELF_RE = re.compile(
+    r"jarvis|llama[-_ ]?server|llama\.cpp|vosk|piper|mnemosyne|chronomemory",
+    re.IGNORECASE,
+)
+
+# Бэкпрешер журнального наблюдателя: дедуп одинаковых строк в окне + жёсткий
+# потолок алертов в минуту. Журнал на err-приоритете при буте/проблемах сыпет
+# пачками; без этого каждый из них будил бы тяжёлую 3B (ТЗ: 3B — крайняя
+# редкость). Реальные новые события проходят; шум и повторы гасятся.
+_ALERT_DEDUP_SEC = 300.0
+_ALERT_MAX_PER_MIN = 5
+_ALERT_DEDUP_MAX = 256          # потолок словаря дедупа (анти-рост памяти)
+
+
 
 class DaemonSwarm(metaclass=Singleton):
     """Background observers that publish events to the bus."""
@@ -23,6 +44,42 @@ class DaemonSwarm(metaclass=Singleton):
         self.bus = EventBus()
         self._qdbus: str | None = shutil.which("qdbus6") or shutil.which("qdbus")
         self._last_clipboard: dict[str, str] = {}
+        # Бэкпрешер журнальных алертов: ключ дедупа → последний ts; и окно
+        # таймстампов для рейт-лимита.
+        self._alert_seen: dict[str, float] = {}
+        self._alert_window: deque[float] = deque()
+
+    @staticmethod
+    def _dedup_key(line: str) -> str:
+        """Свернуть строку журнала к смысловому ядру для дедупа: убрать цифры
+        (таймстампы/pid'ы меняются от строки к строке) и схлопнуть пробелы."""
+        return re.sub(r"\s+", " ", re.sub(r"\d+", "", line)).strip().lower()
+
+    def _alert_allowed(self, line: str) -> bool:
+        """Пропустить алерт? Дедуп одинаковых в окне + потолок в минуту.
+
+        НЕ пропускаем (False): повтор того же события внутри ``_ALERT_DEDUP_SEC``
+        или превышение ``_ALERT_MAX_PER_MIN`` за последние 60с. Так бурст
+        журнала не будит 3B пачкой."""
+        now = time.monotonic()
+        key = self._dedup_key(line)
+        last = self._alert_seen.get(key)
+        if last is not None and now - last < _ALERT_DEDUP_SEC:
+            return False
+        # Рейт-лимит по скользящему окну 60с.
+        while self._alert_window and now - self._alert_window[0] > 60.0:
+            self._alert_window.popleft()
+        if len(self._alert_window) >= _ALERT_MAX_PER_MIN:
+            return False
+        self._alert_window.append(now)
+        self._alert_seen[key] = now
+        # Анти-рост словаря дедупа: при переполнении дропаем старейшие.
+        if len(self._alert_seen) > _ALERT_DEDUP_MAX:
+            for old in sorted(self._alert_seen, key=self._alert_seen.get)[
+                : len(self._alert_seen) - _ALERT_DEDUP_MAX
+            ]:
+                self._alert_seen.pop(old, None)
+        return True
 
     async def watch_journal(self) -> None:
         try:
@@ -50,6 +107,12 @@ class DaemonSwarm(metaclass=Singleton):
                     continue
                 line = raw.decode(errors="replace").strip()
                 if not line or not ALERT_RE.search(line):
+                    continue
+                # Не реагируем на собственные логи (петля обратной связи).
+                if _SELF_RE.search(line):
+                    continue
+                # Дедуп + рейт-лимит: бурст журнала не будит 3B пачкой.
+                if not self._alert_allowed(line):
                     continue
                 await self.bus.publish(
                     Event(EventType.DAEMON_ALERT, line, urgency="high")
