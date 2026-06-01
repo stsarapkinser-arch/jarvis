@@ -26,7 +26,7 @@ AUDIO_FFT → сфера HUD пульсирует синхронно с голо
   • highpass 120 → 90. Кино-Джарвис — тёплый БАРИТОН, а не тонкий «комм».
     Срез на 120 Гц убивает основной тон мужского голоса (~100–120 Гц) и делает
     его жестяным. 90 Гц убирает субсоник-гул, сохраняя грудь.
-  • Добавлен pitch -80 cents. Голос «dmitry» — средний мужской; лёгкий сдвиг
+  • Добавлен pitch -80 cents. Голос «dmitri» — средний мужской; лёгкий сдвиг
     вниз даёт баритон-гравитас (центральная черта кино-голоса). Дёшево на N100.
   • equalizer 10000 → ~8000. Модель Piper = 22050 Гц (Найквист 11025). Пик на
     10 кГц поднимает в основном сибилянты/шум у самой границы. 8 кГц — «воздух»,
@@ -53,6 +53,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Optional
 
+from src.audio.adaptive_gain import (
+    AGCConfig,
+    AdaptiveGainController,
+    AmbientNoiseHub,
+)
 from src.audio.fft_analyzer import PiperFFTPump
 from src.audio.segmentation import split_sentences
 from src.common.event_bus import Event, EventBus, EventType, SystemLoad, SystemState
@@ -67,6 +72,13 @@ APLAY_BIN: Optional[str] = shutil.which("aplay")
 # склеиваем лишь совсем мелкие огрызки.
 _STREAM_MIN_SENTENCE_CHARS = 12
 _SAMPLE_RATE = 22050
+
+# Адаптивная громкость (AGC): финальная ступень piper→sox→[AGC]→aplay. Делает
+# уровень голоса стабильным между фразами (гонит к одной цели) и подстраивает его
+# под внешний шум прямо в процессе речи. Выключается JARVIS_ADAPTIVE_VOLUME=0
+# (тогда тракт прежний: sox → aplay напрямую). Требует и sox, и aplay.
+_ADAPTIVE_VOLUME = os.getenv("JARVIS_ADAPTIVE_VOLUME", "1") != "0"
+_GAIN_PUMP_CHUNK = 2048  # байт S16_LE (~46 мс при 22050) — баланс реакции/нагрузки
 
 # Ambient-источник света/proximity (внешний продьюсер пишет JSON). Если файл
 # свеж (≤60 с) — используем; иначе fallback на час суток для night-режима.
@@ -112,6 +124,17 @@ _STATE_PROSODY: dict[VoiceState, tuple[float, float]] = {
 _BASE_LENGTH_SCALE = 1.0
 _LENGTH_SCALE_FLOOR = 0.55
 _LENGTH_SCALE_CEIL = 1.5
+
+# Смещение целевой громкости AGC по состоянию (dB): NIGHT тише, ALERT чуть
+# громче. Раньше «тише ночью» давал отдельный gain в DSP-цепочке, из-за чего
+# громкость прыгала скачком при смене профиля. Теперь это смещение цели AGC, а
+# переход сглаживает слю-лимит gain — стабильно, без рывка между фразами.
+_STATE_GAIN_BIAS: dict[VoiceState, float] = {
+    VoiceState.IDLE:   -2.0,
+    VoiceState.NORMAL:  0.0,
+    VoiceState.ALERT:   1.0,
+    VoiceState.NIGHT:  -6.0,
+}
 
 # Сырой ввод/вывод SoX: S16_LE mono 22050 → S16_LE mono 22050 (raw↔raw).
 _DSP_IO_ARGS: tuple[str, ...] = (
@@ -262,6 +285,13 @@ class AcousticEngine:
         self.voice_model = voice_model
         self.voice_config = voice_config
         self._fft_pump = fft_pump or PiperFFTPump(bus)
+
+        # Адаптивная громкость: один контроллер на весь движок (состояние gain
+        # переживает фразы → между репликами уровень непрерывен, без скачков).
+        # Hub — общий с голосовым слушателем источник оценки внешнего шума.
+        self._agc_enabled = _ADAPTIVE_VOLUME
+        self._gain_ctrl = AdaptiveGainController(AGCConfig.from_env())
+        self._noise_hub = AmbientNoiseHub()
 
         # (text, state, speed|None, pause|None); None = сигнал остановки воркера.
         self._queue: "queue.Queue[tuple[str, VoiceState, float | None, float | None] | None]" = (
@@ -426,10 +456,48 @@ class AcousticEngine:
             except Exception:
                 log.exception("acoustic worker loop error")
 
+    def _start_gain_pump(self, src: IO[bytes], dst: IO[bytes]) -> threading.Thread:
+        """Daemon-поток: src(DSP-PCM) → адаптивный gain → dst(aplay). Каждый чанк
+        берёт свежую оценку шума из hub и публикует обратно свой выходной уровень
+        (для де-эха при оценке шума во время речи). Закрывает dst по EOF от src."""
+        ctrl = self._gain_ctrl
+        hub = self._noise_hub
+        sr = _SAMPLE_RATE
+        chunk = _GAIN_PUMP_CHUNK
+
+        def _runner() -> None:
+            try:
+                while True:
+                    data = src.read(chunk)
+                    if not data:
+                        break
+                    ctrl.set_ambient(hub.ambient_dbfs())
+                    dt = (len(data) // 2) / sr
+                    out = ctrl.process(data, dt)
+                    try:
+                        dst.write(out)
+                    except (BrokenPipeError, OSError):
+                        break
+                    # Свой выходной уровень → hub: при оценке шума во время речи
+                    # его вычтут из микрофона (де-эхо), чтобы не словить обратную
+                    # связь «громче → микрофон громче → ещё громче».
+                    hub.set_self_output(ctrl.output_dbfs)
+            except Exception:
+                log.debug("adaptive gain pump error", exc_info=True)
+            finally:
+                try:
+                    dst.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_runner, daemon=True, name="jarvis-agc")
+        t.start()
+        return t
+
     def _play(
         self, text: str, state: VoiceState, speed: float | None, pause: float | None
     ) -> None:
-        """piper → (sox DSP) → aplay. PCM ответвляется в FFT-памп для сферы HUD."""
+        """piper → (sox DSP) → [AGC] → aplay. PCM ответвляется в FFT-памп для HUD."""
         if not Path(self.piper_path).is_file():
             log.error("Piper binary not found at %s — TTS disabled", self.piper_path)
             return
@@ -441,7 +509,14 @@ class AcousticEngine:
         profile = self._select_profile(state)
         sox_args = _DSP_CHAINS.get(profile, _DSP_CHAINS[VoiceState.NORMAL])
 
+        # Адаптивная ступень громкости включается только при наличии sox И aplay:
+        # она садится МЕЖДУ ними (piper→sox→[AGC]→aplay), чтобы работать с уже
+        # обработанным DSP-сигналом и не конфликтовать с компрессией sox.
+        adaptive = self._agc_enabled and SOX_BIN is not None and APLAY_BIN is not None
+        self._gain_ctrl.set_state_bias(_STATE_GAIN_BIAS.get(profile, 0.0))
+
         piper = sox = aplay = None
+        gain_thread: threading.Thread | None = None
         try:
             # 1) Piper: текст → сырой PCM. bufsize=0 — без буферной задержки.
             piper = subprocess.Popen(
@@ -464,22 +539,26 @@ class AcousticEngine:
                     stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
                 )
 
-            # 3) SoX DSP между piper и aplay (Bettany Signature).
+            # 3) SoX DSP между piper и aplay (Bettany Signature). В адаптивном
+            # режиме stdout sox идёт в PIPE (его читает AGC-памп), иначе — прямо
+            # в aplay.stdin, как раньше.
             if SOX_BIN and aplay is not None:
                 try:
                     sox = subprocess.Popen(
                         [SOX_BIN, *_DSP_IO_ARGS, *sox_args],
-                        stdin=subprocess.PIPE, stdout=aplay.stdin,
+                        stdin=subprocess.PIPE,
+                        stdout=(subprocess.PIPE if adaptive else aplay.stdin),
                         stderr=subprocess.DEVNULL, bufsize=0,
                     )
                 except Exception:
                     log.exception("sox DSP startup failed; raw piper→aplay fallback")
                     sox = None
                 else:
-                    # sox теперь владеет write-end'ом aplay.stdin. Закрываем
+                    # Без AGC sox владеет write-end'ом aplay.stdin — закрываем
                     # родительскую копию, иначе aplay не получит EOF после выхода
                     # sox и aplay.wait() зависнет навсегда (классическая pipe-ловушка).
-                    if aplay.stdin is not None:
+                    # В адаптивном режиме aplay.stdin держит и закрывает AGC-памп.
+                    if not adaptive and aplay.stdin is not None:
                         try:
                             aplay.stdin.close()
                         except Exception:
@@ -505,8 +584,20 @@ class AcousticEngine:
             # FFT-памп тее'ит piper.stdout → sink и в анализатор (сфера HUD).
             self._fft_pump.start_pump(piper.stdout, sink, label=f"piper[{profile.value}]")
 
+            # Финальная адаптивная ступень: sox.stdout → AGC (подстройка под шум,
+            # стабилизация уровня) → aplay.stdin. Памп сам закроет aplay.stdin по
+            # EOF от sox, дав aplay корректный конец потока.
+            if (
+                adaptive and sox is not None and sox.stdout is not None
+                and aplay is not None and aplay.stdin is not None
+            ):
+                gain_thread = self._start_gain_pump(sox.stdout, aplay.stdin)
+
             if sox is not None:
                 sox.wait()
+            # Дождаться слива остатка через AGC и закрытия aplay.stdin ДО aplay.wait().
+            if gain_thread is not None:
+                gain_thread.join()
             if aplay is not None:
                 aplay.wait()
             piper.wait()

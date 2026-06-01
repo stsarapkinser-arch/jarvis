@@ -19,6 +19,7 @@ except Exception:  # noqa: BLE001
     KaldiRecognizer = None  # type: ignore[assignment,misc]
     Model = None  # type: ignore[assignment,misc]
 
+from src.audio.adaptive_gain import AmbientNoiseHub, rms_dbfs_pcm16
 from src.audio.wakeword import build_gate
 from src.common.event_bus import Event, EventBus, EventType
 from src.common.singleton import Singleton
@@ -66,6 +67,12 @@ class JarvisMain(metaclass=Singleton):
         # (feed() → True всегда), поэтому конструктор безопасен и в тестах, и
         # без openwakeword. Включается JARVIS_WAKEWORD=1.
         self._wake_gate = build_gate()
+        # Адаптивная громкость: слушатель — единственный владелец микрофона, поэтому
+        # ИМЕННО он замеряет внешний шум и кладёт в hub (второй InputStream на том
+        # же устройстве конфликтовал бы с ALSA). Замеряем КАЖДЫЙ кадр, в т.ч. пока
+        # Джарвис говорит (эхо-гейт их «дренирует», но для оценки шума они нужны —
+        # из них вычтется собственный голос). AGC-памп движка читает hub.
+        self._noise_hub = AmbientNoiseHub()
         # Аудио-стек не установлен — тихо в standby (модуль импортируем, но
         # слушать нечем). На N100 сюда не попадаем.
         if Model is None or KaldiRecognizer is None:
@@ -169,6 +176,16 @@ class JarvisMain(metaclass=Singleton):
                     _was_gated = False
                     while True:
                         data, _ = stream.read(READ_FRAMES)
+                        # Замер внешнего шума для адаптивной громкости голоса.
+                        # speaking=_gated(): пока Джарвис говорит, hub вычтет его
+                        # собственный уровень из микрофона (де-эхо). Дёшево и не
+                        # зависит от Vosk/wake-гейта, поэтому ДО них.
+                        try:
+                            self._noise_hub.feed_mic(
+                                rms_dbfs_pcm16(bytes(data)), speaking=self._gated()
+                            )
+                        except Exception:
+                            log.debug("ambient noise feed failed", exc_info=True)
                         # Эхо-гейт: Джарвис говорит — дренируем поток (иначе
                         # переполнится буфер), но в распознаватель НЕ отдаём.
                         if self._gated():

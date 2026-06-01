@@ -66,11 +66,11 @@ log = logging.getLogger("jarvis.core")
 # systemd, разные CWD, тесты — везде работает одинаково.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PIPER_PATH = str(_PROJECT_ROOT / "piper" / "piper")
-VOICE_MODEL = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.onnx")
+VOICE_MODEL = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitri-medium.onnx")
 # По умолчанию piper ищет config рядом с моделью под именем
 # <model>.onnx.json — но у оператора файл лежит как <model>.json (без
 # .onnx в середине). Передаём явно через --config, ничего не переименовывая.
-VOICE_CONFIG = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitry-medium.json")
+VOICE_CONFIG = str(_PROJECT_ROOT / "piper" / "ru_RU-dmitri-medium.json")
 SYSTEM_PROMPT_FILE = str(_PROJECT_ROOT / "config" / "system_prompt")
 
 # ───────────── Out-of-process LLM (native llama-server, OpenAI REST) ─────────
@@ -1856,4 +1856,3 @@ class Jarvis(RecognitionLadderMixin, BackgroundLoopsMixin, metaclass=Singleton):
         PROACTIVE_INTERVAL = max(5, int(float(os.getenv("JARVIS_PROACTIVE_INTERVAL", "1200"))))
     except (TypeError, ValueError):
         PROACTIVE_INTERVAL = 1200  # 20 minutes of silence → volunteer a status
-

@@ -369,7 +369,7 @@ backoff (1→2→4→…→30с), плановая перезагрузка ко
 
 ## Голос Джарвиса (TTS post-processing)
 
-Синтез речи: **Piper** (`piper/ru_RU-dmitry-medium.onnx`) → raw PCM →
+Синтез речи: **Piper** (`piper/ru_RU-dmitri-medium.onnx`) → raw PCM →
 цепочка эффектов **sox** → `aplay`. Тракт вынесен в
 `src/audio/audio_engine.py` (`AcousticEngine`); DSP-цепочки по состоянию —
 в `_DSP_CHAINS`.
@@ -399,4 +399,3 @@ sox -t raw -r 22050 -e signed -b 16 -c 1 /tmp/t.raw -d <эффекты-проф�
 
 > Примечание: при частоте 22050 Гц частота Найквиста = 11025 Гц, поэтому
 > shelf/eq выше ~11 кГц бессмысленны (теплота строится на низах и гладкости).
-

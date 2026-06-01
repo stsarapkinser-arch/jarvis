@@ -87,8 +87,8 @@ DRAFT_MODEL="${DRAFT_MODEL:-$REPO_ROOT/models/${DRAFT_NAME:-Qwen2.5-0.5B-Instruc
 EMBED_DIR="$REPO_ROOT/models/embed"
 VOSK_MODEL="$REPO_ROOT/model"
 PIPER_BIN="$REPO_ROOT/piper/piper"
-PIPER_VOICE="$REPO_ROOT/piper/ru_RU-dmitry-medium.onnx"
-PIPER_CFG="$REPO_ROOT/piper/ru_RU-dmitry-medium.json"
+PIPER_VOICE="$REPO_ROOT/piper/ru_RU-dmitri-medium.onnx"
+PIPER_CFG="$REPO_ROOT/piper/ru_RU-dmitri-medium.json"
 MEMORY_DIR="$REPO_ROOT/jarvis_memory"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
@@ -293,7 +293,7 @@ check_proactive() {
 check_voice() {
     hdr "[3] Голос (Piper TTS)"
     [ -x "$PIPER_BIN" ] && ok "piper-бинарь" || warn "нет piper-бинаря ($PIPER_BIN) — докачай: jarvis setup (или bash scripts/fetch_assets.sh)"
-    [ -f "$PIPER_VOICE" ] && ok "русский голос ru_RU-dmitry" || warn "нет голоса ($PIPER_VOICE) — докачай: jarvis setup"
+    [ -f "$PIPER_VOICE" ] && ok "русский голос ru_RU-dmitri" || warn "нет голоса ($PIPER_VOICE) — докачай: jarvis setup"
     [ -f "$PIPER_CFG" ] && ok "конфиг голоса" || warn "нет конфига голоса: $PIPER_CFG"
 }
 
