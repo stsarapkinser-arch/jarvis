@@ -257,7 +257,17 @@ class JarvisHUD(QMainWindow):
 
     # ──────── Lifecycle ────────
     def show_fullscreen(self) -> None:
-        self.showFullScreen()
+        # Оверлей-HUD кроет экран ГЕОМЕТРИЕЙ, а не режимом окна FullScreen:
+        # showFullScreen() внутри Qt вызывает activateWindow() → предупреждение
+        # «requestActivate() ... WindowDoesNotAcceptFocus» и попытка украсть
+        # фокус/спрятать панели на click-through окне. show() при выставленном
+        # WA_ShowWithoutActivating показывает без активации; топмост держат
+        # WindowStaysOnTopHint + KWin-pin. Геометрию переустанавливаем на случай
+        # смены/подключения монитора между __init__ и показом.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.setGeometry(screen.geometry())
+        self.show()
 
     # ──────── Frame animation helpers ────────
     def _animate_frame_to(self, target: QColor, duration_ms: int = FRAME_TRANSITION_MS) -> None:

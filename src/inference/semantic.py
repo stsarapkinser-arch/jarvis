@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -169,33 +170,57 @@ class SemanticSkillMatcher:
         self._index: list[tuple[str, list[float]]] = []
         self._available = True
         self._next_build_at = 0.0
+        # Один строитель индекса за раз. match() зовётся из РАЗНЫХ потоков
+        # (asyncio.to_thread): без замка параллельные первые вызовы дублировали
+        # бы тяжёлый батч-эмбеддинг всех экземпляров → шторм на single-slot
+        # embed-сервере и каскад ReadTimeout (память делит тот же сервер).
+        self._build_lock = threading.Lock()
 
     # ───────────────────────── сборка экземпляров ─────────────────────────
+    def prewarm(self) -> None:
+        """Построить индекс заранее (фоновый старт), чтобы первый ``match`` не
+        ждал эмбеддинг всех экземпляров на горячем пути. Идемпотентно, без
+        исключений — обёртка над ``_ensure_index``."""
+        self._ensure_index()
+
     def _ensure_index(self) -> None:
         if self._index or not self._available:
             return
         if time.monotonic() < self._next_build_at:
             return
-        exemplars = self._exemplars if self._exemplars is not None else collect_exemplars()
-        ids: list[str] = []
-        texts: list[str] = []
-        for sid, phrases in exemplars.items():
-            for phrase in phrases:
-                ids.append(sid)
-                texts.append(self._ppref + phrase)   # экземпляр = passage
-        if not texts:
-            self._available = False
+        # Не получили замок — кто-то уже строит индекс: тихо уходим (L2 просто не
+        # сработает на этот раз), НЕ блокируя голосовой поток и не плодя дубль-батч.
+        if not self._build_lock.acquire(blocking=False):
             return
         try:
-            vecs = self._embed_fn(texts)
-        except Exception:
-            log.warning("semantic: сборка экземпляров не удалась — повтор через %.0fс",
-                        _BUILD_BACKOFF_SEC, exc_info=True)
+            # Перепроверка под замком: пока ждали, индекс мог собраться/забэкоффиться.
+            if self._index or time.monotonic() < self._next_build_at:
+                return
+            exemplars = self._exemplars if self._exemplars is not None else collect_exemplars()
+            ids: list[str] = []
+            texts: list[str] = []
+            for sid, phrases in exemplars.items():
+                for phrase in phrases:
+                    ids.append(sid)
+                    texts.append(self._ppref + phrase)   # экземпляр = passage
+            if not texts:
+                self._available = False
+                return
+            # Бэкофф ставим ДО попытки: сбой эмбеддинга не должен ретраиться
+            # сразу же (и параллельные потоки увидят активный бэкофф → не полезут).
             self._next_build_at = time.monotonic() + _BUILD_BACKOFF_SEC
-            return
-        self._index = list(zip(ids, vecs))
-        log.info("semantic: индекс собран — %d экземпляров, %d навыков",
-                 len(self._index), len(set(ids)))
+            try:
+                vecs = self._embed_fn(texts)
+            except Exception:
+                log.warning("semantic: сборка экземпляров не удалась — повтор через %.0fс",
+                            _BUILD_BACKOFF_SEC, exc_info=True)
+                return
+            self._index = list(zip(ids, vecs))
+            self._next_build_at = 0.0
+            log.info("semantic: индекс собран — %d экземпляров, %d навыков",
+                     len(self._index), len(set(ids)))
+        finally:
+            self._build_lock.release()
 
     # ───────────────────────── матчинг ─────────────────────────
     def rank(self, text: str) -> list[tuple[str, float]]:

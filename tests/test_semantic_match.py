@@ -269,3 +269,60 @@ def test_init_semantic_matcher_on_with_flag(monkeypatch):
     monkeypatch.setenv("JARVIS_SEMANTIC_MATCH", "1")
     m = Jarvis._init_semantic_matcher()
     assert m is not None and hasattr(m, "match")
+
+
+# ───────────── 8. Устойчивость сборки индекса (анти-шторм) ─────────────
+def test_index_built_once_and_prewarm_idempotent():
+    """Прогрев строит индекс РОВНО раз; повторный prewarm не пере-эмбеддит."""
+    calls: list[int] = []
+
+    def embed(texts):
+        texts = list(texts)
+        calls.append(len(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    m = SemanticSkillMatcher(embed, exemplars={"a": ["alias-a"], "b": ["alias-b"]},
+                             threshold=0.8, margin=0.1)
+    m.prewarm()
+    m.prewarm()
+    assert m._index                         # индекс собран
+    assert calls == [2]                     # один батч экземпляров, без повторов
+
+
+def test_failed_build_backs_off_before_retry():
+    """Сбой эмбеддинга НЕ ретраится сразу (бэкофф взведён ДО попытки) — это и
+    убивает шторм на embed-сервере; после истечения бэкоффа сборка повторяется."""
+    state = {"fail": True, "n": 0}
+
+    def embed(texts):
+        state["n"] += 1
+        if state["fail"]:
+            raise RuntimeError("embed down")
+        return [[1.0, 0.0] for _ in list(texts)]
+
+    m = SemanticSkillMatcher(embed, exemplars={"a": ["alias-a"]}, threshold=0.8, margin=0.1)
+    m.prewarm()
+    assert state["n"] == 1 and not m._index
+    m.prewarm()                              # сразу же — бэкофф не пускает
+    assert state["n"] == 1
+    m._next_build_at = 0.0                   # «бэкофф истёк»
+    state["fail"] = False                    # сервер вернулся
+    m.prewarm()
+    assert state["n"] == 2 and m._index
+
+
+def test_build_lock_skips_when_busy():
+    """Если другой поток уже строит индекс (замок занят) — вызов не блокирует
+    горячий путь и не плодит второй батч-эмбеддинг."""
+    def embed(texts):
+        return [[1.0, 0.0] for _ in list(texts)]
+
+    m = SemanticSkillMatcher(embed, exemplars={"a": ["alias-a"]}, threshold=0.8, margin=0.1)
+    assert m._build_lock.acquire(blocking=False)
+    try:
+        m.prewarm()                          # замок занят → тихо уходит
+        assert not m._index
+    finally:
+        m._build_lock.release()
+    m.prewarm()                              # замок свободен → строит
+    assert m._index

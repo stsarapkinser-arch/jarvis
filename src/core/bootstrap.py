@@ -216,6 +216,34 @@ async def _prewarm_inference(jarvis: Jarvis) -> None:
         log.debug("inference prewarm skipped", exc_info=True)
 
 
+async def _prewarm_semantic(jarvis: Jarvis) -> None:
+    """Построить индекс L2 в фоне на старте — ДО наплыва голосовых/демон-событий.
+
+    Иначе тяжёлый батч-эмбеддинг всех экземпляров навыков лёг бы лениво на первый
+    же ``match`` (горячий путь) и конкурировал бы с записями памяти на
+    single-slot embed-сервере. Ждём готовности embed-сервера, затем строим индекс
+    в треде (sync httpx). Ошибки глушим — ленивый путь матчера сам построит позже."""
+    matcher = getattr(jarvis, "_semantic", None)
+    if matcher is None:                       # L2 выключен — нечего греть
+        return
+    try:
+        from src.inference.embeddings import EmbeddingClient
+        probe = EmbeddingClient()
+        ready = False
+        for _ in range(60):                   # embed-сервер обычно встаёт быстро
+            if probe.health():
+                ready = True
+                break
+            await asyncio.sleep(1.0)
+        probe.close()
+        if not ready:
+            log.warning("embed-сервер не готов — прогрев индекса L2 отложен на ленивый путь")
+            return
+        await asyncio.to_thread(matcher.prewarm)
+    except Exception:
+        log.debug("semantic prewarm skipped", exc_info=True)
+
+
 async def amain() -> None:
     # Веса модели НЕ грузятся в этот процесс. Инференс — нативный llama-server
     # (jarvis-llm.service), который:
@@ -281,6 +309,7 @@ async def amain() -> None:
     jarvis.start_reflection_loop()   # nightly memory consolidation → core facts
     asyncio.create_task(_boot_greeting(jarvis), name="boot-greeting")
     asyncio.create_task(_prewarm_inference(jarvis), name="llm-prewarm")
+    asyncio.create_task(_prewarm_semantic(jarvis), name="semantic-prewarm")
 
     voice = JarvisMain()
     # Голосовой тред запускается через watchdog-обёртку: если run() завершится
