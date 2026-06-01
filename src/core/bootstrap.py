@@ -108,7 +108,10 @@ def _sd_notify(msg: bytes) -> None:
             s.connect(addr)
             s.sendall(msg)
     except Exception:
-        pass
+        # sd_notify — best-effort: вне systemd сокета нет, это норма. Но молча
+        # глотать нельзя — под systemd ошибка тут означает, что watchdog/ready
+        # не дойдут. Логируем на debug, чтобы было видно при разборе.
+        log.debug("sd_notify failed (msg=%r)", msg, exc_info=True)
 
 
 async def _sd_watchdog_loop() -> None:
@@ -145,7 +148,9 @@ async def _boot_greeting(jarvis: Jarvis) -> None:
                 name_hint = f", {m.group(1)}"
                 break
     except Exception:
-        pass
+        # Извлечение имени из памяти — украшение приветствия, не критично. Но
+        # тихо глотать сбой recall/парсинга — терять сигнал о проблеме памяти.
+        log.debug("greeting name-hint extraction failed", exc_info=True)
 
     jarvis.say(
         f"{greeting}{name_hint}. Jarvis онлайн. Все системы инициализированы.",

@@ -240,7 +240,14 @@ def test_skill_confirmation_runs_handler_on_yes():
     j._pending_skill = {
         "skill": fake, "args": {"a": 1}, "intent": "intent", "snap": {}, "ts": 9e18,
     }
-    handled = asyncio.run(j._try_resolve_skill("да, подтверждаю"))
+    # Простое «да» НЕ снимает гейт разрушительного навыка (защита от STT-дрейфа):
+    # подтверждение требует кодовой фразы целиком.
+    handled = asyncio.run(j._try_resolve_skill("да, давай"))
+    assert handled is False
+    assert ran == [], "обычное «да» не должно исполнять разрушительный навык"
+    assert j._pending_skill is not None
+
+    handled = asyncio.run(j._try_resolve_skill("Джарвис, подтверждаю"))
     assert handled is True
     assert ran == [{"a": 1}]
     assert j._pending_skill is None

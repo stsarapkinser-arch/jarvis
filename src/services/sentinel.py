@@ -209,7 +209,9 @@ class Sentinel(metaclass=Singleton):
                         return True
                 return False
             except Exception:
-                pass
+                # psutil может бросить на гонке итерации процессов — падаем на
+                # pgrep-фолбэк ниже, но фиксируем причину на debug.
+                log.debug("psutil heavy-proc scan failed; using pgrep fallback", exc_info=True)
         try:
             out = subprocess.check_output(
                 ["pgrep", "-x", "-l", "-f", "|".join(HEAVY_PROCS)],
@@ -234,7 +236,8 @@ class Sentinel(metaclass=Singleton):
                         pids.append(p.pid)
                 return pids
             except Exception:
-                pass
+                # Гонка итерации процессов — падаем на pgrep-фолбэк, причину на debug.
+                log.debug("psutil embed-pid scan failed; using pgrep fallback", exc_info=True)
         try:
             out = subprocess.check_output(
                 ["pgrep", "-f", f"llama-server.*{EMBED_SERVER_MARKER}"],

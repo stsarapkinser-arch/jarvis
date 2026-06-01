@@ -399,7 +399,8 @@ class ReconDaemon(metaclass=Singleton):
         log.info("recon: no auth.log and no journalctl; auth watcher off")
 
     async def _tail_authlog(self, path: str) -> None:
-        # `tail -F -n0` follows rotations; nice so we yield to Ollama.
+        # `tail -F -n0` follows rotations; nice so we yield to the inference
+        # server (llama-server on the iGPU; Ollama has been removed).
         proc = await self._spawn("tail", "-F", "-n", "0", path)
         if proc is None or proc.stdout is None:
             return

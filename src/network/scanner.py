@@ -11,7 +11,7 @@ When the core dispatches a command that starts with ``nmap`` we hand it to
     ``Jarvis._execute_with_healing`` can heal/retry as usual.
 
 Output goes through nice so a long ``-A`` sweep does not steal cycles from
-Ollama or KWin compositing.
+the inference server (llama-server; Ollama removed) or KWin compositing.
 """
 from __future__ import annotations
 

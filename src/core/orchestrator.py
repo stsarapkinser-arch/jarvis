@@ -200,6 +200,45 @@ NEGATIVE_RE = re.compile(
     r"\b(нет|отмени(?:ть)?|стоп|остановить|cancel|no|stop|abort|don'?t)\b",
     re.IGNORECASE,
 )
+# ───────────────── Кодовая фраза подтверждения разрушительного ──────────────
+# Гейт на rm -rf / sudo / destructive-навык НЕ снимается общим «да/ок/давай»:
+# Vosk small ошибается до ~32% WER (см. model/README), и случайное «давай» в фоне
+# или галлюцинация распознавателя не должны спускать необратимую команду на хост.
+# Поэтому подтверждение — отдельная КОДОВАЯ ФРАЗА, и реплика должна состоять
+# ТОЛЬКО из неё (точный матч целиком, не подстрока внутри длинной фразы). Отмена
+# (NEGATIVE_RE) остаётся широкой — ложная отмена лишь прерывает, это безопасно.
+# Сменить фразу: JARVIS_CONFIRM_PHRASE. AFFIRMATIVE_RE остаётся для НЕ-опасных
+# подтверждений (промоушен выученного навыка), где цена ошибки нулевая.
+CONFIRM_PHRASE = os.getenv("JARVIS_CONFIRM_PHRASE", "джарвис подтверждаю").strip()
+
+
+def _normalize_confirm(text: str) -> str:
+    """Нормализация реплики под точный матч: нижний регистр, ё→е, пунктуация →
+    пробел, схлопнутые пробелы по краям и внутри."""
+    s = (text or "").lower().replace("ё", "е")
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_confirm_phrase(text: str) -> bool:
+    """True, только если реплика ЦЕЛИКОМ совпадает с кодовой фразой (с точностью
+    до нормализации и перестановки слов двухсловной фразы). Подстрока внутри
+    длинной реплики подтверждением НЕ считается — это и есть защита от STT-дрейфа."""
+    norm = _normalize_confirm(text)
+    if not norm:
+        return False
+    target = _normalize_confirm(CONFIRM_PHRASE)
+    if norm == target:
+        return True
+    parts = target.split()
+    if len(parts) == 2 and norm == f"{parts[1]} {parts[0]}":
+        return True
+    return False
+
+
+# Подсказка оператору, что именно произнести. Собирается из живой кодовой фразы,
+# чтобы переопределение JARVIS_CONFIRM_PHRASE отражалось в речи автоматически.
+CONFIRM_HINT = f"Скажите «{CONFIRM_PHRASE}» для подтверждения или «отмени»."
 DESTRUCTIVE_RE = re.compile(
     r"(\brm\s+-(?:r[fF]|fr|rf)\b"
     r"|\bapt(?:-get)?\s+(?:remove|purge|autoremove)\b"
@@ -259,11 +298,12 @@ class _SkillCtx:
 
 
 class _LlamaCompletionAdapter:
-    """Совместимый shim под ollama.AsyncClient API surface.
+    """Совместимый shim под исторический ollama.AsyncClient API surface.
 
-    Mnemosyne / Pixel-thinker и пр. подсистемы исторически писались под
-    ``.generate(model=, prompt=)`` ollama-клиента, который возвращает
-    ``{"response": "..."}``. Этот адаптер транслирует такие вызовы в общий
+    Сам Ollama удалён, но подсистемы (Mnemosyne / Pixel-thinker и пр.)
+    исторически писались под ``.generate(model=, prompt=)``, возвращавший
+    ``{"response": "..."}``. Сохраняем эту форму вызова, чтобы не переписывать
+    их все. Этот адаптер транслирует такие вызовы в общий
     ``Jarvis()._llama_complete`` — модель грузится РАЗ за процесс, второй
     1.9 GiB-резидент в RAM не плодим.
     """
@@ -314,7 +354,8 @@ class Jarvis(metaclass=Singleton):
         # Телеметрия лестницы: какой слой (L0…L2/3B) решил интент. Периодически
         # логирует долю разгрузки 3B — видно, окупаются ли детерминированные слои.
         self._routing_stats = RoutingStats()
-        # Адаптер под ollama-совместимый интерфейс — для Mnemosyne и т.п.
+        # Адаптер под исторический ollama-совместимый интерфейс (Ollama удалён,
+        # форма вызова .generate() сохранена) — для Mnemosyne и т.п.
         self.llm_adapter = _LlamaCompletionAdapter(self)
 
         self._recent_os: deque[dict] = deque(maxlen=RECENT_OS_EVENTS_MAX)
@@ -775,7 +816,7 @@ class Jarvis(metaclass=Singleton):
                 "snap": snap, "ts": time.time(),
             }
             await self._state("ALERT", f"CONFIRM skill: {sk.id}")
-            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            self.say(f"{sk.description}. {CONFIRM_HINT}", tone="alert")
             return ToolResult(call_id, "awaiting confirmation", stop=True)
 
         result = await self._invoke_skill(sk, rs.args)
@@ -878,7 +919,7 @@ class Jarvis(metaclass=Singleton):
                 "snap": snap, "ts": time.time(),
             }
             await self._state("ALERT", f"CONFIRM skill: {sk.id}")
-            self.say(f"{sk.description}. Подтвердите голосом, сэр?", tone="alert")
+            self.say(f"{sk.description}. {CONFIRM_HINT}", tone="alert")
             return True
 
         await self._state("THINKING", sk.id)
@@ -1110,8 +1151,7 @@ class Jarvis(metaclass=Singleton):
         }
         await self._state("ALERT", f"CONFIRM: {cmd[:60]}")
         self.say(
-            f"Команда потенциально разрушительная. {cmd[:80]}. "
-            f"Подтвердите голосом или скажите «отмени».",
+            f"Команда потенциально разрушительная. {cmd[:80]}. {CONFIRM_HINT}",
             tone="alert",
         )
         log.info("destructive command queued for confirmation: %s", cmd[:200])
@@ -1134,7 +1174,7 @@ class Jarvis(metaclass=Singleton):
             await self._state("IDLE", "")
             self.say(self.ack("cancel"))
             return True
-        if AFFIRMATIVE_RE.search(text):
+        if is_confirm_phrase(text):
             cmd = pending["cmd"]
             intent = pending["intent"]
             snap = pending["snap"]
@@ -1173,7 +1213,7 @@ class Jarvis(metaclass=Singleton):
             )
             return True
 
-        if AFFIRMATIVE_RE.search(text):
+        if is_confirm_phrase(text):
             cmd = pending["cmd"]
             intent = pending["intent"]
             snap = pending["snap"]
@@ -1207,7 +1247,7 @@ class Jarvis(metaclass=Singleton):
             self.say(self.ack("cancel"))
             return True
 
-        if AFFIRMATIVE_RE.search(text):
+        if is_confirm_phrase(text):
             sk = pending["skill"]
             args = pending["args"]
             snap = pending["snap"]
@@ -1461,7 +1501,8 @@ class Jarvis(metaclass=Singleton):
 
         await self._state("THINKING", text[:60])
         snap = await asyncio.to_thread(snapshot)
-        # RAG-recall — это эмбеддинг-вызов в ollama (CPU + память). На N100 он
+        # RAG-recall — это эмбеддинг-вызов в embed-сервер (llama-server :8090,
+        # CPU + память; Ollama убран). На N100 он
         # конкурирует за единственный канал памяти с iGPU-декодом llama-server.
         # Под HIGH/CRITICAL пропускаем recall: лучше ответить без памяти, чем
         # задушить мозг лишней нагрузкой ровно перед генерацией. Symbiote-degrade.
@@ -1554,9 +1595,15 @@ class Jarvis(metaclass=Singleton):
             "cmd": bash, "intent": intent, "snap": snap, "ts": time.time(),
             "engine": shadow_res.engine,
         }
+        # ВАЖНО про формулировку: dry-run шёл в изолированной песочнице
+        # (--unshare-all/--net=none, read-only root). Это проверяет синтаксис и
+        # доступность бинарей, но НЕ предсказывает поведение сетевых/пишущих
+        # команд на реальном хосте (rc=0 в --net=none ≠ безопасно вживую). Поэтому
+        # говорим оператору ровно то, что гарантировали, не завышая до «безопасно».
         self.say(
-            f"Модель действий проверена в симуляции без крашей через {shadow_res.engine}. "
-            "Вывести в реальную систему, сэр?",
+            f"Синтаксис и бинари проверены в песочнице ({shadow_res.engine}); "
+            "поведение в реальной системе с сетью и диском может отличаться. "
+            f"{CONFIRM_HINT}",
         )
         return "queued"
 

@@ -21,10 +21,7 @@ ignore = [
 # В тестах допустимы fixture-импорты без явного использования.
 "tests/*" = ["F401"]
 
-[tool.pytest.ini_options]
-minversion = "7.0"
-testpaths = ["tests"]
-asyncio_mode = "auto"
-filterwarnings = [
-    "ignore::DeprecationWarning:chromadb.*",
-]
+# ВНИМАНИЕ: конфиг pytest НЕ здесь, а в корневом ./pytest.ini. Причина — pytest
+# ищет ini-файл от корня репозитория вверх и не заглядывает в config/, поэтому
+# секция [tool.pytest.ini_options] отсюда молча игнорировалась. Ruff же свой
+# конфиг в этом файле находит сам (поиск по дереву от проверяемых файлов).

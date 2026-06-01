@@ -98,6 +98,29 @@ def test_resolve_shadow_returns_false_when_no_pending():
     assert handled is False
 
 
+def test_resolve_shadow_requires_codephrase_not_bare_yes():
+    """Гейт sandbox-команды не снимается простым «да» (Vosk-дрейф) — нужна
+    кодовая фраза целиком."""
+    import time
+    j = _make_jarvis_with_shadow_engine(True)
+    j._execute_with_healing = AsyncMock(return_value=(0, "ok", ""))
+    j._pending_shadow = {
+        "cmd": "echo hi", "intent": "intent", "snap": None, "ts": time.time(),
+        "engine": "bwrap",
+    }
+    # Обычное «да, давай» НЕ исполняет команду и не очищает очередь.
+    handled = asyncio.run(j._try_resolve_shadow("да, давай"))
+    assert handled is False
+    assert j._pending_shadow is not None
+    j._execute_with_healing.assert_not_called()
+
+    # Кодовая фраза целиком — исполняет.
+    handled = asyncio.run(j._try_resolve_shadow("Джарвис, подтверждаю"))
+    assert handled is True
+    assert j._pending_shadow is None
+    j._execute_with_healing.assert_awaited_once()
+
+
 def test_process_intent_speaks_fallback_on_empty_llm_output():
     """Regression: ловимый сбой инференса → агент не произвёл НИ действий, НИ
     речи. Jarvis ОБЯЗАН озвучить сбой, а не молча уйти в IDLE — иначе оператор

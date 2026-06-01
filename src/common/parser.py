@@ -107,4 +107,12 @@ def run_bash(cmd: str, timeout: float = 5.0) -> tuple[int | None, str, str]:
         stdout, stderr = proc.communicate(timeout=timeout)
         return proc.returncode, stdout, stderr
     except subprocess.TimeoutExpired:
+        # Убиваем зависший процесс, иначе он остаётся жить осиротевшим (тем более
+        # с start_new_session=True — переживёт родителя). После kill() добираем
+        # вывод вторым communicate(), чтобы закрыть pipe'ы и не словить зомби.
+        proc.kill()
+        try:
+            proc.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
         return None, "", ""

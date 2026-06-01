@@ -601,7 +601,9 @@ class JarvisHUD(QMainWindow):
             out["gpu"] = snap.gpu
             out["thermal"] = snap.thermal
         except Exception:
-            pass
+            # Снимок системного состояния для HUD — украшение оверлея; ниже есть
+            # psutil-фолбэк. Фиксируем сбой на debug, чтобы не терять сигнал.
+            log.debug("HUD SystemState snapshot failed; falling back to psutil", exc_info=True)
         try:
             import psutil
             vm = psutil.virtual_memory()

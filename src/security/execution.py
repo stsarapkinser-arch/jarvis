@@ -153,6 +153,14 @@ class ShadowExec:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            # Дожинаем убитый процесс в текущем event loop. Иначе его
+            # subprocess-transport доживает до GC уже ПОСЛЕ закрытия лупа
+            # (классический "Event loop is closed" из BaseSubprocessTransport.
+            # __del__) — и оставляет зомби до reap'а.
+            try:
+                await proc.wait()
+            except Exception:
+                log.debug("reaping timed-out shadow proc failed", exc_info=True)
             return ShadowResult(
                 rc=124, stdout="", stderr=f"shadow_exec[{engine}]: timed out after {self.timeout}s",
                 engine=engine, timed_out=True,
