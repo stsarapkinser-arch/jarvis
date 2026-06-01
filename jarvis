@@ -32,6 +32,29 @@ done
 REPO_ROOT="$(cd "$(dirname "$_SELF")" && pwd)"
 cd "$REPO_ROOT"
 
+# ───────────────────────── .env проекта ─────────────────────────
+# Тумблеры (Tier 0 и прочее) живут в $REPO_ROOT/.env как KEY=VALUE и
+# редактируются командой `jarvis toggle`. Грузим их в окружение ДО вычисления
+# констант ниже — чтобы и сервер (setup), и рантайм (run) видели одно и то же.
+# Парсим построчно, а НЕ `source`: файл не должен исполнять произвольный код.
+# Уже заданное в шелле НЕ перетираем — `JARVIS_X=1 jarvis run` побеждает .env.
+ENV_FILE="$REPO_ROOT/.env"
+load_dotenv() {
+    [ -f "$ENV_FILE" ] || return 0
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac      # пусто/комментарий
+        case "$line" in *=*) ;; *) continue ;; esac    # не KEY=VALUE
+        key="${line%%=*}"; key="${key// /}"
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        val="${line#*=}"
+        val="${val%\"}"; val="${val#\"}"               # снять кавычки
+        val="${val%\'}"; val="${val#\'}"
+        [ -z "${!key+x}" ] && export "$key=$val"        # шелл > .env
+    done < "$ENV_FILE"
+}
+load_dotenv
+
 # ───────────────────────── палитра и примитивы ─────────────────────────
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
@@ -161,6 +184,13 @@ ${C_BOLD}УПРАВЛЕНИЕ${C_RESET}
     stop           Остановить ассистента и оба сервера.
     restart        Перезапустить ассистента.
     logs [имя]     Логи в реальном времени (jarvis | llm | embed).
+
+${C_BOLD}НАСТРОЙКА${C_RESET}
+    ${C_GREEN}toggle${C_RESET}         Тумблеры ускорений (Tier 0) — вкл/выкл прямо отсюда,
+                   хранятся в .env. Без аргументов — список и состояние.
+                     jarvis toggle                  ${C_DIM}# что есть и что включено${C_RESET}
+                     jarvis toggle stream-tts on    ${C_DIM}# рантайм → jarvis restart${C_RESET}
+                     jarvis toggle kv-quant q8_0    ${C_DIM}# сборка  → jarvis setup${C_RESET}
 
 ${C_BOLD}ОБСЛУЖИВАНИЕ${C_RESET}
     wipe-memory    Стереть базу памяти (нужно при смене embedding-модели:
@@ -702,6 +732,115 @@ cmd_wipe_memory() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
+#  jarvis toggle — вкл/выкл тумблеров Tier 0 (пишет в .env)
+# ════════════════════════════════════════════════════════════════════════
+# Формат строки: "ENVVAR|ключ|класс|тип|on_value|описание"
+#   класс: build   — запекается в jarvis-llm.service ⇒ применить `jarvis setup`
+#          runtime — читает python при старте      ⇒ применить `jarvis restart`
+#   тип:   bool  — on→1 / off→0
+#          value — on→on_value / off→снять / <строка>→явное значение
+TOGGLES=(
+  "JARVIS_LLM_KV_QUANT|kv-quant|build|value|q8_0|KV-quant + flash-attn: вдвое режет KV-кэш, быстрее декод"
+  "JARVIS_LLM_DRAFT|draft|build|bool|1|Speculative decoding: draft-0.5B предсказывает за 3B (RAM впритык)"
+  "JARVIS_STREAM_TTS|stream-tts|runtime|bool|1|Streaming TTS: ответ по предложениям, первое слово раньше"
+  "JARVIS_WAKEWORD|wakeword|runtime|bool|1|Wake-word пред-гейт перед Vosk (нужен pip openwakeword)"
+  "JARVIS_SEMANTIC_MATCH|semantic|runtime|bool|1|L2: матч навыка по эмбеддингам (сначала калибровка порога)"
+)
+
+# значение → включено? (выкл = пусто/0/false/no/off)
+val_is_on() {
+    case "$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')" in
+        ''|0|false|no|off) return 1 ;; *) return 0 ;;
+    esac
+}
+
+# ключ (короткий или ENVVAR) → строка реестра, либо код 1
+toggle_lookup() {
+    local q="$1" row env short
+    for row in "${TOGGLES[@]}"; do
+        IFS='|' read -r env short _ _ _ _ <<<"$row"
+        if [ "$q" = "$env" ] || [ "$q" = "$short" ]; then echo "$row"; return 0; fi
+    done
+    return 1
+}
+
+# upsert KEY=VALUE в .env (пустой VALUE ⇒ удалить строку = вернуть к умолчанию)
+env_set() {
+    local key="$1" val="${2:-}" tmp
+    touch "$ENV_FILE"
+    tmp="$(mktemp)"
+    grep -v -E "^[[:space:]]*${key}=" "$ENV_FILE" > "$tmp" 2>/dev/null || true
+    [ -n "$val" ] && printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    mv "$tmp" "$ENV_FILE"
+}
+
+# показать один тумблер с текущим (effective) состоянием
+toggle_show() {
+    local env short class type onval desc cur state
+    IFS='|' read -r env short class type onval desc <<<"$1"
+    cur="$(printenv "$env" 2>/dev/null)"
+    if val_is_on "$cur"; then state="${C_GREEN}ВКЛ${C_RESET} "; else state="${C_DIM}выкл${C_RESET}"; fi
+    printf '  %s %s%-11s%s %s[%s, %s]%s\n' "$state" "$C_BOLD" "$short" "$C_RESET" "$C_DIM" "$env" "$class" "$C_RESET"
+    printf '       %s%s%s\n' "$C_DIM" "$desc" "$C_RESET"
+    [ -n "$cur" ] && printf '       %sзначение: %s%s\n' "$C_DIM" "$cur" "$C_RESET"
+}
+
+toggle_list() {
+    hdr "Тумблеры (Tier 0) — хранятся в $ENV_FILE"
+    local row
+    for row in "${TOGGLES[@]}"; do toggle_show "$row"; done
+    printf '\n  %sвкл/выкл:%s   jarvis toggle <ключ> on|off\n' "$C_BOLD" "$C_RESET"
+    printf '  %sзначение:%s  jarvis toggle kv-quant q8_0\n' "$C_BOLD" "$C_RESET"
+    printf '  %sкласс build%s → потом %sjarvis setup%s · %sкласс runtime%s → %sjarvis restart%s\n' \
+        "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET"
+}
+
+cmd_toggle() {
+    local key="${1:-}" want="${2:-}"
+    [ -z "$key" ] && { toggle_list; return 0; }
+
+    local row env short class type onval desc
+    row="$(toggle_lookup "$key")" || {
+        crit "неизвестный тумблер: $key"; note "список: jarvis toggle"; return 1; }
+    IFS='|' read -r env short class type onval desc <<<"$row"
+
+    # без второго аргумента — просто показать состояние этого тумблера
+    [ -z "$want" ] && { hdr "Тумблер $short"; toggle_show "$row"; return 0; }
+
+    local newval
+    case "$type" in
+        bool)
+            case "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" in
+                on|1|yes|true)  newval=1 ;;
+                off|0|no|false) newval=0 ;;
+                *) crit "для $short ожидается on|off (получено: $want)"; return 1 ;;
+            esac ;;
+        value)
+            case "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" in
+                on)  newval="$onval" ;;
+                off) newval="" ;;
+                *)   newval="$want" ;;          # явное значение (напр. q5_0)
+            esac ;;
+    esac
+
+    env_set "$env" "$newval"
+    if val_is_on "$newval"; then ok "$short ВКЛ → $newval  ($env)"
+    else ok "$short ВЫКЛ  ($env)"; fi
+    note "записано в $ENV_FILE"
+    case "$class" in
+        build)   note "класс сборки  → примени: jarvis setup  (перепишет jarvis-llm.service)";;
+        runtime) note "класс рантайма → примени: jarvis restart  (или jarvis run)";;
+    esac
+    if val_is_on "$newval"; then
+        case "$short" in
+            wakeword) note "нужен пакет: pip install openwakeword (иначе fail-open, не блокирует)";;
+            semantic) note "сначала калибровка: python scripts/calibrate_semantic.py → JARVIS_SEMANTIC_THRESHOLD";;
+            draft)    note "draft-GGUF докачается при следующем jarvis setup";;
+        esac
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
 #  диспетчер
 # ════════════════════════════════════════════════════════════════════════
 main() {
@@ -714,6 +853,7 @@ main() {
         stop|стоп)             cmd_stop "$@";;
         restart|рестарт)       cmd_restart "$@";;
         logs|логи)             cmd_logs "$@";;
+        toggle|toggles|env|тумблер|тумблеры) cmd_toggle "$@";;
         wipe-memory|wipe|clean-memory) cmd_wipe_memory "$@";;
         help|--help|-h|"")     cmd_help;;
         *)
