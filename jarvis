@@ -81,6 +81,9 @@ SERVER_BIN="$REPO_ROOT/llama.cpp/build/bin/llama-server"
 # Мозг по умолчанию — Qwen2.5-3B (см. setup_server.sh). Совпадает с MODEL_NAME
 # там; при смене модели держите оба в синхроне (или переопределите CHAT_MODEL).
 CHAT_MODEL="${CHAT_MODEL:-$REPO_ROOT/models/Qwen2.5-3B-Instruct-Q4_K_M.gguf}"
+# Draft-модель для speculative decoding (тумблер draft). Имя — как DRAFT_NAME
+# в setup_server.sh; переопределяемо для симметрии.
+DRAFT_MODEL="${DRAFT_MODEL:-$REPO_ROOT/models/${DRAFT_NAME:-Qwen2.5-0.5B-Instruct-Q4_K_M.gguf}}"
 EMBED_DIR="$REPO_ROOT/models/embed"
 VOSK_MODEL="$REPO_ROOT/model"
 PIPER_BIN="$REPO_ROOT/piper/piper"
@@ -164,55 +167,51 @@ PYDEPS=(
 #  jarvis help
 # ════════════════════════════════════════════════════════════════════════
 cmd_help() {
+    banner
+    printf '  %sИИ-оркестратор для Kali — проверить, починить и запустить одной командой%s\n' \
+        "$C_DIM" "$C_RESET"
     cat <<EOF
-${C_CYAN}${C_BOLD}JARVIS — управление одной командой${C_RESET}
 
-${C_BOLD}ИСПОЛЬЗОВАНИЕ${C_RESET}
-    jarvis <команда>
+${C_BOLD}ИСПОЛЬЗОВАНИЕ${C_RESET}  jarvis <команда> [аргументы]
 
 ${C_BOLD}ОСНОВНОЕ${C_RESET}
-    ${C_GREEN}run${C_RESET}            Запустить ассистента: поднять оба сервера,
-                   при нехватке компонентов — авто-починка, затем foreground.
-    ${C_GREEN}test${C_RESET}           Полная диагностика без изменений: компоненты,
-                   серверы, GPU-оффлоад, память, голос, инструменты.
-    ${C_GREEN}setup${C_RESET}          Установить/докачать ВСЁ, чего нет: venv и
-                   зависимости, пакеты системы, сборка сервера, модели,
-                   systemd-юниты, глобальный симлинк \`jarvis\`.
+    ${C_GREEN}run${C_RESET}            поднять серверы и запустить ассистента (с авто-починкой)
+    ${C_GREEN}setup${C_RESET}          установить/докачать всё, чего не хватает
+    ${C_GREEN}test${C_RESET}           полная диагностика без изменений (read-only)
+    ${C_GREEN}status${C_RESET}         состояние сервисов: мозг / память / ассистент
 
 ${C_BOLD}УПРАВЛЕНИЕ${C_RESET}
-    status         Состояние трёх сервисов (мозг / память / ассистент).
-    stop           Остановить ассистента и оба сервера.
-    restart        Перезапустить ассистента.
-    logs [имя]     Логи в реальном времени (jarvis | llm | embed).
+    restart        перезапустить ассистента
+    stop           остановить ассистента и оба сервера
+    logs [имя]     логи в реальном времени (jarvis | llm | embed)
 
 ${C_BOLD}НАСТРОЙКА${C_RESET}
-    ${C_GREEN}toggle${C_RESET}         Тумблеры ускорений (Tier 0) — вкл/выкл прямо отсюда,
-                   хранятся в .env. Без аргументов — список и состояние.
-                     jarvis toggle                  ${C_DIM}# что есть и что включено${C_RESET}
-                     jarvis toggle stream-tts on    ${C_DIM}# рантайм → jarvis restart${C_RESET}
-                     jarvis toggle kv-quant q8_0    ${C_DIM}# сборка  → jarvis setup${C_RESET}
+    ${C_GREEN}toggle${C_RESET} [...]   тумблеры ускорений/функций (без аргументов — список)
+    config         эффективная конфигурация: эндпоинты, модели, .env
+    edit           открыть .env в \$EDITOR
+    calibrate      подобрать порог L2 (semantic) на живом эмбеддере
+
+${C_BOLD}ИНСТРУМЕНТЫ${C_RESET}
+    ${C_GREEN}ask${C_RESET} <текст>    разовый запрос к мозгу (без голоса)
+    say <текст>    проверить голос (piper → колонки)
+    bench [N]      замерить скорость мозга (tok/s)
+    models         инвентарь моделей (размеры, наличие)
 
 ${C_BOLD}ОБСЛУЖИВАНИЕ${C_RESET}
-    wipe-memory    Стереть базу памяти (нужно при смене embedding-модели:
-                   меняется размерность вектора → старая база несовместима).
-    help           Эта справка.
+    wipe-memory    стереть базу памяти (при смене embedding-модели)
+    update         обновить репозиторий (git pull --ff-only)
+    version        версия, ветка, окружение
+    help           эта справка
 
 ${C_BOLD}ПРИМЕРЫ${C_RESET}
-    jarvis setup        ${C_DIM}# первый раз на чистой машине${C_RESET}
-    jarvis test         ${C_DIM}# убедиться, что всё на месте${C_RESET}
-    jarvis run          ${C_DIM}# рабочий запуск${C_RESET}
-    jarvis logs llm     ${C_DIM}# смотреть лог мозга${C_RESET}
+    jarvis setup
+    jarvis toggle llm-stream on && jarvis restart   ${C_DIM}# рантайм${C_RESET}
+    jarvis toggle kv-quant q8_0 && jarvis setup     ${C_DIM}# сборка${C_RESET}
+    jarvis toggle semantic-threshold 0.68           ${C_DIM}# крутилка${C_RESET}
+    jarvis ask "сколько свободно памяти"
+    jarvis logs llm
 
-${C_BOLD}ПЕРЕМЕННЫЕ${C_RESET} (необязательные)
-    JARVIS_LLM_ENDPOINT     (умолч. http://127.0.0.1:8080)
-    JARVIS_EMBED_ENDPOINT   (умолч. http://127.0.0.1:8090)
-    JARVIS_EMBED_MODEL      (умолч. multilingual-e5-small)
-    JARVIS_SCREEN_WATCH     1=следить за экраном, 0=выключить
-    JARVIS_PROACTIVE_INTERVAL  порог тишины (сек) до проактива и взгляда на
-                            экран; умолч. 1200. Поставь 60 для быстрой проверки.
-    JARVIS_LLM_RECONNECT_WAIT  сколько ждать (сек) рестарта мозга и повторить
-                            запрос при обрыве; умолч. 25, 0 — выключить.
-    SKIP_BUILD=1            пропустить компиляцию сервера в setup
+${C_DIM}Все тумблеры и значения: jarvis toggle · обзор: jarvis config${C_RESET}
 EOF
 }
 
@@ -732,20 +731,44 @@ cmd_wipe_memory() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
-#  jarvis toggle — вкл/выкл тумблеров Tier 0 (пишет в .env)
+#  баннер
 # ════════════════════════════════════════════════════════════════════════
-# Формат строки: "ENVVAR|ключ|класс|тип|on_value|описание"
+banner() {
+    printf '%s%s\n' "$C_CYAN$C_BOLD" "\
+     ██  █████  ██████  ██    ██ ██ ███████
+     ██ ██   ██ ██   ██ ██    ██ ██ ██
+     ██ ███████ ██████  ██    ██ ██ ███████
+██   ██ ██   ██ ██   ██  ██  ██  ██      ██
+ █████  ██   ██ ██   ██   ████   ██ ███████"
+    printf '%s' "$C_RESET"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis toggle — тумблеры ускорений/функций (пишет в .env)
+# ════════════════════════════════════════════════════════════════════════
+# Формат: "ENVVAR|ключ|класс|тип|on_value|умолчание|описание"
 #   класс: build   — запекается в jarvis-llm.service ⇒ применить `jarvis setup`
-#          runtime — читает python при старте      ⇒ применить `jarvis restart`
+#          runtime — читает python при старте         ⇒ применить `jarvis restart`
 #   тип:   bool  — on→1 / off→0
 #          value — on→on_value / off→снять / <строка>→явное значение
+#          tune  — числовая/строковая крутилка: <значение> / reset→умолчание
 TOGGLES=(
-  "JARVIS_LLM_KV_QUANT|kv-quant|build|value|q8_0|KV-quant + flash-attn: вдвое режет KV-кэш, быстрее декод"
-  "JARVIS_LLM_DRAFT|draft|build|bool|1|Speculative decoding: draft-0.5B предсказывает за 3B (RAM впритык)"
-  "JARVIS_LLM_STREAM|llm-stream|runtime|bool|1|Стриминг ответа (SSE): нет all-or-nothing таймаута на медленной 3B"
-  "JARVIS_STREAM_TTS|stream-tts|runtime|bool|1|Streaming TTS: ответ по предложениям, первое слово раньше"
-  "JARVIS_WAKEWORD|wakeword|runtime|bool|1|Wake-word пред-гейт перед Vosk (нужен pip openwakeword)"
-  "JARVIS_SEMANTIC_MATCH|semantic|runtime|bool|1|L2: матч навыка по эмбеддингам (сначала калибровка порога)"
+  # ── класс build (нужен jarvis setup) ──
+  "JARVIS_LLM_KV_QUANT|kv-quant|build|value|q8_0||KV-quant + flash-attn: вдвое режет KV-кэш, быстрее декод"
+  "JARVIS_LLM_DRAFT|draft|build|bool|1|0|Speculative decoding: draft-0.5B предсказывает за 3B (RAM впритык)"
+  "DRAFT_MAX|draft-max|build|tune||8|Догадок draft за раунд (меньше = дешевле проверка); нужен draft on"
+  # ── класс runtime (нужен jarvis restart) ──
+  "JARVIS_LLM_STREAM|llm-stream|runtime|bool|1|0|Стриминг ответа (SSE): нет all-or-nothing таймаута на 3B"
+  "JARVIS_LLM_MAX_TOKENS|llm-max-tokens|runtime|tune||160|Потолок токенов на tool-call (меньше = быстрее, короче)"
+  "JARVIS_STREAM_TTS|stream-tts|runtime|bool|1|0|Streaming TTS: ответ по предложениям, первое слово раньше"
+  "JARVIS_WAKEWORD|wakeword|runtime|bool|1|0|Wake-word пред-гейт перед Vosk (нужен pip openwakeword)"
+  "JARVIS_WAKEWORD_WINDOW|wakeword-window|runtime|tune||8.0|Окно прослушки после wake-слова, сек"
+  "JARVIS_WAKEWORD_THRESHOLD|wakeword-threshold|runtime|tune||0.5|Порог срабатывания wake-детектора [0..1]"
+  "JARVIS_SEMANTIC_MATCH|semantic|runtime|bool|1|0|L2: матч навыка по эмбеддингам (сначала калибровка порога)"
+  "JARVIS_SEMANTIC_THRESHOLD|semantic-threshold|runtime|tune||0.62|Порог косинуса L2 (jarvis calibrate подскажет)"
+  "JARVIS_SEMANTIC_MARGIN|semantic-margin|runtime|tune||0.05|Зазор до второго навыка (анти-двусмысленность)"
+  "JARVIS_SCREEN_WATCH|screen-watch|runtime|bool|1|1|Взгляд на экран: проактив + скриншоты"
+  "JARVIS_PROACTIVE_INTERVAL|proactive|runtime|tune||1200|Порог тишины до проактива/взгляда, сек"
 )
 
 # значение → включено? (выкл = пусто/0/false/no/off)
@@ -759,7 +782,7 @@ val_is_on() {
 toggle_lookup() {
     local q="$1" row env short
     for row in "${TOGGLES[@]}"; do
-        IFS='|' read -r env short _ _ _ _ <<<"$row"
+        IFS='|' read -r env short _ <<<"$row"
         if [ "$q" = "$env" ] || [ "$q" = "$short" ]; then echo "$row"; return 0; fi
     done
     return 1
@@ -775,70 +798,299 @@ env_set() {
     mv "$tmp" "$ENV_FILE"
 }
 
-# показать один тумблер с текущим (effective) состоянием
+# показать один тумблер: маркер состояния + ключ + effective-значение + описание
 toggle_show() {
-    local env short class type onval desc cur state
-    IFS='|' read -r env short class type onval desc <<<"$1"
+    local env short class type onarg def desc cur eff src mark extra
+    IFS='|' read -r env short class type onarg def desc <<<"$1"
     cur="$(printenv "$env" 2>/dev/null)"
-    if val_is_on "$cur"; then state="${C_GREEN}ВКЛ${C_RESET} "; else state="${C_DIM}выкл${C_RESET}"; fi
-    printf '  %s %s%-11s%s %s[%s, %s]%s\n' "$state" "$C_BOLD" "$short" "$C_RESET" "$C_DIM" "$env" "$class" "$C_RESET"
-    printf '       %s%s%s\n' "$C_DIM" "$desc" "$C_RESET"
-    [ -n "$cur" ] && printf '       %sзначение: %s%s\n' "$C_DIM" "$cur" "$C_RESET"
+    eff="${cur:-$def}"
+    if [ -n "$cur" ]; then src=""; else src="${C_DIM} (умолч.)${C_RESET}"; fi
+    extra="$src"
+    if [ "$type" = "tune" ]; then
+        mark="${C_CYAN}◆     ${C_RESET}"; extra="${C_BOLD}${eff:-—}${C_RESET}${src}"
+    elif val_is_on "$eff"; then
+        mark="${C_GREEN}● ВКЛ ${C_RESET}"
+        [ "$type" = "value" ] && extra="${C_BOLD}${eff}${C_RESET}${src}"
+    else
+        mark="${C_DIM}○ ВЫКЛ${C_RESET}"
+    fi
+    printf '  %s  %s%-18s%s %s\n' "$mark" "$C_BOLD" "$short" "$C_RESET" "$extra"
+    printf '          %s%s [%s · %s]%s\n' "$C_DIM" "$desc" "$env" "$class" "$C_RESET"
 }
 
 toggle_list() {
-    hdr "Тумблеры (Tier 0) — хранятся в $ENV_FILE"
-    local row
-    for row in "${TOGGLES[@]}"; do toggle_show "$row"; done
-    printf '\n  %sвкл/выкл:%s   jarvis toggle <ключ> on|off\n' "$C_BOLD" "$C_RESET"
-    printf '  %sзначение:%s  jarvis toggle kv-quant q8_0\n' "$C_BOLD" "$C_RESET"
-    printf '  %sкласс build%s → потом %sjarvis setup%s · %sкласс runtime%s → %sjarvis restart%s\n' \
-        "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$C_RESET"
+    hdr "Тумблеры — хранятся в $ENV_FILE"
+    local row class
+    printf '\n  %sСБОРКА%s %s· применить: jarvis setup%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    for row in "${TOGGLES[@]}"; do
+        IFS='|' read -r _ _ class _ <<<"$row"; [ "$class" = "build" ] && toggle_show "$row"
+    done
+    printf '\n  %sРАНТАЙМ%s %s· применить: jarvis restart%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+    for row in "${TOGGLES[@]}"; do
+        IFS='|' read -r _ _ class _ <<<"$row"; [ "$class" = "runtime" ] && toggle_show "$row"
+    done
+    printf '\n  %sвкл/выкл%s   jarvis toggle <ключ> on|off\n' "$C_BOLD" "$C_RESET"
+    printf '  %sзначение%s   jarvis toggle kv-quant q8_0  ·  jarvis toggle semantic-threshold 0.68\n' "$C_BOLD" "$C_RESET"
+    printf '  %sсброс%s      jarvis toggle <ключ> reset  %s(вернуть умолчание)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
 }
 
 cmd_toggle() {
     local key="${1:-}" want="${2:-}"
     [ -z "$key" ] && { toggle_list; return 0; }
 
-    local row env short class type onval desc
+    local row env short class type onarg def desc
     row="$(toggle_lookup "$key")" || {
         crit "неизвестный тумблер: $key"; note "список: jarvis toggle"; return 1; }
-    IFS='|' read -r env short class type onval desc <<<"$row"
+    IFS='|' read -r env short class type onarg def desc <<<"$row"
 
     # без второго аргумента — просто показать состояние этого тумблера
     [ -z "$want" ] && { hdr "Тумблер $short"; toggle_show "$row"; return 0; }
 
-    local newval
+    local newval lc; lc="$(printf '%s' "$want" | tr 'A-Z' 'a-z')"
     case "$type" in
         bool)
-            case "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" in
-                on|1|yes|true)  newval=1 ;;
-                off|0|no|false) newval=0 ;;
+            case "$lc" in
+                on|1|yes|true)                newval=1 ;;
+                off|0|no|false|reset|default) newval=0 ;;
                 *) crit "для $short ожидается on|off (получено: $want)"; return 1 ;;
             esac ;;
         value)
-            case "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" in
-                on)  newval="$onval" ;;
-                off) newval="" ;;
-                *)   newval="$want" ;;          # явное значение (напр. q5_0)
+            case "$lc" in
+                on)                 newval="$onarg" ;;
+                off|reset|default)  newval="" ;;
+                *)                  newval="$want" ;;       # явное значение (q5_0)
+            esac ;;
+        tune)
+            case "$lc" in
+                off|reset|default)  newval="" ;;
+                on) crit "$short — числовой тумблер; задай значение: jarvis toggle $short $def"; return 1 ;;
+                *)  newval="$want" ;;
             esac ;;
     esac
 
     env_set "$env" "$newval"
-    if val_is_on "$newval"; then ok "$short ВКЛ → $newval  ($env)"
+    if [ "$type" = "tune" ]; then
+        [ -n "$newval" ] && ok "$short = $newval  ($env)" || ok "$short → умолчание $def  ($env снят)"
+    elif [ "$type" = "value" ] && val_is_on "$newval"; then ok "$short ВКЛ → $newval  ($env)"
+    elif val_is_on "$newval"; then ok "$short ВКЛ  ($env)"
     else ok "$short ВЫКЛ  ($env)"; fi
     note "записано в $ENV_FILE"
     case "$class" in
-        build)   note "класс сборки  → примени: jarvis setup  (перепишет jarvis-llm.service)";;
-        runtime) note "класс рантайма → примени: jarvis restart  (или jarvis run)";;
+        build)   note "класс сборки  → примени: jarvis setup";;
+        runtime) note "класс рантайма → примени: jarvis restart";;
     esac
     if val_is_on "$newval"; then
         case "$short" in
             wakeword) note "нужен пакет: pip install openwakeword (иначе fail-open, не блокирует)";;
-            semantic) note "сначала калибровка: python scripts/calibrate_semantic.py → JARVIS_SEMANTIC_THRESHOLD";;
+            semantic) note "сперва калибровка: jarvis calibrate → jarvis toggle semantic-threshold <N>";;
             draft)    note "draft-GGUF докачается при следующем jarvis setup";;
         esac
     fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis config — эффективная конфигурация (read-only обзор)
+# ════════════════════════════════════════════════════════════════════════
+_cfg_file() {  # $1=метка $2=путь
+    if [ -f "$2" ]; then ok "$1: $(basename "$2")  $(du -h "$2" 2>/dev/null | cut -f1)"
+    else warn "$1: нет — $2"; fi
+}
+_cfg_dir() {   # $1=метка $2=каталог
+    if [ -d "$2" ] && [ -n "$(ls -A "$2" 2>/dev/null)" ]; then ok "$1: на месте"
+    else warn "$1: нет — $2"; fi
+}
+
+cmd_config() {
+    hdr "Конфигурация JARVIS"
+    note "репозиторий: $REPO_ROOT"
+
+    printf '\n%sЭндпоинты%s\n' "$C_BOLD" "$C_RESET"
+    printf '  мозг    %s\n' "$CHAT_ENDPOINT"
+    printf '  память  %s  %s(%s)%s\n' "$EMBED_ENDPOINT" "$C_DIM" "$EMBED_MODEL_ALIAS" "$C_RESET"
+
+    printf '\n%sМодели%s\n' "$C_BOLD" "$C_RESET"
+    _cfg_file "мозг"  "$CHAT_MODEL"
+    [ "$(printenv JARVIS_LLM_DRAFT 2>/dev/null)" = "1" ] && _cfg_file "draft" "$DRAFT_MODEL"
+    local eg; eg="$(ls "$EMBED_DIR"/*.gguf 2>/dev/null | head -1)"
+    [ -n "$eg" ] && _cfg_file "память" "$eg" || warn "память: нет .gguf в $EMBED_DIR"
+    _cfg_dir  "слух (Vosk)"   "$VOSK_MODEL"
+    _cfg_file "голос (piper)" "$PIPER_VOICE"
+
+    printf '\n%s.env%s  %s\n' "$C_BOLD" "$C_RESET" "$ENV_FILE"
+    if [ -f "$ENV_FILE" ] && grep -qE '^[[:space:]]*[A-Za-z_]+=' "$ENV_FILE"; then
+        grep -E '^[[:space:]]*[A-Za-z_]+=' "$ENV_FILE" | sed "s/^/    ${C_GREEN}/;s/$/${C_RESET}/"
+    else
+        note "переопределений нет — всё на умолчаниях (правка: jarvis edit / jarvis toggle)"
+    fi
+    printf '\n%sТумблеры:%s jarvis toggle    %sполная диагностика:%s jarvis test\n' \
+        "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis models — инвентарь моделей
+# ════════════════════════════════════════════════════════════════════════
+cmd_models() {
+    hdr "Модели"
+    _cfg_file "мозг (chat)"   "$CHAT_MODEL"
+    _cfg_file "draft (spec)"  "$DRAFT_MODEL"
+    local eg found=0
+    for eg in "$EMBED_DIR"/*.gguf; do
+        [ -f "$eg" ] && { _cfg_file "память (embed)" "$eg"; found=1; }
+    done
+    [ "$found" = 0 ] && warn "память (embed): нет .gguf в $EMBED_DIR"
+    _cfg_dir  "слух (Vosk)"   "$VOSK_MODEL"
+    _cfg_file "голос (piper)" "$PIPER_VOICE"
+    note "каталог: $REPO_ROOT/models · докачать: jarvis setup"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis bench — скорость мозга (tok/s)
+# ════════════════════════════════════════════════════════════════════════
+cmd_bench() {
+    hdr "Бенчмарк мозга (tok/s)"
+    have curl || { crit "нужен curl"; return 1; }
+    http_get "$CHAT_ENDPOINT/health" 3 | grep -qi ok || {
+        crit "мозг не отвечает на $CHAT_ENDPOINT — подними: jarvis run"; return 1; }
+    local n="${1:-64}" body resp t0 t1
+    note "генерирую $n токенов, замеряю…"
+    body="$(printf '{"model":"jarvis","messages":[{"role":"user","content":"Перечисли по порядку числа от 1 до 200 через запятую."}],"temperature":0,"max_tokens":%s,"stream":false}' "$n")"
+    t0="$(date +%s.%N)"
+    resp="$(curl -fsS --max-time 300 -H 'Content-Type: application/json' -d "$body" "$CHAT_ENDPOINT/v1/chat/completions" 2>/dev/null)"
+    t1="$(date +%s.%N)"
+    [ -z "$resp" ] && { crit "пустой ответ от сервера"; return 1; }
+    local tps pps ct
+    tps="$(printf '%s' "$resp" | grep -o '"predicted_per_second":[0-9.]*' | head -1 | cut -d: -f2)"
+    pps="$(printf '%s' "$resp" | grep -o '"prompt_per_second":[0-9.]*'    | head -1 | cut -d: -f2)"
+    ct="$(printf '%s'  "$resp" | grep -o '"completion_tokens":[0-9]*'     | head -1 | cut -d: -f2)"
+    if [ -n "$tps" ]; then
+        ok "декод (генерация): $(awk -v x="$tps" 'BEGIN{printf "%.1f", x}') tok/s"
+        [ -n "$pps" ] && note "prompt eval:       $(awk -v x="$pps" 'BEGIN{printf "%.1f", x}') tok/s"
+    elif [ -n "$ct" ]; then
+        ok "≈ $(awk -v c="$ct" -v a="$t0" -v b="$t1" 'BEGIN{d=b-a; printf "%.1f", (d>0)?c/d:0}') tok/s  (по wall-clock, $ct токенов)"
+    else
+        warn "сервер не вернул метрик; ответ за $(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')с"
+    fi
+    note "медленно? jarvis toggle kv-quant q8_0 && jarvis setup · или ужми jarvis toggle llm-max-tokens 96"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis ask — разовый запрос к мозгу (без голоса)
+# ════════════════════════════════════════════════════════════════════════
+cmd_ask() {
+    local q="$*"
+    [ -z "$q" ] && { crit "использование: jarvis ask <текст>"; return 1; }
+    have python3 || { crit "нужен python3"; return 1; }
+    http_get "$CHAT_ENDPOINT/health" 3 | grep -qi ok || {
+        crit "мозг не отвечает на $CHAT_ENDPOINT — подними: jarvis run"; return 1; }
+    step "Запрос к мозгу"
+    JARVIS_ASK_Q="$q" JARVIS_ASK_EP="$CHAT_ENDPOINT" JARVIS_ASK_MAX="${JARVIS_LLM_MAX_TOKENS:-256}" \
+    python3 - <<'PY'
+import json, os, urllib.request
+ep = os.environ["JARVIS_ASK_EP"].rstrip("/")
+body = json.dumps({
+    "model": "jarvis",
+    "messages": [{"role": "user", "content": os.environ["JARVIS_ASK_Q"]}],
+    "temperature": 0.3,
+    "max_tokens": int(os.environ.get("JARVIS_ASK_MAX", "256") or 256),
+    "stream": False,
+}).encode("utf-8")
+req = urllib.request.Request(ep + "/v1/chat/completions", data=body,
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=300) as r:
+        data = json.load(r)
+    print((data["choices"][0]["message"].get("content") or "").strip() or "(пустой ответ)")
+except Exception as exc:
+    print(f"ошибка запроса: {exc}")
+PY
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis say — проверить голос (piper → колонки)
+# ════════════════════════════════════════════════════════════════════════
+cmd_say() {
+    local text="$*"
+    [ -z "$text" ] && { crit "использование: jarvis say <текст>"; return 1; }
+    [ -x "$PIPER_BIN" ]   || { crit "piper не найден: $PIPER_BIN  (jarvis setup)"; return 1; }
+    [ -f "$PIPER_VOICE" ] || { crit "голос не найден: $PIPER_VOICE"; return 1; }
+    have aplay            || { crit "нужен aplay (пакет alsa-utils)"; return 1; }
+    step "Говорю (piper → aplay)"
+    local cfg=(); [ -f "$PIPER_CFG" ] && cfg=(--config "$PIPER_CFG")
+    if printf '%s' "$text" | "$PIPER_BIN" --model "$PIPER_VOICE" "${cfg[@]}" --output-raw 2>/dev/null \
+        | aplay -q -r 22050 -f S16_LE -c 1 -t raw - 2>/dev/null; then
+        ok "готово"
+    else
+        warn "не удалось воспроизвести (проверь аудио-устройство и громкость)"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis edit — открыть .env в редакторе
+# ════════════════════════════════════════════════════════════════════════
+cmd_edit() {
+    if [ ! -f "$ENV_FILE" ] && [ -f "$REPO_ROOT/.env.example" ]; then
+        cp "$REPO_ROOT/.env.example" "$ENV_FILE" && ok ".env создан из .env.example"
+    fi
+    touch "$ENV_FILE"
+    local ed="${EDITOR:-}"
+    [ -z "$ed" ] && { for c in nano vim vi; do have "$c" && { ed="$c"; break; }; done; }
+    [ -z "$ed" ] && { crit "редактор не найден — задай \$EDITOR"; note "файл: $ENV_FILE"; return 1; }
+    note "открываю $ENV_FILE в $ed (runtime-правки применит jarvis restart)"
+    "$ed" "$ENV_FILE"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis calibrate — подобрать порог L2 (semantic)
+# ════════════════════════════════════════════════════════════════════════
+cmd_calibrate() {
+    step "Калибровка порога L2 (semantic)"
+    local py; py="$(venv_python)"
+    [ -z "$py" ] && { crit "нет venv — запусти jarvis setup"; return 1; }
+    if ! http_get "$EMBED_ENDPOINT/health" 3 | grep -qi ok; then
+        crit "embed-сервер не отвечает на $EMBED_ENDPOINT (он считает векторы)"
+        note "подними в другом терминале: jarvis run   (нужен живой :8090)"
+        return 1
+    fi
+    "$py" "$REPO_ROOT/scripts/calibrate_semantic.py"
+    local rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '\n'
+        note "поставь рекомендованное:  jarvis toggle semantic-threshold <N>"
+        note "включи матчер:            jarvis toggle semantic on && jarvis restart"
+    fi
+    return "$rc"
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis update — обновить репозиторий
+# ════════════════════════════════════════════════════════════════════════
+cmd_update() {
+    step "Обновление репозитория"
+    have git || { crit "нет git"; return 1; }
+    local branch; branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    note "ветка $branch — git pull --ff-only"
+    if git -C "$REPO_ROOT" pull --ff-only; then
+        ok "обновлено"
+        note "менялись build-тумблеры/сервер? → jarvis setup"
+        note "рантайм-правки подхватит        → jarvis restart"
+    else
+        warn "fast-forward не прошёл (локальные изменения/расхождение) — см. git status"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════════════════
+#  jarvis version — версия и окружение
+# ════════════════════════════════════════════════════════════════════════
+cmd_version() {
+    banner
+    local sha branch
+    sha="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    printf '  %sкоммит%s %s   %sветка%s %s\n' "$C_DIM" "$C_RESET" "$sha" "$C_DIM" "$C_RESET" "$branch"
+    printf '  %sрепо%s   %s\n' "$C_DIM" "$C_RESET" "$REPO_ROOT"
+    local py; py="$(venv_python)"
+    [ -n "$py" ] && printf '  %spython%s %s\n' "$C_DIM" "$C_RESET" "$("$py" --version 2>&1)"
+    [ -x "$SERVER_BIN" ] && ok "llama-server собран" || warn "llama-server не собран (jarvis setup)"
 }
 
 # ════════════════════════════════════════════════════════════════════════
@@ -854,7 +1106,16 @@ main() {
         stop|стоп)             cmd_stop "$@";;
         restart|рестарт)       cmd_restart "$@";;
         logs|логи)             cmd_logs "$@";;
-        toggle|toggles|env|тумблер|тумблеры) cmd_toggle "$@";;
+        toggle|toggles|тумблер|тумблеры) cmd_toggle "$@";;
+        config|env|конфиг|настройки)     cmd_config "$@";;
+        edit|править)          cmd_edit "$@";;
+        calibrate|калибровка|калибруй)   cmd_calibrate "$@";;
+        ask|спроси|запрос)     cmd_ask "$@";;
+        say|скажи|голос)       cmd_say "$@";;
+        bench|benchmark|скорость) cmd_bench "$@";;
+        models|модели)         cmd_models "$@";;
+        update|обнови|обновись) cmd_update "$@";;
+        version|--version|версия|ver) cmd_version "$@";;
         wipe-memory|wipe|clean-memory) cmd_wipe_memory "$@";;
         help|--help|-h|"")     cmd_help;;
         *)
