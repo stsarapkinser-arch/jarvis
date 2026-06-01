@@ -33,7 +33,7 @@ src/
 │   ├── healing.py         # SkillHealer: самолечение команд (варианты бинаря qdbus)
 │   ├── learning.py        # SkillLearner: считает повторы fallback-команд → кандидат
 │   ├── learned.py         # Загрузчик self-authoring навыков (config/learned_skills.json)
-│   └── custom.py          # Загрузчик ручных команд оператора (config/commands.toml, L0)
+│   └── custom.py          # Каталог ручных команд: дефолты (commands.example.toml) + личные (commands.toml), L0
 │
 ├── services/          # Фоновые сервисы и демоны
 │   ├── daemon_swarm.py    # Наблюдатели системных событий

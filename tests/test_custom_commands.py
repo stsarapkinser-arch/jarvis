@@ -99,49 +99,102 @@ def test_entry_id_explicit_and_collision_suffix():
     assert b.id.startswith(a.id)
 
 
-def test_read_raw_parses_commands_table(tmp_path, monkeypatch):
+def test_read_table_parses_commands_table(tmp_path):
     path = tmp_path / "commands.toml"
     path.write_text(
         '[[command]]\nphrases = ["a", "b"]\nrun = "echo hi"\nsay = "ок"\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(custom, "COMMANDS_PATH", path)
-    raw = custom._read_raw()
+    raw = custom._read_table(path)
     assert len(raw) == 1 and raw[0]["run"] == "echo hi" and raw[0]["phrases"] == ["a", "b"]
 
 
-def test_read_raw_tolerates_corrupt_toml(tmp_path, monkeypatch):
+def test_read_table_tolerates_corrupt_toml(tmp_path):
     path = tmp_path / "commands.toml"
     path.write_text("[[command]\nthis is not toml", encoding="utf-8")
-    monkeypatch.setattr(custom, "COMMANDS_PATH", path)
-    assert custom._read_raw() == []
+    assert custom._read_table(path) == []
 
 
-def test_read_raw_missing_file_returns_empty(tmp_path, monkeypatch):
+def test_read_table_missing_file_returns_empty(tmp_path):
+    assert custom._read_table(tmp_path / "nope.toml") == []
+
+
+def test_merged_loads_defaults_when_no_personal_file(tmp_path, monkeypatch):
+    """Личного файла нет → грузится только дефолтный каталог (всегда активен)."""
+    example = tmp_path / "commands.example.toml"
+    example.write_text(
+        '[[command]]\nphrases = ["открой загрузки"]\nrun = "xdg-open ~/Downloads"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(custom, "COMMANDS_PATH", tmp_path / "nope.toml")
-    monkeypatch.setattr(custom, "COMMANDS_EXAMPLE_PATH", tmp_path / "also-nope.toml")
-    assert custom._read_raw() == []
+    monkeypatch.setattr(custom, "COMMANDS_EXAMPLE_PATH", example)
+    merged = custom._merged_entries()
+    assert [e["run"] for e in merged] == ["xdg-open ~/Downloads"]
 
 
-def test_active_path_prefers_personal_over_example(tmp_path, monkeypatch):
+def test_merged_personal_extends_defaults(tmp_path, monkeypatch):
+    """Личные команды ДОПОЛНЯЮТ дефолтные (а не заменяют их)."""
     personal = tmp_path / "commands.toml"
     example = tmp_path / "commands.example.toml"
-    example.write_text("", encoding="utf-8")
+    personal.write_text(
+        '[[command]]\nphrases = ["открой проект"]\nrun = "code ~/proj"\n', encoding="utf-8"
+    )
+    example.write_text(
+        '[[command]]\nphrases = ["выключи компьютер"]\nrun = "poweroff"\n', encoding="utf-8"
+    )
     monkeypatch.setattr(custom, "COMMANDS_PATH", personal)
     monkeypatch.setattr(custom, "COMMANDS_EXAMPLE_PATH", example)
-    assert custom._active_path() == example   # личного ещё нет → пример
-    personal.write_text("", encoding="utf-8")
-    assert custom._active_path() == personal  # появился личный → он главнее
+    runs = [e["run"] for e in custom._merged_entries()]
+    assert "code ~/proj" in runs and "poweroff" in runs
+
+
+def test_merged_personal_overrides_default_on_phrase_collision(tmp_path, monkeypatch):
+    """При совпадении фразы личная запись ВЫИГРЫВАЕТ, дефолтная отбрасывается."""
+    personal = tmp_path / "commands.toml"
+    example = tmp_path / "commands.example.toml"
+    personal.write_text(
+        '[[command]]\nphrases = ["открой загрузки"]\nrun = "MINE"\n', encoding="utf-8"
+    )
+    example.write_text(
+        '[[command]]\nphrases = ["открой загрузки"]\nrun = "DEFAULT"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(custom, "COMMANDS_PATH", personal)
+    monkeypatch.setattr(custom, "COMMANDS_EXAMPLE_PATH", example)
+    runs = [e["run"] for e in custom._merged_entries()]
+    assert runs == ["MINE"]  # дефолт с той же фразой целиком отброшен
+
+
+def test_merged_partial_phrase_overlap_keeps_default(tmp_path, monkeypatch):
+    """Если у дефолта есть СОБСТВЕННАЯ фраза — он сохраняется (перекрыт не весь)."""
+    personal = tmp_path / "commands.toml"
+    example = tmp_path / "commands.example.toml"
+    personal.write_text(
+        '[[command]]\nphrases = ["общая фраза"]\nrun = "MINE"\n', encoding="utf-8"
+    )
+    example.write_text(
+        '[[command]]\nphrases = ["общая фраза", "своя фраза"]\nrun = "DEFAULT"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(custom, "COMMANDS_PATH", personal)
+    monkeypatch.setattr(custom, "COMMANDS_EXAMPLE_PATH", example)
+    runs = [e["run"] for e in custom._merged_entries()]
+    assert runs == ["MINE", "DEFAULT"]
 
 
 def test_example_file_is_valid_and_loadable():
-    """Поставляемый шаблон обязан быть валидным TOML и давать рабочие навыки —
-    иначе «из коробки» сломается у оператора."""
-    raw = custom._read_raw()  # на CI личного файла нет → читается example
+    """Поставляемый дефолтный каталог обязан быть валидным TOML и давать рабочие
+    навыки — иначе «из коробки» сломается у оператора. Заодно стережём уникальность
+    нормализованных фраз внутри каталога (дубль фразы = тихо мёртвая команда)."""
+    raw = custom._read_table(custom.COMMANDS_EXAMPLE_PATH)
     assert raw, "config/commands.example.toml пуст или не читается"
     taken: set[str] = set()
+    seen_phrases: set[str] = set()
     for entry in raw:
-        assert custom._valid_entry(entry), f"невалидная запись примера: {entry}"
+        assert custom._valid_entry(entry), f"невалидная запись каталога: {entry}"
+        for p in custom._phrases(entry):
+            norm = custom.normalize_phrase(p)
+            assert norm not in seen_phrases, f"дубль фразы в каталоге: {p!r}"
+            seen_phrases.add(norm)
         sk = custom._build_skill(entry, taken)
         taken.add(sk.id)
         assert sk.id.startswith(custom.CUSTOM_PREFIX)
