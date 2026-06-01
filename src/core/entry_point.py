@@ -19,6 +19,7 @@ except Exception:  # noqa: BLE001
     KaldiRecognizer = None  # type: ignore[assignment,misc]
     Model = None  # type: ignore[assignment,misc]
 
+from src.audio.wakeword import build_gate
 from src.common.event_bus import Event, EventBus, EventType
 from src.common.singleton import Singleton
 
@@ -61,6 +62,10 @@ class JarvisMain(metaclass=Singleton):
         # event-loop (обработчики шины), читается из треда слушателя — для
         # float это атомарно в CPython, блокировка не нужна.
         self._gate_until: float = 0.0
+        # Wake-word пред-гейт (Tier0 #5): по умолчанию выключен и прозрачен
+        # (feed() → True всегда), поэтому конструктор безопасен и в тестах, и
+        # без openwakeword. Включается JARVIS_WAKEWORD=1.
+        self._wake_gate = build_gate()
         # Аудио-стек не установлен — тихо в standby (модуль импортируем, но
         # слушать нечем). На N100 сюда не попадаем.
         if Model is None or KaldiRecognizer is None:
@@ -175,6 +180,12 @@ class JarvisMain(metaclass=Singleton):
                             # мусорный partial первым же кадром после гейта.
                             self.rec.Reset()
                             _was_gated = False
+                        # Wake-word гейт (Tier0 #5): вне окна активации НЕ кормим
+                        # тяжёлый Vosk — экономим CPU N100. Стоит ПОСЛЕ эхо-гейта
+                        # (Джарвис не будит сам себя). Выключен/нет детектора →
+                        # feed() возвращает True (прозрачно/fail-open).
+                        if not self._wake_gate.feed(bytes(data), time.monotonic()):
+                            continue
                         if self.rec.AcceptWaveform(bytes(data)):
                             # Финальный результат после паузы
                             try:
