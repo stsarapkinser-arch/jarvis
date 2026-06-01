@@ -259,3 +259,15 @@ async def test_resume_media_invokes_playerctl_play(monkeypatch):
     # playerctl --all-players play
     assert seen["args"][0].endswith("playerctl") or seen["args"][0] == "playerctl"
     assert "play" in seen["args"]
+
+
+async def test_handled_files_set_is_bounded():
+    """`_handled_files` не растёт неограниченно: при переполнении старые записи
+    выбрасываются, чтобы set не тёк всю сессию (фикс ОЗУ)."""
+    bridge = _fresh_bridge()
+    cap = bridge._HANDLED_FILES_MAX
+    # Несуществующие пути: _handle_received_image добавит ключ и выйдет на
+    # проверке is_file() — ровно путь, наполняющий дедуп-множество.
+    for i in range(cap * 2 + 5):
+        await bridge._handle_received_image(Path(f"/nonexistent/pixel-shot-{i}.png"))
+    assert len(bridge._handled_files) <= cap

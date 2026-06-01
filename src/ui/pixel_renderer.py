@@ -229,10 +229,20 @@ class PixelBridge(metaclass=Singleton):
         except Exception:
             log.exception("open in konsole failed")
 
+    # Потолок множества уже-OCR'енных путей: без него set рос бы на каждый
+    # принятый с телефона снимок весь сеанс (медленная утечка ОЗУ).
+    _HANDLED_FILES_MAX = 512
+
     async def _handle_received_image(self, path: Path) -> None:
         key = str(path)
         if key in self._handled_files:
             return
+        # Ограничиваем рост: при переполнении выбрасываем ~половину произвольных
+        # записей. Коллизия (повторный OCR того же файла после сброса) безвредна
+        # и крайне маловероятна — порог высокий.
+        if len(self._handled_files) >= self._HANDLED_FILES_MAX:
+            for old in list(self._handled_files)[: self._HANDLED_FILES_MAX // 2]:
+                self._handled_files.discard(old)
         self._handled_files.add(key)
         if not path.is_file():
             return

@@ -164,3 +164,72 @@ def test_reality_slice_document_skips_blanks():
     assert "WINDOW: konsole" in doc
     assert "URL" not in doc
     assert "SHELL: whoami" in doc
+
+
+# --- resource fixes: clipboard provider cache + dedup cap ------------------
+from types import SimpleNamespace  # noqa: E402
+
+from src.common.singleton import Singleton  # noqa: E402
+
+
+def test_read_local_clipboard_caches_provider_and_skips_dead_binaries(monkeypatch):
+    """Опрос буфера форкает один subprocess, а не перебирает все три каждые 2с:
+    провайдер определяется один раз и кэшируется."""
+    Singleton.reset(mnemosyne.Mnemosyne)
+    mn = mnemosyne.Mnemosyne()
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kw):
+        calls.append(cmd[0])
+        if cmd[0] == "qdbus":          # klipper отсутствует → rc!=0, не кэшируем
+            return SimpleNamespace(returncode=1, stdout="")
+        if cmd[0] == "wl-paste":       # рабочий провайдер
+            return SimpleNamespace(returncode=0, stdout="clip-text")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert mn._read_local_clipboard() == "clip-text"
+    assert mn._clip_cmd is not None and mn._clip_cmd[0] == "wl-paste"
+    # Второй опрос зовёт ТОЛЬКО кэшированный провайдер — qdbus больше не форкается.
+    calls.clear()
+    assert mn._read_local_clipboard() == "clip-text"
+    assert calls == ["wl-paste"]
+
+
+def test_read_local_clipboard_reprobes_when_cached_binary_vanishes(monkeypatch):
+    """Если кэшированный бинарь исчез (FileNotFoundError) — кэш сбрасывается и
+    провайдер зондируется заново, функциональность не теряется."""
+    Singleton.reset(mnemosyne.Mnemosyne)
+    mn = mnemosyne.Mnemosyne()
+    mn._clip_cmd = ["wl-paste", "--no-newline"]
+
+    def fake_run(cmd, **_kw):
+        if cmd[0] == "wl-paste":
+            raise FileNotFoundError("wl-paste removed")
+        if cmd[0] == "qdbus":
+            return SimpleNamespace(returncode=0, stdout="from-klipper")
+        return SimpleNamespace(returncode=1, stdout="")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Кэш (wl-paste) бросает FileNotFoundError → сброс кэша и немедленное
+    # перезондирование в том же вызове находит работающий qdbus (без потери цикла).
+    assert mn._read_local_clipboard() == "from-klipper"
+    assert mn._clip_cmd is not None and mn._clip_cmd[0] == "qdbus"
+
+
+def test_assimilate_dedup_dict_is_capped():
+    """``_last_assim`` не растёт всю сессию — при переполнении дропаются старые."""
+    Singleton.reset(mnemosyne.Mnemosyne)
+    mn = mnemosyne.Mnemosyne(memory=None, llm_client=None)
+
+    async def go():
+        # Уникальные интересные payload'ы (разные IP) → разные ключи, без cooldown.
+        for i in range(mnemosyne.ASSIM_DEDUP_MAX + 50):
+            await mn.assimilate_clipboard(f"adres 10.{i // 256}.{i % 256}.7")
+
+    asyncio.run(go())
+    assert len(mn._last_assim) <= mnemosyne.ASSIM_DEDUP_MAX

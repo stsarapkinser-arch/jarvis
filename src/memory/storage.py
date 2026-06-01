@@ -60,6 +60,11 @@ log = logging.getLogger("jarvis.mnemosyne")
 HARVEST_INTERVAL = 30.0          # seconds between scheduled snapshots
 ASSIMILATE_COOLDOWN = 12.0       # don't re-think the same clipboard within 12s
 MAX_EDITOR_FILE_BYTES = 8192     # cap how much of an open file we read
+# Потолок словаря анти-дубля ассимиляции: ключ-фингерпринт на каждый уникальный
+# буфер обмена. Без потолка dict растёт всю сессию (медленная утечка ОЗУ); при
+# превышении выбрасываем самые старые записи — окно ASSIMILATE_COOLDOWN короткое,
+# так что старые ключи всё равно бесполезны.
+ASSIM_DEDUP_MAX = 256
 
 IP_RE = re.compile(r"\b(\d{1,3}\.){3}\d{1,3}\b")
 MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b")
@@ -210,6 +215,12 @@ class Mnemosyne(metaclass=Singleton):
         self._last_assim: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
         self._stopping = False
+        # Кэш рабочего инструмента чтения буфера обмена. Без него _klipper_loop
+        # форкал бы до ТРЁХ subprocess'ов (qdbus→wl-paste→xclip) КАЖДЫЕ 2с весь
+        # сеанс, многократно вызывая заведомо отсутствующие бинари. Определяем
+        # провайдера один раз и далее зовём только его; сбрасываем кэш, лишь если
+        # бинарь исчез (FileNotFoundError) — тогда повторно зондируем.
+        self._clip_cmd: list[str] | None = None
 
     # ----- lifecycle ---------------------------------------------------
     def start(self) -> list[asyncio.Task]:
@@ -368,10 +379,23 @@ class Mnemosyne(metaclass=Singleton):
             log.exception("chrono persist failed")
 
     # ----- Clipboard assimilation -------------------------------------
+    # Кандидаты-провайдеры буфера обмена, в порядке предпочтения (KDE → Wayland → X11).
+    _CLIP_PROVIDERS: tuple[tuple[str, ...], ...] = (
+        ("qdbus", "org.kde.klipper", "/klipper", "getClipboardContents"),
+        ("wl-paste", "--no-newline"),
+        ("xclip", "-selection", "clipboard", "-out"),
+    )
+
     async def _klipper_loop(self) -> None:
         last_seen: str | None = None
         while not self._stopping:
             try:
+                # Под HIGH/CRITICAL пропускаем опрос: ассимиляция буфера —
+                # необязательная роскошь, а лишний fork+exec душит общую шину
+                # ровно тогда, когда мозгу нужны ресурсы (как и harvest-тик).
+                if SystemState().load in (SystemLoad.HIGH, SystemLoad.CRITICAL):
+                    await asyncio.sleep(2.0)
+                    continue
                 text = await asyncio.to_thread(self._read_local_clipboard)
                 if text and text != last_seen and text.strip():
                     last_seen = text
@@ -383,22 +407,38 @@ class Mnemosyne(metaclass=Singleton):
             await asyncio.sleep(2.0)
 
     def _read_local_clipboard(self) -> str | None:
+        """Прочитать системный буфер обмена доступным инструментом.
+
+        Провайдер определяется ОДИН раз и кэшируется (``self._clip_cmd``): далее
+        опрос форкает ровно один subprocess вместо перебора всех трёх каждые 2с.
+        Если кэшированный бинарь исчез (FileNotFoundError) — сбрасываем кэш и
+        зондируем заново при следующем вызове."""
         import subprocess
-        for cmd in (
-            ["qdbus", "org.kde.klipper", "/klipper", "getClipboardContents"],
-            ["wl-paste", "--no-newline"],
-            ["xclip", "-selection", "clipboard", "-out"],
-        ):
+
+        if self._clip_cmd is not None:
             try:
                 out = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=1.0,
+                    self._clip_cmd, capture_output=True, text=True, timeout=1.0,
                 )
-                if out.returncode == 0 and out.stdout:
-                    return out.stdout[:8192]
+                return out.stdout[:8192] if out.returncode == 0 and out.stdout else None
+            except FileNotFoundError:
+                self._clip_cmd = None       # бинарь пропал — перезондируем ниже
+            except (subprocess.TimeoutExpired, Exception):
+                return None
+
+        # Зондирование: первый провайдер, ответивший rc==0, становится кэшем.
+        for cmd in self._CLIP_PROVIDERS:
+            try:
+                out = subprocess.run(
+                    list(cmd), capture_output=True, text=True, timeout=1.0,
+                )
             except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
+                continue            # нет бинаря/завис — следующий, и больше не зовём
             except Exception:
                 continue
+            if out.returncode == 0:
+                self._clip_cmd = list(cmd)
+                return out.stdout[:8192] if out.stdout else None
         return None
 
     async def _on_pixel_event(self, event: Event) -> None:
@@ -420,6 +460,10 @@ class Mnemosyne(metaclass=Singleton):
         if now - self._last_assim.get(key, 0.0) < ASSIMILATE_COOLDOWN:
             return None
         self._last_assim[key] = now
+        # Потолок анти-дубля: дроп старейших, чтобы dict не рос всю сессию.
+        if len(self._last_assim) > ASSIM_DEDUP_MAX:
+            for old in sorted(self._last_assim, key=self._last_assim.get)[:len(self._last_assim) - ASSIM_DEDUP_MAX]:
+                self._last_assim.pop(old, None)
 
         recall_hits: list[dict] = []
         if self.memory is not None:

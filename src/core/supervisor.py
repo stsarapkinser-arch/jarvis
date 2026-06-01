@@ -43,6 +43,11 @@ _STATE_DIR = Path(os.environ.get("JARVIS_STATE_DIR", "/tmp"))
 SUPERVISOR_PIDFILE = _STATE_DIR / "jarvis-supervisor.pid"
 CHILD_PIDFILE = _STATE_DIR / "jarvis-bootstrap.pid"
 SUPERVISOR_LOG = _STATE_DIR / "jarvis-supervisor.log"
+# Потолок лог-файла супервизора. Он копится через O_APPEND при КАЖДОМ
+# подъёме bootstrap (краш/reload), без ротации — за недели рос бы безгранично.
+# При демонизации, если файл перерос потолок, открываем его на усечение вместо
+# дописывания (в systemd-режиме foreground'а файл не используется — пишет journald).
+SUPERVISOR_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # Экспоненциальный backoff для перезапуска после КРАШа (не reload).
 CRASH_BACKOFF_SEC = [1, 2, 4, 8, 16, 30]
@@ -98,7 +103,14 @@ def _daemonize() -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     devnull = os.open(os.devnull, os.O_RDONLY)
-    logfd = os.open(str(SUPERVISOR_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    # Ротация по размеру: переросший лог усекаем (O_TRUNC), иначе дописываем.
+    log_flags = os.O_WRONLY | os.O_CREAT
+    try:
+        oversized = SUPERVISOR_LOG.stat().st_size > SUPERVISOR_LOG_MAX_BYTES
+    except OSError:
+        oversized = False
+    log_flags |= os.O_TRUNC if oversized else os.O_APPEND
+    logfd = os.open(str(SUPERVISOR_LOG), log_flags, 0o644)
     os.dup2(devnull, sys.stdin.fileno())
     os.dup2(logfd, sys.stdout.fileno())
     os.dup2(logfd, sys.stderr.fileno())
