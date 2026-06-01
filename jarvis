@@ -15,7 +15,21 @@
 # обрабатываются явными проверками и кодами возврата.
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# REPO_ROOT должен указывать на КОРЕНЬ РЕПО, даже когда скрипт вызван через
+# PATH-симлинк (~/.local/bin/jarvis → …/projects/jarvis/jarvis). Без резолва
+# симлинка ${BASH_SOURCE[0]} = сам симлинк, и REPO_ROOT уезжал в ~/.local/bin —
+# отсюда ложные «нет GGUF/venv/piper» в `jarvis test`, хотя всё на месте.
+_SELF="${BASH_SOURCE[0]}"
+# Идём по цепочке симлинков до реального файла (readlink -f есть не везде —
+# делаем переносимо вручную).
+while [ -h "$_SELF" ]; do
+    _link="$(readlink "$_SELF")"
+    case "$_link" in
+        /*) _SELF="$_link" ;;                                  # абсолютный
+        *)  _SELF="$(dirname "$_SELF")/$_link" ;;              # относительный
+    esac
+done
+REPO_ROOT="$(cd "$(dirname "$_SELF")" && pwd)"
 cd "$REPO_ROOT"
 
 # ───────────────────────── палитра и примитивы ─────────────────────────
