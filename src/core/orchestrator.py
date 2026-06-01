@@ -42,6 +42,7 @@ from src.inference.openai_client import (
     LlamaServerError,
 )
 from src.inference.router import IntentCategory, IntentRouter
+from src.inference.routing_stats import RoutingStats
 from src.inference.agent import AgentRun, ToolCall, ToolResult, run_agent
 from src.inference import tools as tooldefs
 from src import skills
@@ -298,6 +299,9 @@ class Jarvis(metaclass=Singleton):
         # порог косинуса калибруется на железе (scripts/calibrate_semantic.py).
         # Включение: JARVIS_SEMANTIC_MATCH=1. Сбой инициализации не валит ассистента.
         self._semantic = self._init_semantic_matcher()
+        # Телеметрия лестницы: какой слой (L0…L2/3B) решил интент. Периодически
+        # логирует долю разгрузки 3B — видно, окупаются ли детерминированные слои.
+        self._routing_stats = RoutingStats()
         # Адаптер под ollama-совместимый интерфейс — для Mnemosyne и т.п.
         self.llm_adapter = _LlamaCompletionAdapter(self)
 
@@ -1374,6 +1378,19 @@ class Jarvis(metaclass=Singleton):
             ))
 
     async def process_intent(self, text: str) -> str:
+        """Обработать интент и записать, КАКОЙ слой лестницы его решил.
+
+        Тонкая обёртка над _route_intent: тег-результат → телеметрия слоёв
+        (routing_stats), чтобы видеть долю разгрузки 3B на живой речи. Запись
+        в одной точке — все теги уже централизованы как return-значения."""
+        tag = await self._route_intent(text)
+        try:
+            self._routing_stats.record(tag)
+        except Exception:
+            log.debug("routing stats record failed", exc_info=True)
+        return tag
+
+    async def _route_intent(self, text: str) -> str:
         text = (text or "").strip()
         if not text:
             return ""
