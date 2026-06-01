@@ -201,8 +201,8 @@ def test_semantic_fastpath_invokes_skill():
 
     j._semantic = _FakeMatcher("open_terminal")
     fake = _fake_skill(handler=handler)
-    with patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_semantic_fastpath("запусти терминал для работы"))
     assert handled is True
     assert ran == [{}]
@@ -220,8 +220,8 @@ def test_semantic_fastpath_refuses_destructive_or_param_skill():
 
     j._semantic = _FakeMatcher("dangerous")
     fake = _fake_skill(id="dangerous", destructive=True, handler=handler)
-    with patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_semantic_fastpath("снеси всё"))
     assert handled is False
     assert ran == []
@@ -246,13 +246,13 @@ def test_process_intent_semantic_skips_agent():
         raise AssertionError("агент не должен вызываться при semantic fast-path")
 
     j._run_agent_for_intent = fake_agent  # type: ignore[assignment]
-    with patch("src.core.orchestrator.skills.match_alias", return_value=None), \
-         patch("src.core.orchestrator.macros.match_macro", return_value=None), \
-         patch("src.core.orchestrator.patterns.match", return_value=None), \
-         patch("src.core.orchestrator.macros.fuzzy_match_macro", return_value=None), \
-         patch("src.core.orchestrator.skills.fuzzy_match_alias", return_value=None), \
-         patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.skills.match_alias", return_value=None), \
+         patch("src.core.ladder.macros.match_macro", return_value=None), \
+         patch("src.core.ladder.patterns.match", return_value=None), \
+         patch("src.core.ladder.macros.fuzzy_match_macro", return_value=None), \
+         patch("src.core.ladder.skills.fuzzy_match_alias", return_value=None), \
+         patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         res = asyncio.run(j.process_intent("запусти терминал для работы"))
     assert res == "[semantic_fastpath]"
 

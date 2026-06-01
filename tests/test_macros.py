@@ -108,9 +108,9 @@ def test_try_macro_runs_steps_and_briefs_telemetry():
         invoked.append(sk.id)
         return "Загрузка 50 процентов." if sk.id == "rep" else "launched"
 
-    with patch("src.core.orchestrator.macros.match_macro", return_value=macro), \
-         patch("src.core.orchestrator.skills.get", side_effect=lambda sid: fakes.get(sid)), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.macros.match_macro", return_value=macro), \
+         patch("src.core.ladder.skills.get", side_effect=lambda sid: fakes.get(sid)), \
+         patch("src.core.ladder.snapshot", return_value={}):
         j._invoke_skill = fake_invoke  # type: ignore[assignment]
         handled = asyncio.run(j._try_macro("тест сценарий"))
 
@@ -141,9 +141,9 @@ def test_try_macro_skips_destructive_step():
         invoked.append(sk.id)
         return "ok"
 
-    with patch("src.core.orchestrator.macros.match_macro", return_value=macro), \
-         patch("src.core.orchestrator.skills.get", side_effect=lambda sid: fakes.get(sid)), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.macros.match_macro", return_value=macro), \
+         patch("src.core.ladder.skills.get", side_effect=lambda sid: fakes.get(sid)), \
+         patch("src.core.ladder.snapshot", return_value={}):
         j._invoke_skill = fake_invoke  # type: ignore[assignment]
         asyncio.run(j._try_macro("x"))
 
@@ -152,7 +152,7 @@ def test_try_macro_skips_destructive_step():
 
 def test_try_macro_no_match_returns_false():
     j = _make_jarvis()
-    with patch("src.core.orchestrator.macros.match_macro", return_value=None):
+    with patch("src.core.ladder.macros.match_macro", return_value=None):
         assert asyncio.run(j._try_macro("просто фраза")) is False
 
 
@@ -171,7 +171,7 @@ def test_process_intent_macro_skips_agent():
         raise AssertionError("агент не должен вызываться при макросе")
 
     j._run_agent_for_intent = boom  # type: ignore[assignment]
-    with patch("src.core.orchestrator.macros.match_macro", return_value=macro), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.macros.match_macro", return_value=macro), \
+         patch("src.core.ladder.snapshot", return_value={}):
         res = asyncio.run(j.process_intent("c"))
     assert res == "[macro]"

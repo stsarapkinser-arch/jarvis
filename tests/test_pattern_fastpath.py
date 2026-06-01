@@ -152,9 +152,9 @@ def test_pattern_fastpath_invokes_skill_with_args_and_speaks_reply():
         skill_id="set_volume", args={"percent": "30"},
         reply="Громкость на 30 процентов, сэр.",
     )
-    with patch("src.core.orchestrator.patterns.match", return_value=pm), \
-         patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.patterns.match", return_value=pm), \
+         patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_pattern_fastpath("громкость 30"))
 
     assert handled is True
@@ -180,9 +180,9 @@ def test_pattern_fastpath_destructive_queues_confirmation_with_args():
 
     fake = _fake_skill(id="dangerous", destructive=True, handler=handler)
     pm = patterns.PatternMatch(skill_id="dangerous", args={"percent": "30"}, reply="ok")
-    with patch("src.core.orchestrator.patterns.match", return_value=pm), \
-         patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.patterns.match", return_value=pm), \
+         patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_pattern_fastpath("снеси 30"))
 
     assert handled is True
@@ -193,7 +193,7 @@ def test_pattern_fastpath_destructive_queues_confirmation_with_args():
 
 def test_pattern_fastpath_no_match_returns_false():
     j = _make_jarvis()
-    with patch("src.core.orchestrator.patterns.match", return_value=None):
+    with patch("src.core.ladder.patterns.match", return_value=None):
         handled = asyncio.run(j._try_pattern_fastpath("в чём смысл жизни"))
     assert handled is False
 
@@ -202,8 +202,8 @@ def test_pattern_fastpath_unknown_skill_falls_through():
     """Шаблон ссылается на снятый навык → не падаем, отдаём агенту (False)."""
     j = _make_jarvis()
     pm = patterns.PatternMatch(skill_id="ghost", args={}, reply="ok")
-    with patch("src.core.orchestrator.patterns.match", return_value=pm), \
-         patch("src.core.orchestrator.skills.get", return_value=None):
+    with patch("src.core.ladder.patterns.match", return_value=pm), \
+         patch("src.core.ladder.skills.get", return_value=None):
         handled = asyncio.run(j._try_pattern_fastpath("призрак 5"))
     assert handled is False
 
@@ -228,11 +228,11 @@ def test_process_intent_pattern_skips_agent_loop():
         raise AssertionError("агентный цикл не должен вызываться при pattern fast-path")
 
     j._run_agent_for_intent = fake_agent  # type: ignore[assignment]
-    with patch("src.core.orchestrator.patterns.match", return_value=pm), \
-         patch("src.core.orchestrator.skills.get", return_value=fake), \
-         patch("src.core.orchestrator.skills.match_alias", return_value=None), \
-         patch("src.core.orchestrator.macros.match_macro", return_value=None), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.patterns.match", return_value=pm), \
+         patch("src.core.ladder.skills.get", return_value=fake), \
+         patch("src.core.ladder.skills.match_alias", return_value=None), \
+         patch("src.core.ladder.macros.match_macro", return_value=None), \
+         patch("src.core.ladder.snapshot", return_value={}):
         res = asyncio.run(j.process_intent("громкость 30"))
 
     assert res == "[pattern_fastpath]"

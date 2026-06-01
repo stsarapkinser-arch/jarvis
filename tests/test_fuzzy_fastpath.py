@@ -143,9 +143,9 @@ def test_fuzzy_fastpath_alias_invokes_skill():
         return "ok"
 
     fake = _fake_skill(handler=handler)
-    with patch("src.core.orchestrator.macros.fuzzy_match_macro", return_value=None), \
-         patch("src.core.orchestrator.skills.fuzzy_match_alias", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.macros.fuzzy_match_macro", return_value=None), \
+         patch("src.core.ladder.skills.fuzzy_match_alias", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_fuzzy_fastpath("терминэл"))
 
     assert handled is True
@@ -168,9 +168,9 @@ def test_fuzzy_fastpath_macro_takes_priority():
         alias_probed["hit"] = True
         return None
 
-    with patch("src.core.orchestrator.macros.fuzzy_match_macro", return_value=fake_macro), \
-         patch("src.core.orchestrator.skills.fuzzy_match_alias", side_effect=_alias), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.macros.fuzzy_match_macro", return_value=fake_macro), \
+         patch("src.core.ladder.skills.fuzzy_match_alias", side_effect=_alias), \
+         patch("src.core.ladder.snapshot", return_value={}):
         handled = asyncio.run(j._try_fuzzy_fastpath("режим фокус"))
 
     assert handled is True
@@ -179,8 +179,8 @@ def test_fuzzy_fastpath_macro_takes_priority():
 
 def test_fuzzy_fastpath_no_match_returns_false():
     j = _make_jarvis()
-    with patch("src.core.orchestrator.macros.fuzzy_match_macro", return_value=None), \
-         patch("src.core.orchestrator.skills.fuzzy_match_alias", return_value=None):
+    with patch("src.core.ladder.macros.fuzzy_match_macro", return_value=None), \
+         patch("src.core.ladder.skills.fuzzy_match_alias", return_value=None):
         handled = asyncio.run(j._try_fuzzy_fastpath("абракадабра"))
     assert handled is False
 
@@ -204,12 +204,12 @@ def test_process_intent_fuzzy_skips_agent_loop():
         raise AssertionError("агент не должен вызываться при fuzzy fast-path")
 
     j._run_agent_for_intent = fake_agent  # type: ignore[assignment]
-    with patch("src.core.orchestrator.skills.match_alias", return_value=None), \
-         patch("src.core.orchestrator.macros.match_macro", return_value=None), \
-         patch("src.core.orchestrator.patterns.match", return_value=None), \
-         patch("src.core.orchestrator.macros.fuzzy_match_macro", return_value=None), \
-         patch("src.core.orchestrator.skills.fuzzy_match_alias", return_value=fake), \
-         patch("src.core.orchestrator.snapshot", return_value={}):
+    with patch("src.core.ladder.skills.match_alias", return_value=None), \
+         patch("src.core.ladder.macros.match_macro", return_value=None), \
+         patch("src.core.ladder.patterns.match", return_value=None), \
+         patch("src.core.ladder.macros.fuzzy_match_macro", return_value=None), \
+         patch("src.core.ladder.skills.fuzzy_match_alias", return_value=fake), \
+         patch("src.core.ladder.snapshot", return_value={}):
         res = asyncio.run(j.process_intent("терминэл"))
 
     assert res == "[fuzzy_fastpath]"
