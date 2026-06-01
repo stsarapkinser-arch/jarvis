@@ -251,7 +251,7 @@ check_artifacts() {
     else crit "нет embedding-модели в $EMBED_DIR"; fi
 
     if [ -d "$VOSK_MODEL" ] && [ -n "$(ls -A "$VOSK_MODEL" 2>/dev/null)" ]; then ok "Vosk-модель (слух) на месте"
-    else warn "Vosk-модель не найдена в $VOSK_MODEL — распознавание речи не поедет"; fi
+    else warn "Vosk-модель не найдена в $VOSK_MODEL — докачай: jarvis setup (или bash scripts/fetch_assets.sh)"; fi
 }
 
 check_network() {
@@ -292,8 +292,8 @@ check_proactive() {
 
 check_voice() {
     hdr "[3] Голос (Piper TTS)"
-    [ -x "$PIPER_BIN" ] && ok "piper-бинарь" || warn "нет piper-бинаря: $PIPER_BIN"
-    [ -f "$PIPER_VOICE" ] && ok "русский голос ru_RU-dmitry" || warn "нет голоса: $PIPER_VOICE"
+    [ -x "$PIPER_BIN" ] && ok "piper-бинарь" || warn "нет piper-бинаря ($PIPER_BIN) — докачай: jarvis setup (или bash scripts/fetch_assets.sh)"
+    [ -f "$PIPER_VOICE" ] && ok "русский голос ru_RU-dmitry" || warn "нет голоса ($PIPER_VOICE) — докачай: jarvis setup"
     [ -f "$PIPER_CFG" ] && ok "конфиг голоса" || warn "нет конфига голоса: $PIPER_CFG"
 }
 
@@ -569,6 +569,20 @@ ensure_servers_built() {
     fi
 }
 
+ensure_voice_and_hearing() {
+    step "Слух (Vosk) и голос (Piper) — scripts/fetch_assets.sh"
+    # Эти ассеты НЕ в git (как и GGUF-веса): докачиваем при отсутствии.
+    if [ -f "$VOSK_MODEL/am/final.mdl" ] && [ -x "$PIPER_BIN" ] && [ -f "$PIPER_VOICE" ]; then
+        ok "Vosk-модель и Piper уже на месте — пропускаю докачку"
+    elif [ "$OFFLINE" -eq 1 ]; then
+        warn "пропускаю докачку слуха/голоса: нет сети"
+        note "вручную: bash scripts/fetch_assets.sh  (нужен интернет)"
+    else
+        note "запускаю scripts/fetch_assets.sh (Piper + голос + Vosk) ..."
+        bash "$REPO_ROOT/scripts/fetch_assets.sh" || warn "fetch_assets.sh завершился с ошибкой — см. вывод выше"
+    fi
+}
+
 ensure_main_service() {
     step "Основной сервис ассистента"
     if [ -f "$UNIT_DIR/jarvis.service" ]; then
@@ -612,6 +626,7 @@ cmd_setup() {
     apt_install_missing
     ensure_venv
     ensure_models_reachability
+    ensure_voice_and_hearing
     ensure_servers_built
     ensure_main_service
     install_global_symlink

@@ -12,8 +12,15 @@ __pycache__/
 .venv/
 venv/
 
-# Large model/binary assets — stored outside the repo
+# Large model/binary assets — НЕ в git, докачиваются скриптами:
+#   models/        — GGUF-веса мозга/эмбеддера (setup_server.sh / setup_embed_server.sh)
+#   piper/         — TTS-бинарь + либы + espeak-ng-data + голос (scripts/fetch_assets.sh)
+#   model/         — Vosk акустическая модель слуха (scripts/fetch_assets.sh)
+# model/README (статистика WER) оставляем в git как документацию.
 models/
+/piper/
+/model/*
+!/model/README
 
 # IDE
 .idea/
