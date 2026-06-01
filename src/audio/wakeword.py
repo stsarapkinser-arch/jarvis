@@ -64,19 +64,40 @@ class WakeWordDetector:
         self.available = False
         try:
             import numpy as np  # noqa: F401  — нужен для буфера int16
-            from openwakeword.model import Model  # type: ignore
+            import openwakeword.model  # noqa: F401 — проба наличия пакета
         except Exception:
             log.info("openwakeword недоступен — wake-word детектор в standby")
             return
         try:
-            # Пустой список → встроенные предобученные модели openWakeWord.
-            self._model = Model(wakeword_models=model_paths or [])
+            self._model = self._build_model(model_paths)
             self._np = np
             self.available = True
             log.info("wake-word детектор готов (порог %.2f)", threshold)
         except Exception:
             log.exception("openwakeword init не удался — детектор в standby")
             self._model = None
+
+    @staticmethod
+    def _build_model(model_paths: Optional[list[str]]) -> Any:
+        """Сконструировать openWakeWord.Model переносимо между версиями API.
+
+        Имя аргумента со списком моделей менялось (``wakeword_models`` /
+        ``wakeword_model_paths``), а лишний kwarg в новых версиях пробрасывается
+        в ``AudioFeatures`` и валит init (``TypeError: ... unexpected keyword
+        argument 'wakeword_models'``). Поэтому: пустой список = «встроенные
+        предобученные» → зовём конструктор БЕЗ аргумента; явные пути — пробуем
+        известные имена kwarg, затем позиционно."""
+        from openwakeword.model import Model  # type: ignore
+
+        paths = model_paths or []
+        if not paths:
+            return Model()  # дефолтные модели (могут требовать download_models())
+        for kw in ("wakeword_models", "wakeword_model_paths"):
+            try:
+                return Model(**{kw: paths})
+            except TypeError:
+                continue
+        return Model(paths)  # последняя попытка — позиционно
 
     def predict(self, pcm: bytes) -> float:
         """Максимальный score по всем wake-моделям для кадра. 0.0 при сбое."""
