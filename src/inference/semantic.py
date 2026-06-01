@@ -53,6 +53,24 @@ DEFAULT_MARGIN = _env_float("JARVIS_SEMANTIC_MARGIN", 0.05)
 _BUILD_BACKOFF_SEC = 60.0
 
 
+def _e5_prefixes() -> tuple[str, str]:
+    """(query-префикс, passage-префикс) для асимметричного матча.
+
+    Семейство **e5** (наш дефолт multilingual-e5-small) ОБУЧЕНО на префиксах
+    ``query: `` / ``passage: ``: без них близость коротких фраз заметно хуже —
+    парафраз не дотягивает до уверенного матча (в калибровке это видно как плоско
+    низкий recall на всех порогах). Префиксуем экземпляры как passage, запрос —
+    как query. Автодетект по имени модели; ``JARVIS_SEMANTIC_E5_PREFIX=0/1`` —
+    принудительно. Не-e5 модель → пустые префиксы (поведение прежнее)."""
+    env = os.getenv("JARVIS_SEMANTIC_E5_PREFIX", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return ("", "")
+    if env in ("1", "true", "yes", "on"):
+        return ("query: ", "passage: ")
+    model = os.getenv("JARVIS_EMBED_MODEL", "multilingual-e5-small").lower()
+    return ("query: ", "passage: ") if "e5" in model else ("", "")
+
+
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     dot = na = nb = 0.0
     for i in range(min(len(a), len(b))):
@@ -136,11 +154,18 @@ class SemanticSkillMatcher:
         exemplars: Mapping[str, Sequence[str]] | None = None,
         threshold: float = DEFAULT_THRESHOLD,
         margin: float = DEFAULT_MARGIN,
+        query_prefix: str | None = None,
+        passage_prefix: str | None = None,
     ) -> None:
         self._embed_fn = embed_fn
         self._exemplars = exemplars
         self.threshold = threshold
         self.margin = margin
+        # e5-префиксы (query/passage). Берём из env, если не заданы явно — так и
+        # рантайм, и калибровка применяют ОДНО правило к одной модели.
+        _qp, _pp = _e5_prefixes()
+        self._qpref = query_prefix if query_prefix is not None else _qp
+        self._ppref = passage_prefix if passage_prefix is not None else _pp
         self._index: list[tuple[str, list[float]]] = []
         self._available = True
         self._next_build_at = 0.0
@@ -157,7 +182,7 @@ class SemanticSkillMatcher:
         for sid, phrases in exemplars.items():
             for phrase in phrases:
                 ids.append(sid)
-                texts.append(phrase)
+                texts.append(self._ppref + phrase)   # экземпляр = passage
         if not texts:
             self._available = False
             return
@@ -181,7 +206,7 @@ class SemanticSkillMatcher:
         if not self._index:
             return []
         try:
-            qv = self._embed_fn([text])[0]
+            qv = self._embed_fn([self._qpref + text])[0]   # запрос = query
         except Exception:
             log.debug("semantic: эмбеддинг запроса не удался", exc_info=True)
             return []

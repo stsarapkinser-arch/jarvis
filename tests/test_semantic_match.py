@@ -27,9 +27,20 @@ from src.inference.router import IntentCategory
 
 
 def _embed_from(vmap: dict[str, list[float]], dim: int = 2):
-    """Фейк-эмбеддер: известная фраза → заданный вектор, иначе нулевой (cos=-1)."""
+    """Фейк-эмбеддер: известная фраза → заданный вектор, иначе нулевой (cos=-1).
+
+    Снимает e5-префиксы (``query: ``/``passage: ``): матчер добавляет их для
+    реальной модели, а фейк сопоставляет по «голой» фразе — проверяем ЛОГИКУ
+    (порог/зазор/группировку), а не семантику префиксов."""
     def embed(texts):
-        return [list(vmap.get(t, [0.0] * dim)) for t in texts]
+        out = []
+        for t in texts:
+            for p in ("query: ", "passage: "):
+                if t.startswith(p):
+                    t = t[len(p):]
+                    break
+            out.append(list(vmap.get(t, [0.0] * dim)))
+        return out
     return embed
 
 
