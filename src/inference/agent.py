@@ -69,6 +69,8 @@ class ChatClient(Protocol):
         tool_choice: str = ...,
         temperature: float = ...,
         max_tokens: int = ...,
+        *,
+        stream: bool = ...,
     ) -> ChatResponse: ...
 
 
@@ -105,8 +107,9 @@ async def run_agent(
     *,
     max_steps: int = DEFAULT_MAX_STEPS,
     temperature: float = 0.3,
-    max_tokens: int = 512,
+    max_tokens: int = 256,
     tool_choice: str = "required",
+    stream: bool = False,
 ) -> AgentRun:
     """Прогнать агентный цикл. Исключения транспорта пробрасываются наружу
     (оркестратор их ловит и озвучивает сбой).
@@ -125,6 +128,7 @@ async def run_agent(
             tool_choice=tool_choice,
             temperature=temperature,
             max_tokens=max_tokens,
+            stream=stream,
         )
 
         if not resp.tool_calls:

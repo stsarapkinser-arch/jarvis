@@ -30,6 +30,11 @@ from src.skills import apps, patterns
     ("телеграм", "telegram"),
     ("монитор системы", "system_monitor"),
     ("параметры системы", "settings"),
+    ("настройки системы", "settings"),   # порядок слов: раньше уходило на 3B
+    ("панель управления", "settings"),
+    ("текстовый редактор", "editor"),
+    ("командную строку", "terminal"),
+    ("менеджер файлов", "files"),
     ("эксель", "spreadsheet"),
 ])
 def test_resolve_exact_synonym(name, key):

@@ -309,6 +309,8 @@ ruff check .
 |-----|------------|-----|-----------|
 | `JARVIS_LLM_KV_QUANT=q8_0` | KV-quant + flash-attn: вдвое режет KV-кэш, ускоряет декод | `setup_server.sh` (пере-`setup`) | Vulkan-FA версионно-капризна; strip-safety снимет, если сборка не тянет |
 | `JARVIS_LLM_DRAFT=1` | Speculative decoding (draft Qwen2.5-0.5B предсказывает за 3B) | `setup_server.sh` | На 8 ГБ впритык по RAM — мерить tok/s; качает draft-GGUF |
+| `JARVIS_LLM_STREAM=1` | Стриминг ответа сервера (SSE): read-timeout считается между чанками, нет all-or-nothing 180с на медленной 3B | рантайм (`orchestrator`) | пересборка стримовых tool_calls зависит от сборки llama-server |
+| `JARVIS_LLM_MAX_TOKENS=160` | Жёсткий потолок токенов на горячем tool-call пути | рантайм (`orchestrator`) | меньше = быстрее ответ на слабом железе, но реплики короче; min 16 |
 | `JARVIS_STREAM_TTS=1` | Streaming TTS: реплика по предложениям, первое слово раньше | рантайм (`audio_engine`) | стык между piper-процессами; OFF = байт-в-байт прежнее |
 | `JARVIS_WAKEWORD=1` | Wake-word пред-гейт перед Vosk: меньше нагрев/ложные | рантайм (`entry_point`) | нужен `pip install openwakeword`; без него — fail-open (не блокирует) |
 | `JARVIS_SEMANTIC_MATCH=1` | L2: матч навыка по эмбеддингам (парафраз без 3B) | рантайм (`orchestrator`) | **сначала** `python scripts/calibrate_semantic.py` → выставить `JARVIS_SEMANTIC_THRESHOLD` |

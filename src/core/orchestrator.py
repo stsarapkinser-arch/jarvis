@@ -91,10 +91,22 @@ LLM_MODEL = DEFAULT_MODEL
 # На N100 декод ~1 т/с — каждый лишний раунд это +десятки секунд, так что 2 < 4.
 AGENT_MAX_STEPS = 2
 # 160 — одного speak_response (+ set_hud_state/execute_bash) хватает. Жёсткий
-# потолок критичен: на iGPU N100 декод ~1 токен/сек (в логах eval 1473 мс/ток),
-# поэтому каждый сгенерированный токен ≈ секунда ответа. Раньше 3B уходила в
-# простыню (n_tokens=1489) → таймаут.
-LLM_MAX_TOKENS_DEFAULT = 160
+# потолок критичен: на iGPU N100 декод под нагрузкой проседает к ~1 токен/сек
+# (в логах eval 1473 мс/ток), поэтому каждый сгенерированный токен ≈ секунда
+# ответа. Раньше 3B уходила в простыню (n_tokens=1489) → таймаут. Лимит вынесен
+# в env (JARVIS_LLM_MAX_TOKENS): на совсем медленном железе оператор ужимает
+# горячий tool-call путь (напр. 96), не трогая код. min 16 — иначе tool-call
+# JSON не помещается.
+try:
+    LLM_MAX_TOKENS_DEFAULT = max(16, int(float(os.getenv("JARVIS_LLM_MAX_TOKENS", "160"))))
+except (TypeError, ValueError):
+    LLM_MAX_TOKENS_DEFAULT = 160
+# Стриминг ответа сервера (Tier0): токены текут по SSE, read-timeout считается
+# МЕЖДУ чанками, а не на весь ответ — медленная-но-живая 3B на N100 перестаёт
+# рваться по «all-or-nothing» 180с (ровно тот ReadTimeout из логов). OFF по
+# умолчанию: пересборка стримовых tool_calls зависит от сборки llama-server,
+# включать осознанно (jarvis toggle llm-stream on).
+LLM_STREAM = os.getenv("JARVIS_LLM_STREAM", "0").strip().lower() in ("1", "true", "yes", "on")
 # tool_choice для агентного цикла. "required" грамматически принуждает сервер
 # к валидному tool-call — 3B иначе пишет markdown-прозу и роняет парсер (500).
 AGENT_TOOL_CHOICE = DEFAULT_TOOL_CHOICE
@@ -566,6 +578,7 @@ class Jarvis(metaclass=Singleton):
         try:
             resp = await self._llm.chat(
                 messages, tools=None, temperature=temperature, max_tokens=max_tokens,
+                stream=LLM_STREAM,
             )
             return resp.content.strip()
         except LlamaServerError as e:
@@ -1015,6 +1028,7 @@ class Jarvis(metaclass=Singleton):
             self._llm, messages, tools, dispatch,
             max_steps=AGENT_MAX_STEPS, temperature=temperature,
             max_tokens=LLM_MAX_TOKENS_DEFAULT, tool_choice=AGENT_TOOL_CHOICE,
+            stream=LLM_STREAM,
         )
         st.run = run
         # Модель ответила голым текстом вместо speak_response — всё равно озвучим.

@@ -742,6 +742,7 @@ cmd_wipe_memory() {
 TOGGLES=(
   "JARVIS_LLM_KV_QUANT|kv-quant|build|value|q8_0|KV-quant + flash-attn: вдвое режет KV-кэш, быстрее декод"
   "JARVIS_LLM_DRAFT|draft|build|bool|1|Speculative decoding: draft-0.5B предсказывает за 3B (RAM впритык)"
+  "JARVIS_LLM_STREAM|llm-stream|runtime|bool|1|Стриминг ответа (SSE): нет all-or-nothing таймаута на медленной 3B"
   "JARVIS_STREAM_TTS|stream-tts|runtime|bool|1|Streaming TTS: ответ по предложениям, первое слово раньше"
   "JARVIS_WAKEWORD|wakeword|runtime|bool|1|Wake-word пред-гейт перед Vosk (нужен pip openwakeword)"
   "JARVIS_SEMANTIC_MATCH|semantic|runtime|bool|1|L2: матч навыка по эмбеддингам (сначала калибровка порога)"

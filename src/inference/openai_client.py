@@ -18,9 +18,10 @@ Vulkan, см. ``setup_server.sh`` / ``config/jarvis-llm.service``). Здесь �
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 try:
@@ -135,19 +136,29 @@ class LlamaServerClient:
         tools: Sequence[dict[str, Any]] | None = None,
         tool_choice: str = "auto",
         temperature: float = 0.3,
-        max_tokens: int = 512,
+        max_tokens: int = 256,
+        *,
+        stream: bool = False,
+        on_content: Callable[[str], None] | None = None,
     ) -> ChatResponse:
-        """Один раунд /v1/chat/completions (без стриминга — детерминизм tool-use).
+        """Один раунд /v1/chat/completions.
 
         Возвращает ChatResponse с распарсенными tool_calls. На сетевой/HTTP сбой
-        бросает LlamaServerError."""
+        бросает LlamaServerError.
+
+        ``stream=True`` включает SSE: сервер шлёт ответ по токенам, а клиент
+        пересобирает ТОТ ЖЕ ChatResponse (контент + tool_calls из дельт) — контракт
+        вызывающих не меняется. Зачем: read-timeout httpx считается МЕЖДУ чанками,
+        а не на весь ответ, поэтому медленная-но-живая 3B на N100 больше не рвётся
+        по «all-or-nothing» 180с. ``on_content`` (если задан) зовётся на каждом
+        куске текста — стык для пословной/пофразной озвучки в реальном времени."""
         client = self._ensure_client()
         body: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": bool(stream),
         }
         if tools:
             body["tools"] = list(tools)
@@ -158,6 +169,8 @@ class LlamaServerClient:
         if self._request_lock is None:
             self._request_lock = asyncio.Lock()
         async with self._request_lock:
+            if stream:
+                return await self._chat_streaming(client, body, on_content)
             try:
                 resp = await client.post("/v1/chat/completions", json=body)
             except Exception as exc:  # httpx.ConnectError/ReadTimeout/RemoteProtocol...
@@ -174,6 +187,89 @@ class LlamaServerClient:
             raise LlamaServerError(f"невалидный JSON от сервера: {exc}") from exc
 
         return _parse_completion(data)
+
+    async def _chat_streaming(
+        self, client: Any, body: dict[str, Any], on_content: Callable[[str], None] | None
+    ) -> ChatResponse:
+        """SSE-вариант chat: парсим ``data:``-чанки, склеиваем контент и tool_calls.
+
+        tool_call-дельты приходят фрагментами с ``index``: имя обычно в первом
+        фрагменте, аргументы-JSON — по кускам; копим по индексу и собираем в конце.
+        Любой обрыв транслируем в LlamaServerError (как и не-стрим путь), чтобы
+        оркестратор озвучил сбой единообразно."""
+        content_parts: list[str] = []
+        tcs: dict[int, dict[str, Any]] = {}
+        finish_reason = ""
+        try:
+            async with client.stream("POST", "/v1/chat/completions", json=body) as resp:
+                if resp.status_code != 200:
+                    raw = await resp.aread()
+                    raise LlamaServerError(
+                        f"llama-server вернул {resp.status_code}: "
+                        f"{raw.decode('utf-8', 'replace')[:200]}"
+                    )
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except ValueError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                        if on_content is not None:
+                            try:
+                                on_content(piece)
+                            except Exception:
+                                log.debug("on_content callback raised", exc_info=True)
+                    for d in delta.get("tool_calls") or []:
+                        slot = tcs.setdefault(
+                            int(d.get("index", 0)), {"id": "", "name": "", "args": []}
+                        )
+                        if d.get("id"):
+                            slot["id"] = d["id"]
+                        fn = d.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"].append(fn["arguments"])
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
+        except LlamaServerError:
+            raise
+        except Exception as exc:  # обрыв соединения/таймаут чтения посреди стрима
+            kind = type(exc).__name__
+            detail = str(exc) or "обрыв стрима (модель слишком долго молчит?)"
+            raise LlamaServerError(f"llama-server недоступен: {kind}: {detail}") from exc
+
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tcs):
+            slot = tcs[idx]
+            name = str(slot["name"]).strip()
+            if not name:
+                continue
+            tool_calls.append(ToolCall(
+                id=slot["id"] or f"call_{idx}",
+                name=name,
+                arguments=parse_arguments("".join(slot["args"])),
+            ))
+        if not finish_reason:
+            finish_reason = "tool_calls" if tool_calls else "stop"
+        return ChatResponse(
+            content="".join(content_parts),
+            tool_calls=tuple(tool_calls),
+            finish_reason=finish_reason,
+            raw={},
+        )
 
     # Сетевые ошибки, означающие «сервер умер/рестартует», а не «модель долго
     # думает». Только их имеет смысл переждать и повторить — таймаут чтения

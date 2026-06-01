@@ -22,9 +22,11 @@ class FakeClient:
         self.calls: list[list] = []
 
     async def chat(self, messages, tools=None, tool_choice="auto",
-                   temperature=0.3, max_tokens=512):
+                   temperature=0.3, max_tokens=512, *, stream=False,
+                   on_content=None):
         self.calls.append(list(messages))
         self.last_tool_choice = tool_choice
+        self.last_stream = stream
         return self._responses.pop(0)
 
 
