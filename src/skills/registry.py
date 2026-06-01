@@ -89,6 +89,25 @@ def normalize_phrase(text: str) -> str:
     return s.strip(_EDGE_PUNCT)
 
 
+# Транслитерация кириллицы → латиница для ASCII-безопасных skill_id (id уходят
+# в enum-грамматику инструмента run_skill — нелатинские символы там нежелательны).
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(text: str, *, max_len: int = 32, fallback: str = "cmd") -> str:
+    """Фраза → ASCII-слаг для skill_id: транслит кириллицы, не-буквы → ``_``."""
+    base = (text or "").strip().lower().translate(_TRANSLIT)
+    slug = _SLUG_RE.sub("_", base).strip("_")
+    return slug[:max_len] or fallback
+
+
 # Внутренний алиас для краткости в этом модуле.
 _normalize_phrase = normalize_phrase
 
@@ -265,6 +284,7 @@ __all__ = [
     "fuzzy_match_alias",
     "fuzzy_best",
     "normalize_phrase",
+    "slugify",
     "all_skills",
     "skill_ids",
     "skills_for",

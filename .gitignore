@@ -2,6 +2,10 @@
 # Шаблон со всеми опциями — в .env.example (он коммитится).
 .env
 
+# Личные голосовые команды оператора (jarvis commands пишет сюда).
+# Шаблон с примерами — в config/commands.example.toml (он коммитится).
+config/commands.toml
+
 # Python
 __pycache__/
 *.pyc

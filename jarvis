@@ -189,6 +189,7 @@ ${C_BOLD}НАСТРОЙКА${C_RESET}
     ${C_GREEN}toggle${C_RESET} [...]   тумблеры ускорений/функций (без аргументов — список)
     config         эффективная конфигурация: эндпоинты, модели, .env
     edit           открыть .env в \$EDITOR
+    ${C_GREEN}commands${C_RESET}       открыть свои голосовые команды (config/commands.toml)
     calibrate      подобрать порог L2 (semantic) на живом эмбеддере
 
 ${C_BOLD}ИНСТРУМЕНТЫ${C_RESET}
@@ -1055,6 +1056,23 @@ cmd_edit() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
+#  jarvis commands — открыть свои голосовые команды (config/commands.toml)
+# ════════════════════════════════════════════════════════════════════════
+cmd_commands() {
+    local file="$REPO_ROOT/config/commands.toml"
+    local example="$REPO_ROOT/config/commands.example.toml"
+    if [ ! -f "$file" ] && [ -f "$example" ]; then
+        cp "$example" "$file" && ok "config/commands.toml создан из примера"
+    fi
+    touch "$file"
+    local ed="${EDITOR:-}"
+    [ -z "$ed" ] && { for c in nano vim vi; do have "$c" && { ed="$c"; break; }; done; }
+    [ -z "$ed" ] && { crit "редактор не найден — задай \$EDITOR"; note "файл: $file"; return 1; }
+    note "открываю $file в $ed (сохранишь — Джарвис подхватит команды сам)"
+    "$ed" "$file"
+}
+
+# ════════════════════════════════════════════════════════════════════════
 #  jarvis calibrate — подобрать порог L2 (semantic)
 # ════════════════════════════════════════════════════════════════════════
 cmd_calibrate() {
@@ -1124,6 +1142,7 @@ main() {
         toggle|toggles|тумблер|тумблеры) cmd_toggle "$@";;
         config|env|конфиг|настройки)     cmd_config "$@";;
         edit|править)          cmd_edit "$@";;
+        commands|команды|cmd)  cmd_commands "$@";;
         calibrate|калибровка|калибруй)   cmd_calibrate "$@";;
         ask|спроси|запрос)     cmd_ask "$@";;
         say|скажи|голос)       cmd_say "$@";;

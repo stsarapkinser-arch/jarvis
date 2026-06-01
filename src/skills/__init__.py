@@ -37,6 +37,10 @@ from src.skills import apps as _apps              # noqa: E402,F401
 # Импорт последним — id выученных навыков идут в хвост enum, не сдвигая
 # стабильный префикс встроенного каталога (KV-кэш run_skill не плывёт).
 from src.skills import learned as _learned        # noqa: E402,F401
+# Пользовательские команды (config/commands.toml): оператор добавляет свои
+# фразы→команды вручную, ловятся точным fast-path'ом, минуя 3B. Импорт после
+# встроенного каталога — их id уходят в хвост enum, не сдвигая стабильный префикс.
+from src.skills import custom as _custom            # noqa: E402,F401
 # Макросы/сценарии (композиция навыков). Импорт последним — ссылаются на
 # skill_id, уже зарегистрированные выше.
 from src.skills import macros as _macros           # noqa: E402,F401
