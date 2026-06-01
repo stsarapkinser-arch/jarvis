@@ -190,6 +190,7 @@ ${C_BOLD}НАСТРОЙКА${C_RESET}
     config         эффективная конфигурация: эндпоинты, модели, .env
     edit           открыть .env в \$EDITOR
     ${C_GREEN}commands${C_RESET}       добавить свои голосовые команды (config/commands.toml)
+    ${C_GREEN}perf${C_RESET} [on|off]  профиль макс. производительности (governor/iGPU/ускорения)
     calibrate      подобрать порог L2 (semantic) на живом эмбеддере
 
 ${C_BOLD}ИНСТРУМЕНТЫ${C_RESET}
@@ -661,6 +662,14 @@ cmd_run() {
         warn "сервер/модели отсутствуют — добираю (с выбором источника)"
         ensure_models_reachability
         ensure_servers_built
+    fi
+
+    # 1b. Полные тактовые на время сессии — но ТОЛЬКО если оператор включил профиль
+    # (`jarvis perf on` → JARVIS_PERF=1): без сюрпризов чужой системе. Тихо, без
+    # запроса пароля (root/sudo -n) — серверы стартуют уже под governor=performance.
+    PERF_CHANGED=0
+    if val_is_on "${JARVIS_PERF:-}" && perf_tune on auto; then
+        note "производительность: governor=performance, iGPU подняты"
     fi
 
     # 2. Поднять оба сервера.
@@ -1135,6 +1144,132 @@ cmd_update() {
 }
 
 # ════════════════════════════════════════════════════════════════════════
+#  jarvis perf — профиль максимальной производительности для Intel N100
+# ════════════════════════════════════════════════════════════════════════
+#  Цель: кремний не «засыпает» между фразами и инференс жмёт всё доступное.
+#  РАСПРЕДЕЛЕНИЕ РЕСУРСОВ (4 ядра · iGPU · 8 ГБ LPDDR5 — общая шина):
+#    • Мозг (llama-server 3B)  → iGPU 100% (все слои, Vulkan) + 4 потока CPU,
+#                                 Nice -5; flash-attn + KV-q8_0 режут шину/KV.
+#    • Память (embed 120M)     → CPU 2 потока, Nice +5; iGPU НЕ трогает (бережём
+#                                 единственный Vulkan-контекст мозгу).
+#    • Слух (Vosk)/Голос(Piper)→ CPU, короткие всплески.
+#    • Визор (HUD)             → CPU (QPainter), iGPU лишь композитинг.
+#  OS-рычаги: governor=performance + iGPU min=макс (RP0) + EPP=performance —
+#  4 ядра и графика держат высокие частоты, а не разгоняются с задержкой.
+
+# Привилегированная запись в sysfs. root → напрямую; иначе sudo (-n без пароля).
+# $3=auto → без интерактивного запроса пароля (для тихого авто-буста в run).
+_perf_write() {
+    local path="$1" val="$2" mode="${3:-interactive}"
+    [ -e "$path" ] || return 1
+    if [ "$(id -u)" = 0 ]; then printf '%s\n' "$val" > "$path" 2>/dev/null; return; fi
+    if sudo -n true 2>/dev/null; then printf '%s\n' "$val" | sudo -n tee "$path" >/dev/null 2>&1; return; fi
+    [ "$mode" = auto ] && return 1
+    [ -t 0 ] || return 1
+    printf '%s\n' "$val" | sudo tee "$path" >/dev/null 2>&1
+}
+
+# Применить OS-профиль. $1=on|off  $2=auto|interactive. Выставляет PERF_CHANGED.
+perf_tune() {
+    local state="$1" mode="${2:-interactive}" gov epp f card tgt
+    PERF_CHANGED=0
+    if [ "$state" = on ]; then gov=performance; epp=performance; else gov=schedutil; epp=balance_performance; fi
+    # CPU governor по всем ядрам (+ откат schedutil→powersave при off, если нет).
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -e "$f" ] || continue
+        if _perf_write "$f" "$gov" "$mode"; then PERF_CHANGED=1
+        elif [ "$state" = off ]; then _perf_write "$f" powersave "$mode" && PERF_CHANGED=1; fi
+    done
+    # Energy-Performance Preference (intel_pstate) — не критично, best-effort.
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [ -e "$f" ] && _perf_write "$f" "$epp" "$mode" >/dev/null 2>&1
+    done
+    # iGPU: pin минимальной частоты к RP0 (макс) на on; к RPn (hw-min) на off.
+    for card in /sys/class/drm/card*/; do
+        [ -f "${card}gt_min_freq_mhz" ] || continue
+        if [ "$state" = on ]; then
+            tgt="$(cat "${card}gt_RP0_freq_mhz" 2>/dev/null || cat "${card}gt_max_freq_mhz" 2>/dev/null || echo '')"
+        else
+            tgt="$(cat "${card}gt_RPn_freq_mhz" 2>/dev/null || echo '')"
+        fi
+        [ -n "$tgt" ] && _perf_write "${card}gt_min_freq_mhz" "$tgt" "$mode" && PERF_CHANGED=1
+    done
+    # ACPI platform profile (если ноут его экспортирует).
+    _perf_write /sys/firmware/acpi/platform_profile \
+        "$([ "$state" = on ] && echo performance || echo balanced)" "$mode" >/dev/null 2>&1
+    [ "$PERF_CHANGED" = 1 ]
+}
+
+perf_status() {
+    hdr "Производительность — текущее состояние"
+    local g epp cur mn mx rp0 card
+    g="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
+    epp="$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo '—')"
+    printf '  %sCPU%s governor=%s  EPP=%s  ядер=%s\n' "$C_BOLD" "$C_RESET" "$g" "$epp" "$(nproc 2>/dev/null || echo '?')"
+    for card in /sys/class/drm/card*/; do
+        [ -f "${card}gt_cur_freq_mhz" ] || continue
+        cur="$(cat "${card}gt_cur_freq_mhz" 2>/dev/null || echo '?')"
+        mn="$(cat "${card}gt_min_freq_mhz" 2>/dev/null || echo '?')"
+        mx="$(cat "${card}gt_max_freq_mhz" 2>/dev/null || echo '?')"
+        rp0="$(cat "${card}gt_RP0_freq_mhz" 2>/dev/null || echo '?')"
+        printf '  %siGPU%s %s: cur=%s МГц  min=%s  max=%s  (RP0=%s)\n' \
+            "$C_BOLD" "$C_RESET" "$(basename "$card")" "$cur" "$mn" "$mx" "$rp0"
+        break
+    done
+    printf '\n  %sУскорения инференса (тумблеры):%s\n' "$C_BOLD" "$C_RESET"
+    local row env short
+    for short in llm-stream stream-tts kv-quant; do
+        row="$(toggle_lookup "$short")" && toggle_show "$row"
+    done
+}
+
+cmd_perf() {
+    local action="${1:-status}"
+    case "$(printf '%s' "$action" | tr 'A-Z' 'a-z')" in
+        on|max|turbo|вкл)
+            hdr "Профиль максимальной производительности (Intel N100)"
+            printf '  %sРаспределение:%s мозг→iGPU+4 ядра · память→2 ядра CPU · слух/голос/визор→CPU\n' \
+                "$C_DIM" "$C_RESET"
+            # 1) Lossless-ускорения инференса (тумблеры).
+            env_set JARVIS_LLM_STREAM 1
+            env_set JARVIS_STREAM_TTS 1
+            env_set JARVIS_LLM_KV_QUANT q8_0
+            env_set JARVIS_PERF 1        # маркер: jarvis run сам поднимет частоты
+            ok "тумблеры: llm-stream ВКЛ · stream-tts ВКЛ · kv-quant q8_0 (flash-attn + KV вдвое)"
+            # 2) OS-частоты.
+            if perf_tune on interactive; then
+                ok "OS: governor=performance, iGPU подняты к RP0, EPP=performance"
+            else
+                warn "не смог поднять частоты (нет прав sudo?) — тумблеры всё равно применены"
+                note "вручную: sudo cpupower frequency-set -g performance"
+            fi
+            step "Применить и перезапустить"
+            note "kv-quant — класс СБОРКИ:  jarvis setup    (пересоберёт unit с flash-attn)"
+            note "затем рантайм-тумблеры:    jarvis restart"
+            note "если мозг не стартует после setup — Vulkan-FA не тянет: jarvis toggle kv-quant off && jarvis setup"
+            ;;
+        off|reset|balanced|выкл)
+            hdr "Сброс профиля производительности → сбалансированный"
+            env_set JARVIS_LLM_KV_QUANT ""
+            env_set JARVIS_LLM_STREAM ""
+            env_set JARVIS_STREAM_TTS ""
+            env_set JARVIS_PERF ""
+            ok "тумблеры сброшены к умолчанию"
+            if perf_tune off interactive; then
+                ok "OS: governor=schedutil/powersave, iGPU min=hw-min"
+            else
+                note "OS-частоты не менял (нет прав sudo) — не страшно"
+            fi
+            note "применить: jarvis setup && jarvis restart"
+            ;;
+        status|"")
+            perf_status ;;
+        *)
+            crit "неизвестно: $action"; note "jarvis perf [on|off|status]"; return 1 ;;
+    esac
+}
+
+# ════════════════════════════════════════════════════════════════════════
 #  jarvis version — версия и окружение
 # ════════════════════════════════════════════════════════════════════════
 cmd_version() {
@@ -1166,6 +1301,7 @@ main() {
         config|env|конфиг|настройки)     cmd_config "$@";;
         edit|править)          cmd_edit "$@";;
         commands|команды|cmd)  cmd_commands "$@";;
+        perf|turbo|производительность)   cmd_perf "$@";;
         calibrate|калибровка|калибруй)   cmd_calibrate "$@";;
         ask|спроси|запрос)     cmd_ask "$@";;
         say|скажи|голос)       cmd_say "$@";;
